@@ -1,4 +1,4 @@
-﻿"""
+"""
 ConvLSTM AutoEncoder for meteorological spatiotemporal sequence encoding.
 
 Usage:
@@ -259,10 +259,10 @@ class Encoder(nn.Module):
             num_layers=num_layers,
             return_all_steps=False, # 编码器只需取时间序列最后的全局表示
         )
-        # 自适应平均池化，将任意 HxW 的空间图压缩为 1x1 标量维度
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        # 将池化后的隐藏层映射为用户设定的潜在维度（Latent Space）
-        self.fc = nn.Linear(hidden_channels, latent_dim)
+        # 自适应平均池化，由于直接降到 1x1 会丢失所有拓扑空间信号，改为保留 4x4 的特征代表值
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+        # 将池化后的隐藏层 (原 hidden_channels * 4 * 4) 映射为潜向量维度
+        self.fc = nn.Linear(hidden_channels * 16, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. 过 ConvLSTM 处理完整序列长度，获取最后时间步 -> [B, hidden_channels, H, W]
@@ -299,8 +299,8 @@ class Decoder(nn.Module):
         self.frame_height = frame_height
         self.frame_width = frame_width
 
-        # 映射回隐藏层维度
-        self.fc = nn.Linear(latent_dim, hidden_channels)
+        # 将低维向量直接映射放出原始的完整粗略空间拓扑张量 [hidden_channels * H * W]
+        self.fc = nn.Linear(latent_dim, hidden_channels * frame_height * frame_width)
         
         # 解码的 ConvLSTM，作用是注入时域和空域特征
         self.convlstm = ConvLSTM(
@@ -316,13 +316,17 @@ class Decoder(nn.Module):
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         batch_size = latent.shape[0]
         
-        # 1. 扩展潜向量成基础表征图 -> [B, hidden_channels]
+        # 1. 映射回包含了粗略地理空间拓扑的密集张量 -> [B, hidden_channels * H * W]
         feat = self.fc(latent)
         
-        # 2. 通过 Expand 的方式广播回时间序列维度与空间网格维度
-        # view 先插入 seq_len, H, W 对应的伪维度 1 -> [B, 1, hidden_channels, 1, 1]
-        feat = feat.view(batch_size, 1, self.hidden_channels, 1, 1)
-        # expand 执行广播，不耗费大量额外显存 -> [B, seq_len, hidden_channels, H, W]
+        # 2. 折叠重建成真实的二维空间地理地图数组 -> [B, hidden_channels, H, W]
+        feat = feat.view(batch_size, self.hidden_channels, self.frame_height, self.frame_width)
+        
+        # 3. 增加单帧时间维度 -> [B, 1, hidden_channels, H, W]
+        feat = feat.unsqueeze(1)
+        
+        # 4. 在时间跨度序列上应用均匀的广播 (网络自己依此单帧画面推演地理时流)
+        # -> [B, seq_len, hidden_channels, H, W]
         feat = feat.expand(
             batch_size,
             self.seq_len,
@@ -395,34 +399,30 @@ class ConvLSTMAutoEncoder(nn.Module):
 
 class MeteoDataset(Dataset):
     """
-    负责将预处理后的全量 numpy 数据 [Total_Time_Steps, 10, H, W] 
+    负责将预处理后的全量气象数据 [Total_Steps, 10, H, W] 
     切分成适合送入模型的固定窗口 (window_size) 样本集。
-
-    核心逻辑是平移切割：假如序列长 1000，window_size=96，则切割出 1000//96 个非重叠样本。
+    
+    采用滑动窗口 (Sliding Window) 策略可以成十倍百倍地增加可用训练样本。
     """
-    def __init__(self, data: np.ndarray, window_size: int = WINDOW_SIZE):
+    def __init__(self, data: np.ndarray, window_size: int = WINDOW_SIZE, stride: int = 24):
         super().__init__()
         self.window_size = window_size
+        self.stride = stride
         
-        # 为了严格保证每个样本时序长度等于 window_size，采用向下取整舍弃多余的首尾部分
-        n_samples = len(data) // window_size
+        # 保留下数据的引用
+        self.data = data
         
-        # 将连续的一维时序截断后 Reshape 成 [样本数量, 时间窗口大小, 通道数, H, W] 的格式
-        self.data = data[: n_samples * window_size].reshape(
-            n_samples,
-            window_size,
-            data.shape[1],
-            data.shape[2],
-            data.shape[3],
-        )
+        # 计算滑动窗口游标能截取到的样本总个数
+        self.n_samples = (len(self.data) - self.window_size) // self.stride + 1
 
     def __len__(self) -> int:
-        return len(self.data)
+        return self.n_samples
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        # PyTorch 的 Dataset 要求返回的是 Tensor 或者字典，这里将 NumPy 数据转化为 Tensor
-        return torch.from_numpy(self.data[index])
-
+        # 在获取单条样本时再执行内存切片，转化为 GPU 计算所需的 Tensor
+        start_idx = index * self.stride
+        end_idx = start_idx + self.window_size
+        return torch.from_numpy(self.data[start_idx:end_idx])
 
 def _find_first_4d_dataset(h5_obj):
     """
@@ -672,22 +672,21 @@ def run_training(args: argparse.Namespace) -> None:
             f"LR: {lr_now:.2e} | Time: {elapsed:.1f}s"
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  Best model saved (val_loss={val_loss:.6f})")
-
+        # 把存档主导权彻底交还给 EarlyStopping 工具对象去验证 val_loss 以及保存最优检查点
         early_stopping(val_loss, model, args.checkpoints)
+        
         if early_stopping.early_stop:
-            print("Early stopping")
+            print("Early stopping triggered. Model validation saturated.")
             break
 
         adjust_learning_rate(optimizer, epoch, args)
 
     if os.path.exists(checkpoint_path):
+        # 原汁原味读取 EarlyStopping 打包的最强记忆点
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        # 再将其重新烙下明确标记的最强部署印记，防止以后迭代时搞混最佳权重
         torch.save(model.state_dict(), best_model_path)
-        best_val_loss = min(best_val_loss, early_stopping.val_loss_min)
+        best_val_loss = early_stopping.val_loss_min
 
     print("\n" + "=" * 72)
     print(f"训练完成！最优验证 Loss: {best_val_loss:.6f}")
@@ -759,7 +758,7 @@ if __name__ == "__main__":
     parser.add_argument("--smoke-test", action="store_true", help="使用随机数据验证模型结构")
     parser.add_argument("--train-epochs", type=int, default=EPOCHS, help="训练轮数")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="初始学习率")
-    parser.add_argument("--patience", type=int, default=7, help="早停耐心轮数")
+    parser.add_argument("--patience", type=int, default=5, help="早停耐心轮数")
     parser.add_argument(
         "--lradj",
         type=str,
