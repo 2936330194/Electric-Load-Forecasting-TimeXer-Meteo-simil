@@ -1166,24 +1166,31 @@ class SimilarDayRetriever:
         Returns:
             RetrievalResult: 封装了相似片段负荷序列以及评估得分的结果对象。
         """
+        # 确保系统已完成构建或加载
         self._ensure_built()
+        
+        # 统一输入格式为 [1, Dim]
         weather_embedding = np.asarray(weather_embedding, dtype=np.float32).reshape(1, -1)
         if weather_embedding.shape[1] != self.weather_encoder.output_dim:
             raise ValueError(
                 f"气象编码维度错误，期望 {self.weather_encoder.output_dim}，实际 {weather_embedding.shape[1]}"
             )
 
-        # 构建当前查询点的时间描述符并加权缩放
+        # 1. 构建当前查询点的时间描述符（周期性特征）并应用权重 alpha
         time_vector = self._build_time_vectors([pd.Timestamp(query_timestamp)])
-        # 合入气象表征
+        
+        # 2. 融合气象潜向量与时间特征，并执行全局 L2 归一化
         fused_query = self._fuse_and_normalize(weather_embedding, time_vector)
-        # 抛给高层检索器做精确比对（或者 faiss.IndexFlatIP）
+        
+        # 3. 在索引库中执行精确内积搜索（等价于余弦相似度）
         scores, ids = self.index.search(fused_query, top_k=top_k)
 
-        # 从检索库元数据结构中通过 ID 直接拷贝切出匹配的负荷序列切片
+        # 4. 根据返回的索引，从底库中提取对应的负荷曲线和时间戳
         retrieved_ids = [int(idx) for idx in ids[0].tolist() if int(idx) >= 0]
         retrieved_scores = [float(s) for s in scores[0][: len(retrieved_ids)].tolist()]
+        # 提取历史负荷数据块
         retrieved_loads = np.ascontiguousarray(self.load_curves[retrieved_ids])
+        # 转换历史时间戳为字符串
         retrieved_times = [
             str(pd.Timestamp(ts)) for ts in self.start_timestamps[retrieved_ids]
         ]
@@ -1208,6 +1215,8 @@ class SimilarDayRetriever:
         """
         self._ensure_built()
         weather_window = np.asarray(weather_window, dtype=np.float32)
+        
+        # 维度校验：必须包含预测长度所需的所有气象帧
         if weather_window.ndim != 4 or weather_window.shape[0] != self.pred_len:
             raise ValueError(f"查询气象窗口必须为 [{self.pred_len}, C, H, W]，实际 {weather_window.shape}")
         if weather_window.shape[1] != self.weather_encoder.channel_count:
@@ -1215,7 +1224,10 @@ class SimilarDayRetriever:
                 f"气象通道数错误，期望 {self.weather_encoder.channel_count}，实际 {weather_window.shape[1]}"
             )
 
+        # 调用编码器将 [T, C, H, W] 压缩为潜向量
         weather_embedding = self.weather_encoder.transform_window(weather_window)
+        
+        # 转发至底层检索接口
         return self.search_by_weather_embedding(
             weather_embedding[0],
             query_timestamp=query_timestamp,
@@ -1233,23 +1245,26 @@ class SimilarDayRetriever:
         常被测算验证环节(Backtest)使用。
         """
         self._ensure_built()
+        
+        # 自动管理 HDF5 存储句柄
         created_store = False
         if weather_store is None:
             if self.weather_h5_path is None:
                 raise RuntimeError("当前检索器没有保存 weather_h5_path，无法按时间戳取气象窗口。")
             weather_store = HDF5WeatherSequenceStore(self.weather_h5_path)
-            # 是否在内层开启的标志
             created_store = True
 
         try:
-            # 去气象数据表上反查得到图像序列
+            # 1. 根据时间戳从 HDF5 中提取对应的气象图像序列
             weather_window = weather_store.get_window_by_timestamp(query_timestamp, self.pred_len)
+            # 2. 转发至中层接口进行编码和检索
             return self.search_by_weather_window(
                 weather_window,
                 query_timestamp=query_timestamp,
                 top_k=top_k,
             )
         finally:
+            # 如果是当前函数开启的句柄，则负责关闭
             if created_store:
                 weather_store.close()
 
@@ -1261,15 +1276,20 @@ class SimilarDayRetriever:
     ) -> RetrievalResult:
         """
         [实用工具接口] 从给定的"未来数据表"中找到第一行包含的预测起点时间，基于此时间完成一键检索。
+        主要用于与推理主程序对接。
         """
         future_csv_path = Path(future_csv_path).resolve()
         if not future_csv_path.exists():
             raise FileNotFoundError(f"未找到未来负荷 CSV 文件: {future_csv_path}")
+            
         future_df = pd.read_csv(future_csv_path)
         if "date" not in future_df.columns or len(future_df) == 0:
             raise ValueError(f"未来负荷 CSV 缺少 date 列或为空: {future_csv_path}")
-        # 解析预测 CSV 表第一行即为要求搜索的时间戳起点
+            
+        # 提取第 0 行的时间戳，作为预测窗口的起点
         query_timestamp = pd.Timestamp(future_df["date"].iloc[0])
+        
+        # 调用高层接口执行检索
         return self.search_by_timestamp(
             query_timestamp=query_timestamp,
             top_k=top_k,
@@ -1278,8 +1298,12 @@ class SimilarDayRetriever:
 
     def save(self, artifact_dir: Union[str, Path]) -> None:
         """
-        持久化当前构建完毕的模型，方便在推理时极速加载 (免去算PCA的延误)。
-        共分为三个产物文件：检索表数组(npz)、模型实例(pkl)、以及查询元配置(json)。
+        持久化当前构建完毕的模型，方便在推理时极速加载。
+        
+        产物包括：
+        1. retriever_arrays.npz: 包含底库向量、历史负荷曲线及时间标签。
+        2. weather_encoder.pkl: 序列化后的编码器实例（含标准化参数）。
+        3. metadata.json: 保存超参数、训练统计信息及各组件配置。
         """
         self._ensure_built()
         artifact_dir = Path(artifact_dir).resolve()
@@ -1289,19 +1313,19 @@ class SimilarDayRetriever:
         encoder_path = artifact_dir / "weather_encoder.pkl"
         meta_path = artifact_dir / "metadata.json"
 
-        # numpy 内置高速保存特征及标签池
+        # 1. 使用 NumPy 压缩格式保存大数组
         np.savez(
             arrays_path,
             base_vectors=self.base_vectors.astype(np.float32),
             load_curves=self.load_curves.astype(np.float32),
-            start_timestamps_ns=self.start_timestamps.asi8.astype(np.int64),
+            start_timestamps_ns=self.start_timestamps.asi8.astype(np.int64), # 时间戳转为纳秒整数
         )
 
-        # 序列化含有 StandardScaler 和 IncrementalPCA 内置学得权重的编码器实例
+        # 2. 使用 Pickle 序列化编码器对象
         with open(encoder_path, "wb") as f:
             pickle.dump(self.weather_encoder, f)
 
-        # 记录关键超参等上下文信息
+        # 3. 记录元数据和超参数上下文
         metadata = {
             "weather_dim_requested": self.weather_dim,
             "weather_dim_effective": self.weather_encoder.output_dim,
@@ -1330,7 +1354,8 @@ class SimilarDayRetriever:
     @classmethod
     def load(cls, artifact_dir: Union[str, Path]) -> "SimilarDayRetriever":
         """
-        类方法，反向加载并初始化系统。从之前 `save(...)` 创建的存档目录中复苏全部模型状态结构和底库资源。
+        从离线存档中完整恢复检索器实例。
+        包含模型权重加载、底库数组还原以及 FAISS/NumPy 索引重建。
         """
         artifact_dir = Path(artifact_dir).resolve()
         arrays_path = artifact_dir / "retriever_arrays.npz"
@@ -1340,9 +1365,11 @@ class SimilarDayRetriever:
         if not arrays_path.exists() or not encoder_path.exists() or not meta_path.exists():
             raise FileNotFoundError(f"检索库目录不完整: {artifact_dir}")
 
+        # 1. 加载元数据
         with open(meta_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
 
+        # 2. 构造基础类实例
         retriever = cls(
             weather_dim=int(metadata["weather_dim_requested"]),
             time_weight=float(metadata["time_weight"]),
@@ -1357,18 +1384,21 @@ class SimilarDayRetriever:
             log1p_channels=metadata["log1p_channels"],
         )
 
+        # 3. 还原序列化的编码器
         with open(encoder_path, "rb") as f:
             retriever.weather_encoder = pickle.load(f)
 
+        # 4. 读取底库大数组
         arrays = np.load(arrays_path)
         retriever.base_vectors = arrays["base_vectors"].astype(np.float32)
         retriever.load_curves = arrays["load_curves"].astype(np.float32)
         retriever.start_timestamps = pd.to_datetime(arrays["start_timestamps_ns"].astype(np.int64))
 
-        # 挂载并填充查询接口引擎
+        # 5. 基于载入的向量重建检索索引
         retriever.index = ExactInnerProductIndex(retriever.base_vectors.shape[1])
         retriever.index.add(retriever.base_vectors)
 
+        # 6. 回填运行状态元数据
         retriever.load_csv_path = metadata.get("load_csv_path")
         retriever.weather_h5_path = metadata.get("weather_h5_path")
         retriever.train_frame_count = metadata.get("train_frame_count")
@@ -1386,7 +1416,7 @@ def print_retrieval_result(result: RetrievalResult, print_json: bool = False) ->
         print_json: 是否以 JSON 格式输出（方便程序间对接）。
     """
     if print_json:
-        # JSON 序列化，确保中文不乱码。
+        # 以紧凑 JSON 格式输出，禁用 ASCII 转义以显示中文时间戳
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return
 
@@ -1402,7 +1432,7 @@ def print_retrieval_result(result: RetrievalResult, print_json: bool = False) ->
         ),
         start=1,
     ):
-        # 仅打印负荷曲线的前 8 个点作为缩略展示
+        # 仅打印负荷曲线的前 8 个点作为趋势预览
         head_values = ", ".join(f"{float(x):.4f}" for x in curve[:8])
         print(
             f"  [排名 {rank}] 索引: {idx:<6} | 起始时间: {ts} | 相似度: {score:.6f}"
@@ -1413,31 +1443,34 @@ def print_retrieval_result(result: RetrievalResult, print_json: bool = False) ->
 
 def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     """向命令行解析器添加共享的建库配置及运行参数。"""
-    parser.add_argument("--load-csv", type=str, default=str(DEFAULT_LOAD_CSV))
-    parser.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5))
-    parser.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR))
-    parser.add_argument("--weather-dim", type=int, default=AE_LATENT_DIM)
-    parser.add_argument("--time-weight", type=float, default=2.0)
-    parser.add_argument("--pred-len", type=int, default=96)
-    parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0)
-    parser.add_argument("--build-batch-size", type=int, default=384)
-    parser.add_argument("--ae-checkpoint", type=str, default=str(DEFAULT_AE_CHECKPOINT))
-    parser.add_argument("--ae-norm-stats", type=str, default=str(DEFAULT_AE_NORM_STATS))
-    parser.add_argument("--encoder-batch-size", type=int, default=AE_BATCH_SIZE)
-    parser.add_argument("--max-train-windows", type=int, default=None)
+    parser.add_argument("--load-csv", type=str, default=str(DEFAULT_LOAD_CSV), help="负荷数据集路径")
+    parser.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5), help="气象 HDF5 路径")
+    parser.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR), help="模型/库保存目录")
+    parser.add_argument("--weather-dim", type=int, default=AE_LATENT_DIM, help="目标潜向量维度")
+    parser.add_argument("--time-weight", type=float, default=2.0, help="时间特征权重 (alpha)")
+    parser.add_argument("--pred-len", type=int, default=96, help="预测步长/窗口长度")
+    parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0, help="前多少比例的数据用于建库")
+    parser.add_argument("--build-batch-size", type=int, default=384, help="建库批处理规格")
+    parser.add_argument("--ae-checkpoint", type=str, default=str(DEFAULT_AE_CHECKPOINT), help="AE 权重路径")
+    parser.add_argument("--ae-norm-stats", type=str, default=str(DEFAULT_AE_NORM_STATS), help="AE 标准化参数路径")
+    parser.add_argument("--encoder-batch-size", type=int, default=AE_BATCH_SIZE, help="推理批处理规格")
+    parser.add_argument("--max-train-windows", type=int, default=None, help="强制截断训练样本数")
 
 
 def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
     """智能推断查询时间点：优先读取显式参数，其次读取未来测试集期初，否则回退使用训练集期末。"""
+    # 1. 显式指定参数最高优
     if getattr(args, "query_start", None):
         return pd.Timestamp(args.query_start)
 
+    # 2. 如果提供了未来 CSV，则以 CSV 开始日期作为默认预测起点
     future_csv = Path(args.future_csv).resolve()
     if future_csv.exists():
         future_df = pd.read_csv(future_csv)
         if "date" in future_df.columns and len(future_df) > 0:
             return pd.Timestamp(future_df["date"].iloc[0])
 
+    # 3. 兜底方案：计算训练集（库）的最后一个可能的时间点
     load_df = pd.read_csv(args.load_csv)
     load_df["date"] = pd.to_datetime(load_df["date"])
     train_rows = int(len(load_df) * float(args.train_ratio))
