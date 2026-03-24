@@ -692,9 +692,15 @@ class ConvLSTMAEWeatherEncoder:
         """
         初始化神经网络结构。
         将训练保存好的 ConvLSTM AutoEncoder 节点还原，并将前向执行模式设好以便之后特征抽取使用。
+
+        Args:
+            frame_height (int): 输入气象帧的高度。
+            frame_width (int): 输入气象帧的宽度。
         """
+        # 模型推理依赖于输入数据的标准化，因此必须先确保归一化所需的均值和标准差已加载
         self._ensure_norm_stats_loaded()
 
+        # 如果模型已经实例化，则仅检查输入尺寸是否与之前加载时一致
         if self._model is not None:
             if self.frame_height != int(frame_height) or self.frame_width != int(frame_width):
                 raise ValueError(
@@ -703,44 +709,79 @@ class ConvLSTMAEWeatherEncoder:
                 )
             return
 
+        # 校验模型权重文件 (.pth 或 .pt) 是否存在于指定路径
         checkpoint_path = Path(self.checkpoint_path)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"未找到 ConvLSTM AE 模型权重文件: {checkpoint_path}")
 
+        # 记录本次加载的图像尺寸，用于后续推理时的维度校验
         self.frame_height = int(frame_height)
         self.frame_width = int(frame_width)
+        
+        # 自动推断执行设备 (GPU 为首选，CPU 为兜底)
         self._device = self._resolve_device()
-        self._use_amp = self._device.type == "cuda"  # 利用自动混合精度加速编码过程
+        
+        # 如果在 CUDA 环境下运行，由于 ConvLSTM 运算量较大，启用自动混合精度 (AMP) 可以显著加速编码过程
+        self._use_amp = self._device.type == "cuda"
 
+        # 根据初始化参数实例化 ConvLSTM 自编码器网络结构
         model = ConvLSTMAutoEncoder(
-            in_channels=self.in_channels,
-            hidden_channels=self.hidden_dim,
-            latent_dim=self.output_dim,
-            num_layers=self.num_layers,
-            seq_len=self.window_size,
-            frame_height=self.frame_height,
-            frame_width=self.frame_width,
-        ).float().to(self._device)
+            in_channels=self.in_channels,     # 输入通道数
+            hidden_channels=self.hidden_dim,  # ConvLSTM 隐藏层通道数
+            latent_dim=self.output_dim,       # 中间潜变量层维度 (128)
+            num_layers=self.num_layers,       # 堆叠的 ConvLSTM 层数
+            seq_len=self.window_size,         # 时序窗口长度 (96)
+            frame_height=self.frame_height,   # 图像高度
+            frame_width=self.frame_width,     # 图像宽度
+        ).float().to(self._device)            # 将模型权重转换为 float32 并搬运至指定计算设备
+
+        # 从磁盘加载预训练好的权重字典到模型中
         model.load_state_dict(torch.load(checkpoint_path, map_location=self._device))
-        model.eval()  # 固定 Batch Normalization、Dropout 的运行方式
+        
+        # 将模型设为评估模式 (Evaluation Mode)，该模式会禁用 Dropout 并将 Batch Normalization 固定在此前训练得到的均值和方差上
+        model.eval()
+        
+        # 将初始化并装载完毕的模型挂载到实例变量上，供后续 transform_frame_block 等方法调用
         self._model = model
 
     def preprocess_frames(self, frames: np.ndarray) -> np.ndarray:
-        """预处理：数据对齐校验 -> 偏度修正裁剪 -> 根据训练总集分布做标准缩放均一化。"""
+        """
+        [预处理环节] 对原始气象帧序列进行清洗和数值规范化。
+        
+        流程包括：数据类型转换 -> 维度与通道校验 -> 极端值对数平滑 -> Z-Score 标准化。
+        
+        Args:
+            frames: 形状为 [T, C, H, W] 的原始气象张量。
+            
+        Returns:
+            np.ndarray: 处理后的 float32 标准化张量副本。
+        """
+        # 1. 确保标准化依赖的均值 (mean) 和标准差 (std) 已经从磁盘加载到内存
         self._ensure_norm_stats_loaded()
 
+        # 2. 转换为 numpy 数组并创建副本，避免原地修改 (In-place) 传入的原始输入对象
         arr = np.asarray(frames, dtype=np.float32).copy()
+        
+        # 3. 维度校验：ConvLSTM 期望的时序图像输入必须是 4 维 (时间帧, 通道, 高度, 宽度)
         if arr.ndim != 4:
             raise ValueError(f"气象序列维度必须为 [T, C, H, W]，但获得的是 {arr.shape}")
+            
+        # 4. 通道一致性校验：输入数据的气象通道数量必须与训练集统计出的一致 (通常为 10 通道)
         if arr.shape[1] != self.channel_count:
             raise ValueError(
                 f"气象数据通道数错误：期望为 {self.channel_count}，但获得的是 {arr.shape[1]}"
             )
 
+        # 5. 特殊通道处理：对降水、风速等具有高度右偏性 (Skewed) 的通道执行对数变换
+        # log1p(x) 等价于 log(1 + x)，能有效处理包含大量 0 的稀疏数据，且防止负值异常
         for channel in self.log1p_channels:
             arr[:, channel, :, :] = np.log1p(np.clip(arr[:, channel, :, :], a_min=0.0, a_max=None))
 
+        # 6. 标准化：减去全局均值并除以标准差，将各通道数据缩放到约 [-1, 1] 范围内
+        # 这一步对于神经网络的收敛和特征表征性能至关重要
         arr = (arr - self.channel_mean) / self.channel_std
+        
+        # 7. 返回最终的 float32 数组，确保内存布局紧凑
         return arr.astype(np.float32, copy=False)
 
     def transform_frame_block(
@@ -749,34 +790,62 @@ class ConvLSTMAEWeatherEncoder:
         expected_windows: Optional[int] = None,
     ) -> np.ndarray:
         """
-        核心气象序列嵌入函数（长块接口）。
-        沿滑动窗口机制裁剪处理连续数据集并喂入 AutoEncoder 将其转换为固定尺寸特征表示以便比较或者建立检索树。
+        [核心嵌入接口] 将长序列连续气象帧通过滑动窗口转换为低维潜向量。
+        
+        该方法主要用于离线建库阶段，处理整个训练集的大块气象数据。它会自动执行：
+        滑动窗口切片 -> 格式转换 -> 批处理推理 -> 编码生成。
+
+        Args:
+            frames: 形状为 [T_long, C, H, W] 的长气象帧序列。
+            expected_windows: 预期产生的窗口数，用于防止数据缺失导致的逻辑错误。
+
+        Returns:
+            np.ndarray: 生成的特征矩阵，形状为 [N_windows, latent_dim] (即 [N, 128])。
         """
+        # 1. 执行预处理 (标准化、对数变换等)
         frames = self.preprocess_frames(frames)
+        
+        # 2. 基础长度校验：输入序列至少需要能覆盖一个完整的时间窗口
         if frames.shape[0] < self.window_size:
             raise ValueError(
                 f"气象输入序列总长度不足时间窗口的大小预设值: {frames.shape[0]} < {self.window_size}"
             )
 
+        # 3. 动态加载神经网络模型（初次调用时触发）
         self._ensure_model_loaded(frames.shape[2], frames.shape[3])
+        
+        # 4. 核心滑动窗口生成逻辑：
+        # 利用 sliding_window_view 高效产生视图，避免数据物理复制。
+        # 结果形状从 [T_long, C, H, W] 变为 [N_windows, C, H, W, T_window_size]
         window_view = sliding_window_view(frames, window_shape=self.window_size, axis=0)
+        
+        # 将时序步维度 (T) 移到通道维度之前，以符合 ConvLSTM 的输入习惯：[N, T, C, H, W]
         window_view = np.moveaxis(window_view, -1, 1)
+        
+        # 5. 生成结果的规模审计
         num_windows = int(window_view.shape[0])
         if expected_windows is not None and num_windows != int(expected_windows):
             raise RuntimeError(f"预期获得 {expected_windows} 窗口的数据切片量但返回了 {num_windows} 个")
 
+        # 6. 分批推理过程：避免大数据量一次性塞入显存导致 OOM
         encoded = np.empty((num_windows, self.output_dim), dtype=np.float32)
         micro_batch = max(1, self.batch_size)
 
         for start in range(0, num_windows, micro_batch):
             end = min(start + micro_batch, num_windows)
+            # 准备一批数据用于推理，强制转换为 C 连续内存布局以加速张量拷贝
             batch_np = np.array(window_view[start:end], dtype=np.float32, copy=True, order="C")
+            # 将 Numpy 数据搬运至指定的硬件设备 (GPU/CPU)
             batch_tensor = torch.from_numpy(batch_np).to(device=self._device, dtype=torch.float32)
-            # 无需反向传播，节约并且加快推理运行
+            
+            # 使用推理模式关闭梯度记录，显著降低内存开销并提升速度
             with torch.inference_mode():
-                # 用混合精度降低运算负荷加速计算
+                # 开启自动混合精度加速推理运算
                 with torch.amp.autocast("cuda", enabled=self._use_amp):
+                    # 获取该批次气象窗口对应的潜向量编码
                     batch_encoded = self._model.encode(batch_tensor)
+            
+            # 将结果回传至内存并转回 float32 系统精度
             encoded[start:end] = batch_encoded.float().cpu().numpy()
 
         return encoded
@@ -790,9 +859,24 @@ class ConvLSTMAEWeatherEncoder:
         window_batch: np.ndarray,
         expected_windows: Optional[int] = None,
     ) -> np.ndarray:
+        """
+        [低层接口] 对已经切分好的气象窗口批次进行编码。
+        
+        该方法接收一个 5 维张量 [批大小, 时间步, 通道, 高, 宽]，
+        并在执行预处理（标准化、对数变换）后，通过 ConvLSTM 编码器提取特征。
+
+        Args:
+            window_batch (np.ndarray): 5D 数组，形状为 [N, T, C, H, W]。
+            expected_windows (int, optional): 预期窗口数量，用于运行时一致性校验。
+
+        Returns:
+            np.ndarray: [N, latent_dim] 的编码特征数组。
+        """
+        # 确保预处理统计量已加载
         self._ensure_norm_stats_loaded()
 
         windows = np.asarray(window_batch, dtype=np.float32)
+        # 基本维度校验
         if windows.ndim != 5 or windows.shape[1] != self.window_size:
             raise ValueError(
                 f"窗口批次必须为 [N, {self.window_size}, C, H, W]，实际 {windows.shape}"
@@ -802,14 +886,19 @@ class ConvLSTMAEWeatherEncoder:
                 f"窗口批次通道数必须为 {self.channel_count}，实际 {windows.shape[2]}"
             )
 
+        # 确保神经网络模型已加载至正确设备
         self._ensure_model_loaded(windows.shape[3], windows.shape[4])
 
+        # 准备标准化后的数据副本
         arr = np.array(windows, dtype=np.float32, copy=True, order="C")
+        
+        # 对特定的降水/风速通道应用 log1p 变换以减弱极端值的影响
         for channel in self.log1p_channels:
             arr[:, :, channel, :, :] = np.log1p(
                 np.clip(arr[:, :, channel, :, :], a_min=0.0, a_max=None)
             )
 
+        # 全局 Z-Score 标准化：根据训练集的像素级分布进行缩放
         channel_mean = self.channel_mean.reshape(1, 1, self.channel_count, 1, 1)
         channel_std = self.channel_std.reshape(1, 1, self.channel_count, 1, 1)
         arr = (arr - channel_mean) / channel_std
@@ -818,15 +907,22 @@ class ConvLSTMAEWeatherEncoder:
         if expected_windows is not None and num_windows != int(expected_windows):
             raise RuntimeError(f"期望得到 {expected_windows} 个窗口，实际为 {num_windows}。")
 
+        # 预分配结果空间
         encoded = np.empty((num_windows, self.output_dim), dtype=np.float32)
         micro_batch = max(1, self.batch_size)
+        
+        # 分小批次喂入模型，防止显存溢出 (OOM)
         for start in range(0, num_windows, micro_batch):
             end = min(start + micro_batch, num_windows)
             batch_np = np.array(arr[start:end], dtype=np.float32, copy=True, order="C")
             batch_tensor = torch.from_numpy(batch_np).to(device=self._device, dtype=torch.float32)
+            
+            # 使用推理模式和混合精度提升效率
             with torch.inference_mode():
                 with torch.amp.autocast("cuda", enabled=self._use_amp):
                     batch_encoded = self._model.encode(batch_tensor)
+            
+            # 将 GPU 上的特征张量搬运回 CPU 的 NumPy 数组中
             encoded[start:end] = batch_encoded.float().cpu().numpy()
 
         return encoded
@@ -941,6 +1037,16 @@ class SimilarDayRetriever:
 
     @staticmethod
     def _is_midnight_timestamp(timestamp: pd.Timestamp) -> bool:
+        """
+        静态辅助方法：判断给定的时间戳是否恰好为当天的午夜零点 (00:00:00)。
+        这对于确保检索检索到的历史片段按整日对齐至关重要。
+
+        Args:
+            timestamp: 需要检查的时间戳对象。
+
+        Returns:
+            bool: 如果是零点则返回 True，否则返回 False。
+        """
         ts = pd.Timestamp(timestamp)
         return (
             ts.hour == 0
@@ -956,7 +1062,23 @@ class SimilarDayRetriever:
         train_row_count: int,
         max_train_windows: Optional[int] = None,
     ) -> np.ndarray:
+        """
+        计算并筛选出所有合法的训练窗口起始索引。
+        算法逻辑：
+        1. 寻找负荷序列中第一个出现的午夜零点作为起始锚点。
+        2. 按照 build_stride (步长) 向后滑动，生成候选索引序列。
+        3. 验证每个起始位置的时间戳是否符合零点对齐要求。
+
+        Args:
+            load_dates: 负荷数据的时间戳序列。
+            train_row_count: 用于训练的总行数限制。
+            max_train_windows: 如果指定，则限制生成的窗口总数上限。
+
+        Returns:
+            np.ndarray: 包含所有合法起始索引的 int64 数组。
+        """
         train_row_count = int(train_row_count)
+        # 最大的起始索引不能超过（总行数 - 预测窗口长度）
         max_start = train_row_count - self.pred_len
         if max_start < 0:
             raise ValueError(
@@ -964,14 +1086,19 @@ class SimilarDayRetriever:
             )
 
         dates = pd.DatetimeIndex(pd.to_datetime(load_dates))
+        
+        # 第一步：在可用序列中定位第一个零点位置
         first_midnight_index = None
         for idx in range(max_start + 1):
             if self._is_midnight_timestamp(dates[idx]):
                 first_midnight_index = idx
                 break
+        
         if first_midnight_index is None:
             raise ValueError("训练数据中找不到从 00:00:00 开始的完整日窗口。")
 
+        # 第二步：从第一个零点开始，按照指定的步长 (Stride) 生成索引建议。
+        # Stride 通常等于 pred_len (96)，即按天滑动；也可以设为更小的值以增加样本重叠度。
         start_indices = np.arange(
             first_midnight_index,
             max_start + 1,
@@ -981,16 +1108,20 @@ class SimilarDayRetriever:
         if start_indices.size == 0:
             raise ValueError("当前 build_stride 设置下无法生成任何训练窗口。")
 
+        # 第三步：双重校验，确保筛选后的每一个起始索引对应的时间戳依然是零点
         valid_mask = np.array(
             [self._is_midnight_timestamp(dates[int(idx)]) for idx in start_indices],
             dtype=bool,
         )
         start_indices = start_indices[valid_mask]
+        
         if start_indices.size == 0:
             raise ValueError("当前 build_stride 无法保持窗口起点对齐到 00:00:00。")
 
+        # 第四步：如果设置了最大窗口数限制，则执行截断
         if max_train_windows is not None:
             start_indices = start_indices[: int(max_train_windows)]
+        
         if start_indices.size == 0:
             raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
 
@@ -1000,54 +1131,78 @@ class SimilarDayRetriever:
         self, weather_store: HDF5WeatherSequenceStore, frame_count: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        批处理计算所有历史用于建库的高清晰度气象图像的单通道像素级全局均值和方差。
+        [增量统计接口] 批处理计算全量历史气象图像的单通道像素级全局均值和方差。
+        
+        由于气象 HDF5 文件极其巨大（通常 10GB 以上），无法一次性加载到内存。
+        本方法采用“在线算法”思想：分批读取数据，累加元素和与平方和，最后计算全局统计量。
 
         Args:
-            weather_store: 数据存放读入句柄。
-            frame_count: 用于计算这前多少帧。
+            weather_store: 用于读取 HDF5 数据的存储对象。
+            frame_count: 参与计算的总时间帧数。
 
         Returns:
-            Tuple[np.ndarray, np.ndarray]: 形状为 (1, C, 1, 1) 的全局均值和标准差矩阵。
+            Tuple[np.ndarray, np.ndarray]: 
+                - mean: 形状为 (1, C, 1, 1) 的全局像素均值。
+                - std: 形状为 (1, C, 1, 1) 的全局像素标准差。
         """
         if frame_count <= 0:
             raise ValueError("frame_count 必须为正整数。")
 
         channel_count = int(weather_store.frame_shape[0])
-        # 使用 float64 进行累加以抵御巨量数字之下的精度溢出
-        total_sum = np.zeros((1, channel_count, 1, 1), dtype=np.float64)
-        total_sq_sum = np.zeros((1, channel_count, 1, 1), dtype=np.float64)
-        total_pixels = 0
+        
+        # 1. 初始化累加器
+        # 使用 float64 (双精度) 进行累加以抵御数亿个像素点叠加时可能发生的精度丢失或溢出
+        total_sum = np.zeros((1, channel_count, 1, 1), dtype=np.float64)     # 元素总和 ΣX
+        total_sq_sum = np.zeros((1, channel_count, 1, 1), dtype=np.float64)  # 平方总和 ΣX^2
+        total_pixels = 0  # 总有效像素计数 (N)
 
+        # 2. 确定批处理规格，平衡内存占用与读取效率
         batch_frames = max(self.build_batch_size, 256)
         total_batches = math.ceil(frame_count / batch_frames)
 
+        # 3. 循环遍历所有帧，执行分批累加
         for batch_idx, start in enumerate(range(0, frame_count, batch_frames), start=1):
             end = min(frame_count, start + batch_frames)
+            # 从 HDF5 磁盘文件中按切片读取当前批次数据
             frames = weather_store.get_block(start, end)
+            
+            # 对特定通道执行 log1p 变换，确保统计结果与编码器输入的量纲一致
             for channel in self.log1p_channels:
                 frames[:, channel, :, :] = np.log1p(
                     np.clip(frames[:, channel, :, :], a_min=0.0, a_max=None)
                 )
 
-            # 沿所有空间 H 和 W 以及本批的时间帧 T 累加
+            # 沿所有空间维度 (H, W) 以及批内的时间轴 (T) 执行求和，仅保留通道维度 (C)
             total_sum += frames.sum(axis=(0, 2, 3), keepdims=True, dtype=np.float64)
+            # 累加每个像素的平方
             total_sq_sum += np.square(frames, dtype=np.float64).sum(
                 axis=(0, 2, 3), keepdims=True, dtype=np.float64
             )
-            # 记录累积到底除以多少个像素点
+            
+            # 更新已处理的总像素数 (N = Batch_T * H * W)
             total_pixels += frames.shape[0] * frames.shape[2] * frames.shape[3]
 
+            # 进度打印，方便监控长时间的统计任务
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
                 print(
-                    f"[通道统计] 批次 {batch_idx}/{total_batches} "
-                    f"frames={start}:{end}"
+                    f"[通道统计] 进度 {batch_idx}/{total_batches} "
+                    f"处理帧范围: {start}:{end}"
                 )
 
-        # 运用 E(X^2) - [E(X)]^2 的性质反推出方差，并加以 eps 防止其坍塌到负数边界（由于浮点误差）
+        # 4. 计算最终结果：运用概率论中的方差计算公式 Var(X) = E(X^2) - [E(X)]^2
+        
+        # 全局均值 E(X) = ΣX / N
         mean = (total_sum / total_pixels).astype(np.float32)
+        
+        # 全局方差 Var(X) = (ΣX^2 / N) - mean^2
         variance = (total_sq_sum / total_pixels) - np.square(mean, dtype=np.float64)
+        
+        # 鲁棒性处理：由于浮点误差，方差可能出现极微小的负数，需强行截止到 eps (1e-8)
         variance = np.maximum(variance, 1e-8)
+        
+        # 标准差 std = sqrt(Var)
         std = np.sqrt(variance).astype(np.float32)
+        
         return mean, std
 
     def _iter_raw_feature_batches(
@@ -1058,20 +1213,46 @@ class SimilarDayRetriever:
         stage_name: str,
     ) -> Iterator[np.ndarray]:
         """
-        一个生成器，用于遍历指定数量的训练窗口，分块产生尚未经 PCA 压缩的时空描述向量。
+        [流式特征生成器] 逐块遍历整个气象数据集，产生未经压缩的原始特征描述向量。
+        
+        该生成器特别适用于 StatisticalWeatherEncoder (PCA方案) 的拟合过程，
+        它能确保在内存占用极小的情况下，完成对数万个气象时间窗口的特征提取。
+
+        Args:
+            weather_store: 气象 HDF5 存储对象。
+            encoder: 用于执行空间统计量提取的编码器。
+            n_windows: 本次迭代需要涵盖的总窗口数量。
+            stage_name: 当前处理阶段的显示名称（用于日志打印）。
+
+        Returns:
+            Iterator[np.ndarray]: 每次产生形状为 [batch_size, raw_feature_dim] 的特征批次。
         """
+        # 1. 计算总批次数以便于进度监控
         total_batches = math.ceil(n_windows / self.build_batch_size)
+        
+        # 2. 按步长 (build_batch_size) 循环产生每个数据块
         for batch_idx, start in enumerate(range(0, n_windows, self.build_batch_size), start=1):
+            # 确定当前批次的实际大小 (处理最后一批不满的情况)
             current_size = min(self.build_batch_size, n_windows - start)
+            
+            # 重要：计算本批次气象帧读取的截止位置 (End Index)
+            # 由于每个窗口本身有 pred_len (通常为 96) 的长度，我们需要额外多读 95 帧以保证最后一个窗口能取全
             end = start + current_size + self.pred_len - 1
+            
+            # 3. 从磁盘一次性拉取该连续帧大块，减少 I/O 碎片化开销
             frames = weather_store.get_block(start, end)
+            
+            # 4. 调用编码器的内部方法，将 [T, C, H, W] 空间序列转换为 [N, Dim] 原始统计量向量
             raw = encoder.extract_raw_features_from_block(frames, expected_windows=current_size)
 
+            # 5. 打印关键进度节点（第1批、最后1批及约 1/8 间隔点）
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
                 print(
-                    f"[{stage_name}] 批次 {batch_idx}/{total_batches} "
-                    f"windows={start}:{start + current_size - 1}"
+                    f"[{stage_name}] 进度 {batch_idx}/{total_batches} "
+                    f"窗口范围={start}:{start + current_size - 1}"
                 )
+            
+            # 6. 使用生成器 yield 返回，自动管理内存释放
             yield raw
 
     def _iter_weather_embedding_batches(
@@ -1082,35 +1263,61 @@ class SimilarDayRetriever:
         stage_name: str,
     ) -> Iterator[np.ndarray]:
         """
-        分批产生经过 ConvLSTM 自编码器嵌入后的特征向量流。
+        [深度特征生成器] 分批产生经过 ConvLSTM 自编码器嵌入后的紧凑特征向量流。
+        
+        该方法驱动气象编码器对底库中所有的历史气象窗口进行批量推理。
+        通过生成器模式，可以平滑地处理数以千计的 4D 气象图像块而不会撑爆内存。
+
+        Args:
+            weather_store: 气象 HDF5 数据存储句柄。
+            encoder: 已加载权重的 ConvLSTM 自编码器编码器。
+            window_start_indices: 负荷数据对应的训练窗口起始索引集合。
+            stage_name: 用于进度显示的文本标签。
+
+        Returns:
+            Iterator[np.ndarray]: 每次 yield 一个包含 batch_size 个嵌入向量的 array [N, 128]。
         """
-        # 兼容性处理：部分环境下由于编码问题可能需要清洗阶段名称中的非 ASCII 字符（如在原始终端导出日志时）
+        # 1. 确保起始索引为一维 numpy 数组，方便后续切片操作
         start_indices = np.asarray(window_start_indices, dtype=np.int64)
         if start_indices.ndim != 1 or start_indices.size == 0:
             raise ValueError("window_start_indices 必须是一维且非空。")
 
+        # 2. 鲁棒性处理：部分环境控制台不支持中文，将 stage_name 清洗为纯 ASCII 以防打印崩溃
         safe_stage_name = stage_name.encode("ascii", errors="ignore").decode("ascii").strip() or "weather_batch"
+        
+        # 3. 计算实际的批处理规格：取建库配置与编码器内部显存限制的最小值
         effective_batch_size = max(1, min(self.build_batch_size, encoder.batch_size))
         total_batches = math.ceil(len(start_indices) / effective_batch_size)
+        
+        # 获取单帧气象图像的形状 (C, H, W)
         frame_shape = tuple(int(x) for x in weather_store.frame_shape)
 
+        # 4. 循环切片起始索引，执行分批转换
         for batch_idx, offset in enumerate(range(0, len(start_indices), effective_batch_size), start=1):
+            # 取出本批次的所有起始位置
             batch_starts = start_indices[offset : offset + effective_batch_size]
             current_size = len(batch_starts)
+            
+            # 5. 内存管理：预分配一个 [N, T, C, H, W] 的 5 维大张量存放批量窗口数据
+            # 这一步将多个不连续的磁盘读取组合成一个连续的内存块，以便于 GPU 推理
             batch_windows = np.empty((current_size, self.pred_len, *frame_shape), dtype=np.float32)
             for row_idx, start_idx in enumerate(batch_starts):
                 batch_windows[row_idx] = weather_store.get_window(int(start_idx), self.pred_len)
 
+            # 6. 调用神经网络编码器，将 5 维气象序列转换为 2 维潜变量特征
             batch_vectors = encoder.transform_window_batch(
                 batch_windows,
                 expected_windows=current_size,
             )
 
+            # 7. 进度打印：在特定的步长节点输出日志，方便开发者监控“特征固化”进度
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
                 print(
-                    f"[{safe_stage_name}] 批次 {batch_idx}/{total_batches} "
-                    f"windows={int(batch_starts[0])}:{int(batch_starts[-1])}"
+                    f"[{safe_stage_name}] 进度 {batch_idx}/{total_batches} "
+                    f"处理索引范围: {int(batch_starts[0])}:{int(batch_starts[-1])}"
                 )
+            
+            # 8. 产出本批次特征并释放 batch_windows 内存占位
             yield batch_vectors
 
     def _build_time_vectors(self, timestamps: Sequence[pd.Timestamp]) -> np.ndarray:
