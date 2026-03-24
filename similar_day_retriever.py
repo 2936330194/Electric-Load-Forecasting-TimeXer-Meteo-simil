@@ -1043,9 +1043,6 @@ class SimilarDayRetriever:
 
         Args:
             timestamp: 需要检查的时间戳对象。
-
-        Returns:
-            bool: 如果是零点则返回 True，否则返回 False。
         """
         ts = pd.Timestamp(timestamp)
         return (
@@ -1328,9 +1325,12 @@ class SimilarDayRetriever:
 
     def _fuse_and_normalize(self, weather_vectors: np.ndarray, time_vectors: np.ndarray) -> np.ndarray:
         """
-        核心的多模态融合计算环节：
-        分别对气象向量做 L2 归一化；对时间特征乘以时间权重参数；
-        拼接后再次对总体执行 L2 归一化。这保障了检索特征处于同一量级，并且可以使用高效的 faiss.IndexFlatIP。
+        核心的多模态协同计算环节 (已修复隐式跨模态数学漏洞)：
+        1. 保持气象向量在独立子空间的 L2 归一化。
+        2. 将线性的标量时间特征 (值域 [-0.5, 0.5]) 强制向循环编码 (Cyclic Encoding) 转换。这保证：
+           a. 消除由于线性阶段性导致“深夜”和“凌晨”内积跳变为负（极不相似）的荒谬判定；
+           b. 构建出了一个所有时刻 L2 范数都恒等于常数的时间特征集。
+        3. 水平拼接气象与加权时间特征，并对总体进行最终的 L2 归一化。由于现在拼接的两端向量都拥有了恒定不变的范数，这里的归一化成为了“安全的各向同性收缩”，彻底规避了不同时间查询时气象权重遭到倾轧（坍缩）的问题。
         """
         weather_vectors = l2_normalize(np.asarray(weather_vectors, dtype=np.float32))
         time_vectors = np.asarray(time_vectors, dtype=np.float32)
@@ -1338,11 +1338,30 @@ class SimilarDayRetriever:
             raise ValueError(
                 f"气象向量与时间向量样本数不一致: {weather_vectors.shape[0]} vs {time_vectors.shape[0]}"
             )
-        # 放大时间特征的权重以增强按相似节假日/相似周期检索的属性
-        weighted_time = time_vectors * self.time_weight
-        # 将归一化的气象表征和加权的时间特征在特征维度 (Axis=1) 水平拼接
+
+        # 漏洞修复一：线性特征 -> [0, 2π] 弧度制
+        # 这里 +0.5 平移是为了将 [-0.5, 0.5] 对齐到 [0, 1] 的完整一圈周期信号中
+        radians = (time_vectors + 0.5) * 2.0 * np.pi
+        
+        # 步骤二：极坐标分解保证周期无缝闭环
+        # sin^2(x) + cos^2(x) = 1，每对特征贡献恒定的范数
+        cyclic_time_vectors = np.hstack([np.sin(radians), np.cos(radians)]).astype(np.float32, copy=False)
+        
+        # 步骤三（关键修复）：对时间子空间也做 L2 归一化，使其 L2 范数 = 1
+        # 未归一化时 cyclic 向量的 L2 = sqrt(原始时间维度) (例如 5 维时间 -> sqrt(5) = 2.24)
+        # 这会导致 time_weight=2.0 时，时间在总特征中实际占比高达 95%，气象几乎被边缘化。
+        # 归一化后，time_weight 才真正成为可解释的模态权重比值。
+        cyclic_time_vectors = l2_normalize(cyclic_time_vectors)
+        
+        # 步骤四：施加时间权重系数
+        # 此时 weather 子空间 L2=1, time 子空间 L2=time_weight
+        # 最终相似度中两个模态的贡献比 = 1 : time_weight^2
+        weighted_time = cyclic_time_vectors * self.time_weight
+        
+        # 步骤五：水平拼接两个模态的特征
         fused = np.hstack([weather_vectors, weighted_time]).astype(np.float32, copy=False)
-        # 最后对混合的描述向量做 L2 归一化，以便于后续支持精确内积相似度
+        
+        # 步骤六：投射到单位超球面，使 faiss.IndexFlatIP 的内积等价于余弦相似度
         return l2_normalize(fused)
 
     def build(
