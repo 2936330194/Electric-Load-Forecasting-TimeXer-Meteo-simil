@@ -35,7 +35,6 @@ import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.decomposition import IncrementalPCA
 from sklearn.preprocessing import StandardScaler
-from utils.timefeatures import time_features
 # 从 convlstm_ae 模块导入自编码器模型及其相关的训练/推理配置
 from convlstm_ae import (
     BATCH_SIZE as AE_BATCH_SIZE,         # 推理时的批大小
@@ -1321,7 +1320,22 @@ class SimilarDayRetriever:
         """从对应时间序列中提取周期性时间特征 embedding（例如：月、日、时等）"""
         timestamps = pd.DatetimeIndex(pd.to_datetime(timestamps))
         # time_features 返回尺寸为 [C, N] 的时间特征，随后转置成 [N, C]
-        return time_features(timestamps, freq=self.freq).T.astype(np.float32)
+        if len(timestamps) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+
+        iso_week = timestamps.isocalendar().week.to_numpy(dtype=np.float32)
+
+        # Retrieval windows are aligned to 00:00:00, so minute/hour features are
+        # constant across the index and dilute the useful weekly and seasonal cues.
+        time_vectors = np.column_stack(
+            [
+                timestamps.dayofweek.to_numpy(dtype=np.float32) / 6.0 - 0.5,
+                (timestamps.day.to_numpy(dtype=np.float32) - 1.0) / 30.0 - 0.5,
+                (timestamps.dayofyear.to_numpy(dtype=np.float32) - 1.0) / 365.0 - 0.5,
+                (iso_week - 1.0) / 52.0 - 0.5,
+            ]
+        )
+        return time_vectors.astype(np.float32, copy=False)
 
     def _fuse_and_normalize(self, weather_vectors: np.ndarray, time_vectors: np.ndarray) -> np.ndarray:
         """
