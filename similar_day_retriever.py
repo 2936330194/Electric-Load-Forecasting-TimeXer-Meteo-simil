@@ -948,7 +948,7 @@ class SimilarDayRetriever:
     def __init__(
         self,
         weather_dim: int = AE_LATENT_DIM,
-        time_weight: float = 2.0,
+        time_weight: float = 1.22,
         pred_len: int = 96,
         train_ratio: float = 2.0 / 3.0,
         freq: str = "15min",
@@ -1803,7 +1803,7 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5), help="气象 HDF5 路径")
     parser.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR), help="模型/库保存目录")
     parser.add_argument("--weather-dim", type=int, default=AE_LATENT_DIM, help="目标潜向量维度")
-    parser.add_argument("--time-weight", type=float, default=2.0, help="时间特征权重 (alpha)")
+    parser.add_argument("--time-weight", type=float, default=1.22, help="时间特征权重 (alpha)")
     parser.add_argument("--pred-len", type=int, default=96, help="预测步长/窗口长度")
     parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0, help="前多少比例的数据用于建库")
     parser.add_argument("--build-batch-size", type=int, default=384, help="建库批处理规格")

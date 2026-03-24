@@ -1,7 +1,7 @@
 {
   "weather_dim_requested": 128,
   "weather_dim_effective": 128,
-  "time_weight": 2.0,
+  "time_weight": 1.22,
   "pred_len": 96,
   "train_ratio": 0.6666666666666666,
   "freq": "15min",
@@ -23,6 +23,6 @@
   "weather_h5_path": "D:\\Pycharm Project\\Scientific Reasearch\\Electricity Forecasting\\Electric Load Forecasting TimeXer Meteo simil\\data\\hunan_grid_meteo_20250101_20260228.h5",
   "train_frame_count": 23328,
   "train_window_count": 243,
-  "fused_dim": 133,
+  "fused_dim": 138,
   "index_backend": "faiss"
 }
