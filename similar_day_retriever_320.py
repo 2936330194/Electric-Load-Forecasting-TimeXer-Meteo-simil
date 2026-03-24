@@ -4,14 +4,14 @@ similar_day_retriever_320.py
 基于《相似日检索系统架构设计文档_单年精简版》的独立实现：
 
 1. 使用 2025 年负荷数据前 2/3 训练段构建离线检索库
-2. 将未来 96 步气象窗口编码为 320 维向量
+2. 将未来 10 个通道 96 步 的气象窗口编码为 128 维潜向量
 3. 叠加 5 维时间特征并进行时间权重提权
 4. 采用 Exact Inner Product Search 返回 Top-K 相似历史负荷曲线
 
 说明：
-- 本程序不改动也不依赖 convlstm_ae.py 的训练流程
-- 320 维气象编码在本程序内独立完成：
-  原始气象帧 -> 空间统计摘要 -> StandardScaler -> IncrementalPCA(320)
+- 本程序不改动 `convlstm_ae.py` 的训练流程，但在推理时依赖其定义的模型结构和训练出的权重。
+- 128 维气象编码通过预训练模型完成：
+  原始气象帧 -> 对数变换(log1p) -> 通道级标准化 -> ConvLSTM-AE Encoder -> 128 维潜映射(Latent)
 - faiss 可用时优先使用 IndexFlatIP；不可用时自动回退到 NumPy 精确检索
 """
 
@@ -392,16 +392,16 @@ class HDF5WeatherSequenceStore:
         return self.get_window(start_index, int(window_size))
 
 
-class StatisticalWeatherEncoder320:
+class StatisticalWeatherEncoder:
     """
-    独立的 320 维气象编码器。
-    它负责将极高维度的气象图像序列(如 96小时 * 10通道 * 61高 * 62宽) 降维成 320 维的稠密向量。
+    独立的统计型气象编码器（备选方案）。
+    它负责将极高维度的气象图像序列(如 96小时 * 10通道 * 61高 * 62宽) 通过空间统计和 PCA 降维。
 
     核心处理流程式：
     1. 预处理 (log1p & Standard Scale): 对原始 [T, C, H, W] 气象块进行对数变换和 Z-Score 标准化。
     2. 空间聚合降维: 沿空间维度 (H, W) 提取像素单帧的全局统计量：mean/std/min/max，得到 [T, C] 分布。
     3. 时序拼接展开: 以指定的窗口步长 (例如 96 步) 滑动，收集窗口内的所有空间统计信息拼接为一个巨大的描述向量。
-    4. 特征降维 (PCA): 用标准缩放器做二次处理最后交由增量PCA (IncrementalPCA) 解压到紧凑的 320 维子空间。
+    4. 特征降维 (PCA): 用标准缩放器做二次处理最后交由增量PCA (IncrementalPCA) 解压到紧凑的低维子空间。
     """
 
     def __init__(
@@ -418,7 +418,7 @@ class StatisticalWeatherEncoder320:
         初始化统计编码器。
 
         Args:
-            weather_dim: 最终所需的PCA输出维度，通常设定为 320 以保持计算精度和极高的检索效率。
+            weather_dim: 最终所需的输出维度，如果使用统计方案，该维度由 PCA 产生。
             window_size: 气象窗口长度 (时间步数)，对应于预测步长。
             stats: 要提取的空间维统计度量名列表。
             log1p_channels: 因为偏度极高，需要预先进行 log(1+x) 缩放转换的气象通道索引（例如降水通道）。
@@ -570,7 +570,7 @@ class StatisticalWeatherEncoder320:
         对给定的时空拼接版巨大向量进行压缩转换。
 
         Returns:
-            np.ndarray: 被压缩为 320 维的稠密潜变量表达。
+            np.ndarray: 被压缩后的稠密潜变量表达。
         """
         if self.feature_scaler is None or self.pca is None or self.output_dim is None:
             raise RuntimeError("编码器尚未完成 fit。")
@@ -783,13 +783,13 @@ class ConvLSTMAEWeatherEncoder:
         return None
 
 
-class SimilarDayRetriever320:
+class SimilarDayRetriever:
     """
     相似日检索系统主类。
     
     整合并驱动了以下流程：
     1. 负荷/气象数据对齐加载和划分；
-    2. 气象统计编码器的拟合与全量库特征转换；
+    2. 气象编码器的初始化与全量库特征转换；
     3. 时间特征向量生成及与气象特征的多模态加权融合 (时间特征由 alpha 参数提权) ；
     4. 建立底库索引 (ExactInnerProductIndex) ；
     5. 提供基于时间戳、在线气象窗口、或者未来的独立气象窗口的 Top-K 查询；
@@ -969,17 +969,23 @@ class SimilarDayRetriever320:
         n_windows: int,
         stage_name: str,
     ) -> Iterator[np.ndarray]:
+        """
+        分批产生经过 ConvLSTM 自编码器嵌入后的特征向量流。
+        """
+        # 兼容性处理：部分环境下由于编码问题可能需要清洗阶段名称中的非 ASCII 字符（如在原始终端导出日志时）
         safe_stage_name = stage_name.encode("ascii", errors="ignore").decode("ascii").strip() or "weather_batch"
         total_batches = math.ceil(n_windows / self.build_batch_size)
         for batch_idx, start in enumerate(range(0, n_windows, self.build_batch_size), start=1):
             current_size = min(self.build_batch_size, n_windows - start)
+            # 计算当前窗口组所需的总帧数范围
             end = start + current_size + self.pred_len - 1
             frames = weather_store.get_block(start, end)
+            # 使用神经网络执行前向传播生成潜向量
             batch_vectors = encoder.transform_frame_block(frames, expected_windows=current_size)
 
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
                 print(
-                    f"[{safe_stage_name}] 批次 {batch_idx}/{total_batches} "
+                    f"[{stage_name}] 批次 {batch_idx}/{total_batches} "
                     f"windows={start}:{start + current_size - 1}"
                 )
             yield batch_vectors
@@ -1015,7 +1021,7 @@ class SimilarDayRetriever320:
         weather_h5_path: Union[str, Path] = DEFAULT_WEATHER_H5,
         artifact_dir: Optional[Union[str, Path]] = None,
         max_train_windows: Optional[int] = None,
-    ) -> "SimilarDayRetriever320":
+    ) -> "SimilarDayRetriever":
         """
         开始执行建库全流程。
         读取数据、切分训练数据、拟合编码器、压缩特征、融合构建索引并保存。
@@ -1051,7 +1057,7 @@ class SimilarDayRetriever320:
         load_curves = np.ascontiguousarray(load_curves.astype(np.float32))
 
         print("=" * 72)
-        print("开始构建 320 维相似日检索库")
+        print("开始构建时空相似日检索库 (ConvLSTM-AE)")
         print(f"负荷数据: {Path(load_csv_path).resolve()}")
         print(f"气象数据: {Path(weather_h5_path).resolve()}")
         print(f"训练比例: {self.train_ratio:.6f}")
@@ -1078,18 +1084,19 @@ class SimilarDayRetriever320:
                 f"got {self.weather_dim}"
             )
 
-        # 调用工厂闭包拟合编码器当中的 Standardization 和 IncrementalPCA。会扫两遍底层数据。
+        # 针对神经网络编码器（ConvLSTM-AE），其权重已在训练阶段固化，此处 fit 仅为保持接口一致性。
+        # 如果切换回 StatisticalWeatherEncoder，则会在此处进行真实的 PCA 拟合。
         encoder.fit(
             raw_feature_batches_factory=lambda: self._iter_raw_feature_batches(
                 weather_store=weather_store,
                 encoder=encoder,
                 n_windows=n_windows,
-                stage_name="编码器拟合",
+                stage_name="检查编码器状态",
             ),
             total_samples=n_windows,
         )
 
-        # 此后分配底库潜向量内存（仅[N, 320]大小所以可以直接全部放进内存）
+        # 此后分配底库潜向量内存（仅[N, Latent_Dim]大小所以可以直接全部放进内存）
         weather_vectors = np.empty((n_windows, encoder.output_dim), dtype=np.float32)
         cursor = 0
         # 第散遍扫描：产生用于建库的最终被降维表征
@@ -1364,12 +1371,21 @@ class SimilarDayRetriever320:
 
 
 def print_retrieval_result(result: RetrievalResult, print_json: bool = False) -> None:
+    """
+    可视化打印检索结果。
+    
+    参数:
+        result: 检索结果对象。
+        print_json: 是否以 JSON 格式输出（方便程序间对接）。
+    """
     if print_json:
+        # JSON 序列化，确保中文不乱码。
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return
 
     print("=" * 72)
-    print(f"查询时间: {result.query_timestamp}")
+    print(f"查询时间点 (Query): {result.query_timestamp}")
+    # 遍历 Top-K 结果进行排版打印
     for rank, (idx, ts, score, curve) in enumerate(
         zip(
             result.historical_indices,
@@ -1379,11 +1395,12 @@ def print_retrieval_result(result: RetrievalResult, print_json: bool = False) ->
         ),
         start=1,
     ):
+        # 仅打印负荷曲线的前 8 个点作为缩略展示
         head_values = ", ".join(f"{float(x):.4f}" for x in curve[:8])
         print(
-            f"Top-{rank}: idx={idx}, start={ts}, score={score:.6f}, "
-            f"curve_head=[{head_values}]"
+            f"  [排名 {rank}] 索引: {idx:<6} | 起始时间: {ts} | 相似度: {score:.6f}"
         )
+        print(f"    负荷曲线预览: [{head_values} ...]")
     print("=" * 72)
 
 
@@ -1424,7 +1441,7 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
 
 def command_build(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：触发并执行离线库构建流程。"""
-    retriever = SimilarDayRetriever320(
+    retriever = SimilarDayRetriever(
         weather_dim=args.weather_dim,
         time_weight=args.time_weight,
         pred_len=args.pred_len,
@@ -1444,7 +1461,7 @@ def command_build(args: argparse.Namespace) -> None:
 
 def command_query(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：加载检索模型与离线相似特征库库并执行单次线上检索预测。"""
-    retriever = SimilarDayRetriever320.load(args.artifact_dir)
+    retriever = SimilarDayRetriever.load(args.artifact_dir)
     query_timestamp = resolve_query_timestamp(args)
     weather_store = HDF5WeatherSequenceStore(args.weather_h5)
     try:
@@ -1494,7 +1511,7 @@ def command_smoke_test(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """构造整个脚本支持的包含多层级子命令的主命令行参数解析应用。"""
-    parser = argparse.ArgumentParser(description="320维气象编码相似日检索系统")
+    parser = argparse.ArgumentParser(description="气象潜向量嵌入相似日检索系统")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     parser_build = subparsers.add_parser("build", help="构建并保存离线相似日检索库")
@@ -1522,18 +1539,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """程序入口：根据命令行输入的子命令执行相应逻辑。"""
     parser = build_parser()
     args = parser.parse_args()
 
+    # 命令分发
     if args.command == "build":
+        # 离线建库模式
         command_build(args)
     elif args.command == "query":
+        # 在线查询模式
         command_query(args)
     elif args.command == "smoke-test":
+        # 冒烟测试模式（快速验证）
         command_smoke_test(args)
     else:
-        raise ValueError(f"未知命令: {args.command}")
+        # 异常情况处理
+        raise ValueError(f"未知子命令: {args.command}")
 
 
 if __name__ == "__main__":
+    # 执行主函数
     main()
