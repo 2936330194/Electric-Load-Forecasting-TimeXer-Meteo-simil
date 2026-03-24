@@ -1,0 +1,27 @@
+{
+  "weather_dim_requested": 128,
+  "weather_dim_effective": 128,
+  "time_weight": 2.0,
+  "pred_len": 96,
+  "train_ratio": 0.6666666666666666,
+  "freq": "15min",
+  "build_batch_size": 384,
+  "ae_checkpoint_path": "D:\\Pycharm Project\\Scientific Reasearch\\Electricity Forecasting\\Electric Load Forecasting TimeXer Meteo simil\\checkpoints_ae\\convlstm_ae_best.pth",
+  "ae_norm_stats_path": "D:\\Pycharm Project\\Scientific Reasearch\\Electricity Forecasting\\Electric Load Forecasting TimeXer Meteo simil\\checkpoints_ae\\norm_stats.npz",
+  "encoder_batch_size": 16,
+  "stats": [
+    "mean",
+    "std",
+    "min",
+    "max"
+  ],
+  "log1p_channels": [
+    9
+  ],
+  "load_csv_path": "D:\\Pycharm Project\\Scientific Reasearch\\Electricity Forecasting\\Electric Load Forecasting TimeXer Meteo simil\\data\\湖南省电力负荷_unknow.csv",
+  "weather_h5_path": "D:\\Pycharm Project\\Scientific Reasearch\\Electricity Forecasting\\Electric Load Forecasting TimeXer Meteo simil\\data\\hunan_grid_meteo_20250101_20260228.h5",
+  "train_frame_count": 479,
+  "train_window_count": 384,
+  "fused_dim": 133,
+  "index_backend": "faiss"
+}

@@ -36,31 +36,38 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.decomposition import IncrementalPCA
 from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
+# 从 convlstm_ae 模块导入自编码器模型及其相关的训练/推理配置
 from convlstm_ae import (
-    BATCH_SIZE as AE_BATCH_SIZE,
-    BEST_MODEL_FILE as AE_BEST_MODEL_FILE,
-    CHECKPOINT_DIR as AE_CHECKPOINT_DIR,
-    ConvLSTMAutoEncoder,
-    GPU_ID as AE_GPU_ID,
-    HIDDEN_DIM as AE_HIDDEN_DIM,
-    IN_CHANNELS as AE_IN_CHANNELS,
-    LATENT_DIM as AE_LATENT_DIM,
-    LOG1P_CHANNELS as AE_LOG1P_CHANNELS,
-    NORM_STATS_FILE as AE_NORM_STATS_FILE,
-    NUM_LAYERS as AE_NUM_LAYERS,
-    USE_GPU as AE_USE_GPU,
-    WINDOW_SIZE as AE_WINDOW_SIZE,
+    BATCH_SIZE as AE_BATCH_SIZE,         # 推理时的批大小
+    BEST_MODEL_FILE as AE_BEST_MODEL_FILE, # 最优权重文件名
+    CHECKPOINT_DIR as AE_CHECKPOINT_DIR,   # 权重存放目录
+    ConvLSTMAutoEncoder,                  # 模型类定义
+    GPU_ID as AE_GPU_ID,                 # GPU 设备 ID
+    HIDDEN_DIM as AE_HIDDEN_DIM,         # 隐藏层维度
+    IN_CHANNELS as AE_IN_CHANNELS,       # 输入气象通道数
+    LATENT_DIM as AE_LATENT_DIM,         # 潜变量维度 (目前为 128)
+    LOG1P_CHANNELS as AE_LOG1P_CHANNELS, # 需要 log1p 处理的通道索引
+    NORM_STATS_FILE as AE_NORM_STATS_FILE,# 归一化统计文件
+    NUM_LAYERS as AE_NUM_LAYERS,         # ConvLSTM 层数
+    USE_GPU as AE_USE_GPU,               # 是否使用 GPU
+    WINDOW_SIZE as AE_WINDOW_SIZE,       # 时间窗口步数
 )
 
-
 ROOT_DIR = Path(__file__).resolve().parent
+# 默认的负荷历史数据 CSV 路径
 DEFAULT_LOAD_CSV = ROOT_DIR / "data" / "湖南省电力负荷_unknow.csv"
+# 默认的待预测未来窗口 CSV 路径
 DEFAULT_FUTURE_CSV = ROOT_DIR / "data" / "湖南省电力负荷_unknow_future.csv"
+# 默认的气象网格 HDF5 数据路径
 DEFAULT_WEATHER_H5 = ROOT_DIR / "data" / "hunan_grid_meteo_20250101_20260228.h5"
+# 相似日检索库（Artifacts）的保存目录
 DEFAULT_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "similar_day_retriever_ae_128"
+# 默认的 AE 模型权重路径
 DEFAULT_AE_CHECKPOINT = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_BEST_MODEL_FILE).resolve()
+# 默认的 AE 归一化统计信息路径
 DEFAULT_AE_NORM_STATS = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_NORM_STATS_FILE).resolve()
 
+# 针对 Windows 或某些终端环境，重新配置输出流以避免编码错误（用 replace 替换无法显示的字符）
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -763,7 +770,7 @@ class ConvLSTMAEWeatherEncoder:
 
         for start in range(0, num_windows, micro_batch):
             end = min(start + micro_batch, num_windows)
-            batch_np = np.ascontiguousarray(window_view[start:end], dtype=np.float32)
+            batch_np = np.array(window_view[start:end], dtype=np.float32, copy=True, order="C")
             batch_tensor = torch.from_numpy(batch_np).to(device=self._device, dtype=torch.float32)
             # 无需反向传播，节约并且加快推理运行
             with torch.inference_mode():
@@ -939,7 +946,7 @@ class SimilarDayRetriever:
     def _iter_raw_feature_batches(
         self,
         weather_store: HDF5WeatherSequenceStore,
-        encoder: StatisticalWeatherEncoder320,
+        encoder: StatisticalWeatherEncoder,
         n_windows: int,
         stage_name: str,
     ) -> Iterator[np.ndarray]:
@@ -1321,7 +1328,7 @@ class SimilarDayRetriever:
         print(f"[保存] 检索库已写入: {artifact_dir}")
 
     @classmethod
-    def load(cls, artifact_dir: Union[str, Path]) -> "SimilarDayRetriever320":
+    def load(cls, artifact_dir: Union[str, Path]) -> "SimilarDayRetriever":
         """
         类方法，反向加载并初始化系统。从之前 `save(...)` 创建的存档目录中复苏全部模型状态结构和底库资源。
         """
@@ -1441,6 +1448,7 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
 
 def command_build(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：触发并执行离线库构建流程。"""
+    # 1. 根据命令行参数初始化检索器实例
     retriever = SimilarDayRetriever(
         weather_dim=args.weather_dim,
         time_weight=args.time_weight,
@@ -1451,6 +1459,7 @@ def command_build(args: argparse.Namespace) -> None:
         ae_norm_stats_path=args.ae_norm_stats,
         encoder_batch_size=args.encoder_batch_size,
     )
+    # 2. 调用 build 方法执行数据读取、特征转换、索引构建及保存
     retriever.build(
         load_csv_path=args.load_csv,
         weather_h5_path=args.weather_h5,
@@ -1461,23 +1470,31 @@ def command_build(args: argparse.Namespace) -> None:
 
 def command_query(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：加载检索模型与离线相似特征库库并执行单次线上检索预测。"""
+    # 1. 从指定的 Artifacts 目录加载已构建好的检索器
     retriever = SimilarDayRetriever.load(args.artifact_dir)
+    # 2. 智能解析查询的时间戳起始点
     query_timestamp = resolve_query_timestamp(args)
+    # 3. 打开气象数据仓库
     weather_store = HDF5WeatherSequenceStore(args.weather_h5)
     try:
+        # 4. 执行基于时间戳的相似日检索
         result = retriever.search_by_timestamp(
             query_timestamp=query_timestamp,
             top_k=args.top_k,
             weather_store=weather_store,
         )
     finally:
+        # 确保 HDF5 文件句柄被关闭
         weather_store.close()
+    # 5. 打印或输出检索结果
     print_retrieval_result(result, print_json=args.print_json)
 
 
 def command_smoke_test(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：在极小规模数据上串联执行构建及查询以校验整个检索系统运行畅通无阻。"""
-    retriever = SimilarDayRetriever320(
+    # 冒烟测试通常用于代码变更后的快速冒泡验证
+    # 1. 初始化检索器
+    retriever = SimilarDayRetriever(
         weather_dim=args.weather_dim,
         time_weight=args.time_weight,
         pred_len=args.pred_len,
@@ -1487,6 +1504,7 @@ def command_smoke_test(args: argparse.Namespace) -> None:
         ae_norm_stats_path=args.ae_norm_stats,
         encoder_batch_size=args.encoder_batch_size,
     )
+    # 2. 快速构建小规模库 (默认 max_train_windows 为 384)
     retriever.build(
         load_csv_path=args.load_csv,
         weather_h5_path=args.weather_h5,
@@ -1494,6 +1512,7 @@ def command_smoke_test(args: argparse.Namespace) -> None:
         max_train_windows=args.max_train_windows,
     )
 
+    # 3. 执行一次模拟查询
     query_timestamp = resolve_query_timestamp(args)
     weather_store = HDF5WeatherSequenceStore(args.weather_h5)
     try:
@@ -1506,17 +1525,21 @@ def command_smoke_test(args: argparse.Namespace) -> None:
         weather_store.close()
 
     print("[Smoke Test] Top-K 检索已返回结果。")
+    # 4. 展示测试结果
     print_retrieval_result(result, print_json=args.print_json)
 
 
 def build_parser() -> argparse.ArgumentParser:
     """构造整个脚本支持的包含多层级子命令的主命令行参数解析应用。"""
     parser = argparse.ArgumentParser(description="气象潜向量嵌入相似日检索系统")
+    # 设置子命令容器
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # --- build 子命令：负责离线建库 ---
     parser_build = subparsers.add_parser("build", help="构建并保存离线相似日检索库")
     add_build_arguments(parser_build)
 
+    # --- query 子命令：负责在线检索 ---
     parser_query = subparsers.add_parser("query", help="加载离线库并执行在线检索")
     parser_query.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR))
     parser_query.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5))
@@ -1527,12 +1550,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser_query.add_argument("--top-k", type=int, default=3)
     parser_query.add_argument("--print-json", action="store_true")
 
+    # --- smoke-test 子命令：开发环境流程验证 ---
     parser_smoke = subparsers.add_parser("smoke-test", help="小规模建库并验证检索流程")
     add_build_arguments(parser_smoke)
     parser_smoke.add_argument("--future-csv", type=str, default=str(DEFAULT_FUTURE_CSV))
     parser_smoke.add_argument("--query-start", type=str, default=None)
     parser_smoke.add_argument("--top-k", type=int, default=3)
     parser_smoke.add_argument("--print-json", action="store_true")
+    # 冒烟测试默认只扫描 384 个窗口以确保速度
     parser_smoke.set_defaults(max_train_windows=384)
 
     return parser
