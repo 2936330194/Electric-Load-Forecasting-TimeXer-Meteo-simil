@@ -24,6 +24,7 @@ import pickle
 import time
 import h5py
 import faiss
+import torch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -34,13 +35,30 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.decomposition import IncrementalPCA
 from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
+from convlstm_ae import (
+    BATCH_SIZE as AE_BATCH_SIZE,
+    BEST_MODEL_FILE as AE_BEST_MODEL_FILE,
+    CHECKPOINT_DIR as AE_CHECKPOINT_DIR,
+    ConvLSTMAutoEncoder,
+    GPU_ID as AE_GPU_ID,
+    HIDDEN_DIM as AE_HIDDEN_DIM,
+    IN_CHANNELS as AE_IN_CHANNELS,
+    LATENT_DIM as AE_LATENT_DIM,
+    LOG1P_CHANNELS as AE_LOG1P_CHANNELS,
+    NORM_STATS_FILE as AE_NORM_STATS_FILE,
+    NUM_LAYERS as AE_NUM_LAYERS,
+    USE_GPU as AE_USE_GPU,
+    WINDOW_SIZE as AE_WINDOW_SIZE,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_LOAD_CSV = ROOT_DIR / "data" / "湖南省电力负荷_unknow.csv"
 DEFAULT_FUTURE_CSV = ROOT_DIR / "data" / "湖南省电力负荷_unknow_future.csv"
 DEFAULT_WEATHER_H5 = ROOT_DIR / "data" / "hunan_grid_meteo_20250101_20260228.h5"
-DEFAULT_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "similar_day_retriever_320"
+DEFAULT_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "similar_day_retriever_ae_128"
+DEFAULT_AE_CHECKPOINT = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_BEST_MODEL_FILE).resolve()
+DEFAULT_AE_NORM_STATS = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_NORM_STATS_FILE).resolve()
 
 
 def _require_h5py() -> None:
@@ -382,7 +400,7 @@ class StatisticalWeatherEncoder320:
 
     def __init__(
         self,
-        weather_dim: int = 320,
+        weather_dim: int = AE_LATENT_DIM,
         window_size: int = 96,
         stats: Sequence[str] = ("mean", "std", "min", "max"),
         log1p_channels: Sequence[int] = (9,),
@@ -562,6 +580,168 @@ class StatisticalWeatherEncoder320:
         return self.transform_raw(raw)
 
 
+class ConvLSTMAEWeatherEncoder:
+    """Weather encoder backed by the trained ConvLSTM autoencoder."""
+
+    def __init__(
+        self,
+        checkpoint_path: Union[str, Path] = DEFAULT_AE_CHECKPOINT,
+        norm_stats_path: Union[str, Path] = DEFAULT_AE_NORM_STATS,
+        window_size: int = AE_WINDOW_SIZE,
+        latent_dim: int = AE_LATENT_DIM,
+        batch_size: int = AE_BATCH_SIZE,
+        hidden_dim: int = AE_HIDDEN_DIM,
+        num_layers: int = AE_NUM_LAYERS,
+        in_channels: int = AE_IN_CHANNELS,
+        log1p_channels: Sequence[int] = AE_LOG1P_CHANNELS,
+    ):
+        self.checkpoint_path = str(Path(checkpoint_path).resolve())
+        self.norm_stats_path = str(Path(norm_stats_path).resolve())
+        self.window_size = int(window_size)
+        self.output_dim = int(latent_dim)
+        self.batch_size = int(batch_size)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.in_channels = int(in_channels)
+        self.log1p_channels = tuple(int(x) for x in log1p_channels)
+
+        self.channel_mean: Optional[np.ndarray] = None
+        self.channel_std: Optional[np.ndarray] = None
+        self.frame_height: Optional[int] = None
+        self.frame_width: Optional[int] = None
+
+        self._model: Optional[ConvLSTMAutoEncoder] = None
+        self._device: Optional[torch.device] = None
+        self._use_amp = False
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_model"] = None
+        state["_device"] = None
+        state["_use_amp"] = False
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._model = None
+        self._device = None
+        self._use_amp = False
+
+    @property
+    def channel_count(self) -> int:
+        self._ensure_norm_stats_loaded()
+        return int(self.channel_mean.shape[1])
+
+    def _ensure_norm_stats_loaded(self) -> None:
+        if self.channel_mean is not None and self.channel_std is not None:
+            return
+
+        norm_stats_path = Path(self.norm_stats_path)
+        if not norm_stats_path.exists():
+            raise FileNotFoundError(f"ConvLSTM AE normalization stats not found: {norm_stats_path}")
+
+        stats = np.load(norm_stats_path)
+        self.channel_mean = np.asarray(stats["mean"], dtype=np.float32)
+        self.channel_std = np.asarray(stats["std"], dtype=np.float32)
+        self.channel_std = np.where(self.channel_std < 1e-8, 1.0, self.channel_std).astype(np.float32)
+        if "log1p_channels" in stats:
+            self.log1p_channels = tuple(int(x) for x in np.asarray(stats["log1p_channels"]).tolist())
+
+    def _resolve_device(self) -> torch.device:
+        if AE_USE_GPU and torch.cuda.is_available():
+            return torch.device(f"cuda:{AE_GPU_ID}")
+        return torch.device("cpu")
+
+    def _ensure_model_loaded(self, frame_height: int, frame_width: int) -> None:
+        self._ensure_norm_stats_loaded()
+
+        if self._model is not None:
+            if self.frame_height != int(frame_height) or self.frame_width != int(frame_width):
+                raise ValueError(
+                    f"ConvLSTM AE frame shape mismatch: expected ({self.frame_height}, {self.frame_width}), "
+                    f"got ({frame_height}, {frame_width})"
+                )
+            return
+
+        checkpoint_path = Path(self.checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"ConvLSTM AE checkpoint not found: {checkpoint_path}")
+
+        self.frame_height = int(frame_height)
+        self.frame_width = int(frame_width)
+        self._device = self._resolve_device()
+        self._use_amp = self._device.type == "cuda"
+
+        model = ConvLSTMAutoEncoder(
+            in_channels=self.in_channels,
+            hidden_channels=self.hidden_dim,
+            latent_dim=self.output_dim,
+            num_layers=self.num_layers,
+            seq_len=self.window_size,
+            frame_height=self.frame_height,
+            frame_width=self.frame_width,
+        ).float().to(self._device)
+        model.load_state_dict(torch.load(checkpoint_path, map_location=self._device))
+        model.eval()
+        self._model = model
+
+    def preprocess_frames(self, frames: np.ndarray) -> np.ndarray:
+        self._ensure_norm_stats_loaded()
+
+        arr = np.asarray(frames, dtype=np.float32).copy()
+        if arr.ndim != 4:
+            raise ValueError(f"weather frames must be [T, C, H, W], got {arr.shape}")
+        if arr.shape[1] != self.channel_count:
+            raise ValueError(
+                f"weather channel count mismatch: expected {self.channel_count}, got {arr.shape[1]}"
+            )
+
+        for channel in self.log1p_channels:
+            arr[:, channel, :, :] = np.log1p(np.clip(arr[:, channel, :, :], a_min=0.0, a_max=None))
+
+        arr = (arr - self.channel_mean) / self.channel_std
+        return arr.astype(np.float32, copy=False)
+
+    def transform_frame_block(
+        self,
+        frames: np.ndarray,
+        expected_windows: Optional[int] = None,
+    ) -> np.ndarray:
+        frames = self.preprocess_frames(frames)
+        if frames.shape[0] < self.window_size:
+            raise ValueError(
+                f"weather frame count is smaller than window_size: {frames.shape[0]} < {self.window_size}"
+            )
+
+        self._ensure_model_loaded(frames.shape[2], frames.shape[3])
+        window_view = sliding_window_view(frames, window_shape=self.window_size, axis=0)
+        window_view = np.moveaxis(window_view, -1, 1)
+        num_windows = int(window_view.shape[0])
+        if expected_windows is not None and num_windows != int(expected_windows):
+            raise RuntimeError(f"expected {expected_windows} windows but got {num_windows}")
+
+        encoded = np.empty((num_windows, self.output_dim), dtype=np.float32)
+        micro_batch = max(1, self.batch_size)
+
+        for start in range(0, num_windows, micro_batch):
+            end = min(start + micro_batch, num_windows)
+            batch_np = np.ascontiguousarray(window_view[start:end], dtype=np.float32)
+            batch_tensor = torch.from_numpy(batch_np).to(device=self._device, dtype=torch.float32)
+            with torch.inference_mode():
+                with torch.amp.autocast("cuda", enabled=self._use_amp):
+                    batch_encoded = self._model.encode(batch_tensor)
+            encoded[start:end] = batch_encoded.float().cpu().numpy()
+
+        return encoded
+
+    def transform_window(self, weather_window: np.ndarray) -> np.ndarray:
+        return self.transform_frame_block(weather_window, expected_windows=1)
+
+    def fit(self, *args, **kwargs) -> None:
+        """Compatibility no-op for the previous PCA encoder API."""
+        return None
+
+
 class SimilarDayRetriever320:
     """
     相似日检索系统主类。
@@ -577,12 +757,15 @@ class SimilarDayRetriever320:
 
     def __init__(
         self,
-        weather_dim: int = 320,
+        weather_dim: int = AE_LATENT_DIM,
         time_weight: float = 2.0,
         pred_len: int = 96,
         train_ratio: float = 2.0 / 3.0,
         freq: str = "15min",
         build_batch_size: int = 384,
+        ae_checkpoint_path: Union[str, Path] = DEFAULT_AE_CHECKPOINT,
+        ae_norm_stats_path: Union[str, Path] = DEFAULT_AE_NORM_STATS,
+        encoder_batch_size: int = AE_BATCH_SIZE,
         stats: Sequence[str] = ("mean", "std", "min", "max"),
         log1p_channels: Sequence[int] = (9,),
     ):
@@ -605,11 +788,14 @@ class SimilarDayRetriever320:
         self.train_ratio = float(train_ratio)
         self.freq = str(freq)
         self.build_batch_size = int(build_batch_size)
+        self.ae_checkpoint_path = str(Path(ae_checkpoint_path).resolve())
+        self.ae_norm_stats_path = str(Path(ae_norm_stats_path).resolve())
+        self.encoder_batch_size = int(encoder_batch_size)
         self.stats = tuple(stats)
         self.log1p_channels = tuple(int(x) for x in log1p_channels)
 
         # 核心功能组件，只有在 build() 或 load() 后才会被实例化或赋予数据
-        self.weather_encoder: Optional[StatisticalWeatherEncoder320] = None
+        self.weather_encoder: Optional[ConvLSTMAEWeatherEncoder] = None
         self.index: Optional[ExactInnerProductIndex] = None
         
         # 对应着库里所有的搜索底库和标签数据
@@ -735,6 +921,27 @@ class SimilarDayRetriever320:
             # 通过 yield 挂起，供调用方消费特征，节约内存
             yield raw
 
+    def _iter_weather_embedding_batches(
+        self,
+        weather_store: HDF5WeatherSequenceStore,
+        encoder: ConvLSTMAEWeatherEncoder,
+        n_windows: int,
+        stage_name: str,
+    ) -> Iterator[np.ndarray]:
+        total_batches = math.ceil(n_windows / self.build_batch_size)
+        for batch_idx, start in enumerate(range(0, n_windows, self.build_batch_size), start=1):
+            current_size = min(self.build_batch_size, n_windows - start)
+            end = start + current_size + self.pred_len - 1
+            frames = weather_store.get_block(start, end)
+            batch_vectors = encoder.transform_frame_block(frames, expected_windows=current_size)
+
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
+                print(
+                    f"[{stage_name}] éŽµè§„î‚¼ {batch_idx}/{total_batches} "
+                    f"windows={start}:{start + current_size - 1}"
+                )
+            yield batch_vectors
+
     def _build_time_vectors(self, timestamps: Sequence[pd.Timestamp]) -> np.ndarray:
         """从对应时间序列中提取周期性时间特征 embedding（例如：月、日、时等）"""
         timestamps = pd.DatetimeIndex(pd.to_datetime(timestamps))
@@ -814,17 +1021,20 @@ class SimilarDayRetriever320:
         print("=" * 72)
 
         # 全局扫描计算历史训练区间内气象每通道像素方差分布
-        channel_mean, channel_std = self._compute_channel_stats(weather_store, train_frame_count)
         # 实例化编码器核心
-        encoder = StatisticalWeatherEncoder320(
-            weather_dim=self.weather_dim,
+        encoder = ConvLSTMAEWeatherEncoder(
+            checkpoint_path=self.ae_checkpoint_path,
+            norm_stats_path=self.ae_norm_stats_path,
+            latent_dim=self.weather_dim,
             window_size=self.pred_len,
-            stats=self.stats,
             log1p_channels=self.log1p_channels,
-            batch_size=self.build_batch_size,
-            channel_mean=channel_mean,
-            channel_std=channel_std,
+            batch_size=self.encoder_batch_size,
         )
+        if self.weather_dim != AE_LATENT_DIM:
+            raise ValueError(
+                f"weather_dim must match the trained ConvLSTM-AE latent dim {AE_LATENT_DIM}, "
+                f"got {self.weather_dim}"
+            )
 
         # 调用工厂闭包拟合编码器当中的 Standardization 和 IncrementalPCA。会扫两遍底层数据。
         encoder.fit(
@@ -841,13 +1051,12 @@ class SimilarDayRetriever320:
         weather_vectors = np.empty((n_windows, encoder.output_dim), dtype=np.float32)
         cursor = 0
         # 第散遍扫描：产生用于建库的最终被降维表征
-        for batch_raw in self._iter_raw_feature_batches(
+        for batch_vectors in self._iter_weather_embedding_batches(
             weather_store=weather_store,
             encoder=encoder,
             n_windows=n_windows,
             stage_name="向量生成",
         ):
-            batch_vectors = encoder.transform_raw(batch_raw)
             weather_vectors[cursor : cursor + len(batch_vectors)] = batch_vectors
             cursor += len(batch_vectors)
 
@@ -870,6 +1079,7 @@ class SimilarDayRetriever320:
         self.train_frame_count = int(train_frame_count)
         self.train_window_count = int(n_windows)
         self.fused_dim = int(fused_vectors.shape[1])
+        self.log1p_channels = tuple(self.weather_encoder.log1p_channels)
 
         weather_store.close()
 
@@ -1044,6 +1254,9 @@ class SimilarDayRetriever320:
             "train_ratio": self.train_ratio,
             "freq": self.freq,
             "build_batch_size": self.build_batch_size,
+            "ae_checkpoint_path": self.ae_checkpoint_path,
+            "ae_norm_stats_path": self.ae_norm_stats_path,
+            "encoder_batch_size": self.encoder_batch_size,
             "stats": list(self.stats),
             "log1p_channels": list(self.log1p_channels),
             "load_csv_path": self.load_csv_path,
@@ -1081,6 +1294,9 @@ class SimilarDayRetriever320:
             train_ratio=float(metadata["train_ratio"]),
             freq=str(metadata["freq"]),
             build_batch_size=int(metadata["build_batch_size"]),
+            ae_checkpoint_path=metadata.get("ae_checkpoint_path", DEFAULT_AE_CHECKPOINT),
+            ae_norm_stats_path=metadata.get("ae_norm_stats_path", DEFAULT_AE_NORM_STATS),
+            encoder_batch_size=int(metadata.get("encoder_batch_size", AE_BATCH_SIZE)),
             stats=metadata["stats"],
             log1p_channels=metadata["log1p_channels"],
         )
@@ -1133,11 +1349,14 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--load-csv", type=str, default=str(DEFAULT_LOAD_CSV))
     parser.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5))
     parser.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR))
-    parser.add_argument("--weather-dim", type=int, default=320)
+    parser.add_argument("--weather-dim", type=int, default=AE_LATENT_DIM)
     parser.add_argument("--time-weight", type=float, default=2.0)
     parser.add_argument("--pred-len", type=int, default=96)
     parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0)
     parser.add_argument("--build-batch-size", type=int, default=384)
+    parser.add_argument("--ae-checkpoint", type=str, default=str(DEFAULT_AE_CHECKPOINT))
+    parser.add_argument("--ae-norm-stats", type=str, default=str(DEFAULT_AE_NORM_STATS))
+    parser.add_argument("--encoder-batch-size", type=int, default=AE_BATCH_SIZE)
     parser.add_argument("--max-train-windows", type=int, default=None)
 
 
@@ -1166,6 +1385,9 @@ def command_build(args: argparse.Namespace) -> None:
         pred_len=args.pred_len,
         train_ratio=args.train_ratio,
         build_batch_size=args.build_batch_size,
+        ae_checkpoint_path=args.ae_checkpoint,
+        ae_norm_stats_path=args.ae_norm_stats,
+        encoder_batch_size=args.encoder_batch_size,
     )
     retriever.build(
         load_csv_path=args.load_csv,
@@ -1197,6 +1419,9 @@ def command_smoke_test(args: argparse.Namespace) -> None:
         pred_len=args.pred_len,
         train_ratio=args.train_ratio,
         build_batch_size=args.build_batch_size,
+        ae_checkpoint_path=args.ae_checkpoint,
+        ae_norm_stats_path=args.ae_norm_stats,
+        encoder_batch_size=args.encoder_batch_size,
     )
     retriever.build(
         load_csv_path=args.load_csv,
