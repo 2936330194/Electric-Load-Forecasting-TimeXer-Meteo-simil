@@ -1321,9 +1321,7 @@ class SimilarDayRetriever:
         timestamps = pd.DatetimeIndex(pd.to_datetime(timestamps))
         # time_features 返回尺寸为 [C, N] 的时间特征，随后转置成 [N, C]
         if len(timestamps) == 0:
-            return np.empty((0, 4), dtype=np.float32)
-
-        iso_week = timestamps.isocalendar().week.to_numpy(dtype=np.float32)
+            return np.empty((0, 5), dtype=np.float32)
 
         # Retrieval windows are aligned to 00:00:00, so minute/hour features are
         # constant across the index and dilute the useful weekly and seasonal cues.
@@ -1332,7 +1330,8 @@ class SimilarDayRetriever:
                 timestamps.dayofweek.to_numpy(dtype=np.float32) / 6.0 - 0.5,
                 (timestamps.day.to_numpy(dtype=np.float32) - 1.0) / 30.0 - 0.5,
                 (timestamps.dayofyear.to_numpy(dtype=np.float32) - 1.0) / 365.0 - 0.5,
-                (iso_week - 1.0) / 52.0 - 0.5,
+                (timestamps.isocalendar().week.to_numpy(dtype=np.float32) - 1.0) / 52.0 - 0.5,
+                (timestamps.month.to_numpy(dtype=np.float32) - 1.0) / 11.0 - 0.5,
             ]
         )
         return time_vectors.astype(np.float32, copy=False)
