@@ -52,14 +52,14 @@ LOG1P_CHANNELS = [9]
 # ----------------- 模型超参数 (Model Hyperparameters) -----------------
 WINDOW_SIZE = 96     # 时间窗大小：96代表1天的数据包含着每15分钟一个步长组成的96个连续帧
 HIDDEN_DIM = 16      # ConvLSTM 的隐藏特征通道层数，提取出的特征更抽象，参数也随之成平方倍增加
-LATENT_DIM = 64      # 最后编码得到的潜向量长度映射 (决定了后续在检索库搜索时向量的体积大小)
+LATENT_DIM = 128      # 最后编码得到的潜向量长度映射 (决定了后续在检索库搜索时向量的体积大小)
 NUM_LAYERS = 1       # 级联的 ConvLSTM 提取深度层数 (1层通常具备基础表征，多层计算较慢)
 IN_CHANNELS = 10     # 对应上面的 CHANNEL_NAMES
 
 # ----------------- 训练控制超参数 (Training Hyperparameters) ----------
 BATCH_SIZE = 16      # 每批次包含的天数样本，受限于 4D 张量 (B, T, C, H, W) 的极长的时间步长，极易发生显存崩塌
 LEARNING_RATE = 1e-3 # Adam优化器的初始学习率
-EPOCHS = 50          # 模型全参数迭代的最高轮数
+EPOCHS = 70          # 模型全参数迭代的最高轮数
 TRAIN_RATIO = 0.8    # 时序前 80% 用于自回归拟合生成，后 20% 用于客观衡量它是否学到了"重建规律"
 NUM_WORKERS = 0      # DataLoader 读取线程，0 表示主线程取，在 Windows 和复杂 H5 索引时避免死锁首选
 
