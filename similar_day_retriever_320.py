@@ -21,6 +21,7 @@ import argparse
 import json
 import math
 import pickle
+import sys
 import time
 import h5py
 import faiss
@@ -59,6 +60,11 @@ DEFAULT_WEATHER_H5 = ROOT_DIR / "data" / "hunan_grid_meteo_20250101_20260228.h5"
 DEFAULT_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "similar_day_retriever_ae_128"
 DEFAULT_AE_CHECKPOINT = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_BEST_MODEL_FILE).resolve()
 DEFAULT_AE_NORM_STATS = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_NORM_STATS_FILE).resolve()
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(errors="replace")
 
 
 def _require_h5py() -> None:
@@ -581,7 +587,10 @@ class StatisticalWeatherEncoder320:
 
 
 class ConvLSTMAEWeatherEncoder:
-    """Weather encoder backed by the trained ConvLSTM autoencoder."""
+    """
+    基于预训练 ConvLSTM 自编码器的气象编码器。
+    用于将高维的连续气象帧序列压缩降维。
+    """
 
     def __init__(
         self,
@@ -595,6 +604,20 @@ class ConvLSTMAEWeatherEncoder:
         in_channels: int = AE_IN_CHANNELS,
         log1p_channels: Sequence[int] = AE_LOG1P_CHANNELS,
     ):
+        """
+        初始化自编码器封装。
+
+        Args:
+            checkpoint_path (Union[str, Path]): AE 模型权重检查点路径。
+            norm_stats_path (Union[str, Path]): 用于预处理的归一化均值和标准差统计文件路径。
+            window_size (int): 预测模型时间窗口长度 (包含多个气象图像帧)。
+            latent_dim (int): 由 AE 模型提取的隐藏空间连续变量特征维度。
+            batch_size (int): 数据通过 AE 模型的前向传播微批次规格以便防显存溢出。
+            hidden_dim (int): ConvLSTM 中的内部通道数量。
+            num_layers (int): ConvLSTM 的循环神经层堆叠深度。
+            in_channels (int): 每帧输入网络的气象多变量原始通道总数。
+            log1p_channels (Sequence[int]): 需以 log(1+x) 计算缓解右偏态极端值的降水或风速通道索引。
+        """
         self.checkpoint_path = str(Path(checkpoint_path).resolve())
         self.norm_stats_path = str(Path(norm_stats_path).resolve())
         self.window_size = int(window_size)
@@ -615,6 +638,7 @@ class ConvLSTMAEWeatherEncoder:
         self._use_amp = False
 
     def __getstate__(self) -> dict:
+        """配置支持 Pickle 序列化以实现状态持久化；清理包含特定设备状态或网络权重的临时不可序列化指针对象。"""
         state = self.__dict__.copy()
         state["_model"] = None
         state["_device"] = None
@@ -622,6 +646,7 @@ class ConvLSTMAEWeatherEncoder:
         return state
 
     def __setstate__(self, state: dict) -> None:
+        """对象反序列化回调函数：重载基础成员并将底层依赖环境配置参数重置为空，交由运行时再次加载。"""
         self.__dict__.update(state)
         self._model = None
         self._device = None
@@ -629,48 +654,56 @@ class ConvLSTMAEWeatherEncoder:
 
     @property
     def channel_count(self) -> int:
+        """获取训练集中提取的气象统计数据中的通道数。"""
         self._ensure_norm_stats_loaded()
         return int(self.channel_mean.shape[1])
 
     def _ensure_norm_stats_loaded(self) -> None:
+        """加载用于归一化预处理的预置长效统计量数据如像素级均值及方差；这对应着我们在全局气象建库前的均值计算。"""
         if self.channel_mean is not None and self.channel_std is not None:
             return
 
         norm_stats_path = Path(self.norm_stats_path)
         if not norm_stats_path.exists():
-            raise FileNotFoundError(f"ConvLSTM AE normalization stats not found: {norm_stats_path}")
+            raise FileNotFoundError(f"未找到 ConvLSTM AE 归一化统计数据文件: {norm_stats_path}")
 
         stats = np.load(norm_stats_path)
         self.channel_mean = np.asarray(stats["mean"], dtype=np.float32)
         self.channel_std = np.asarray(stats["std"], dtype=np.float32)
+        # 固定最小方差为 1，确保之后计算不产生除以 0 时发生的无穷大或空数据
         self.channel_std = np.where(self.channel_std < 1e-8, 1.0, self.channel_std).astype(np.float32)
         if "log1p_channels" in stats:
             self.log1p_channels = tuple(int(x) for x in np.asarray(stats["log1p_channels"]).tolist())
 
     def _resolve_device(self) -> torch.device:
+        """根据超参数配置和环境实际资源推断运算应当运行的设备 (GPU/CPU)。"""
         if AE_USE_GPU and torch.cuda.is_available():
             return torch.device(f"cuda:{AE_GPU_ID}")
         return torch.device("cpu")
 
     def _ensure_model_loaded(self, frame_height: int, frame_width: int) -> None:
+        """
+        初始化神经网络结构。
+        将训练保存好的 ConvLSTM AutoEncoder 节点还原，并将前向执行模式设好以便之后特征抽取使用。
+        """
         self._ensure_norm_stats_loaded()
 
         if self._model is not None:
             if self.frame_height != int(frame_height) or self.frame_width != int(frame_width):
                 raise ValueError(
-                    f"ConvLSTM AE frame shape mismatch: expected ({self.frame_height}, {self.frame_width}), "
-                    f"got ({frame_height}, {frame_width})"
+                    f"ConvLSTM AE 帧尺寸不匹配: 期望 ({self.frame_height}, {self.frame_width})，"
+                    f"实际 ({frame_height}, {frame_width})"
                 )
             return
 
         checkpoint_path = Path(self.checkpoint_path)
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"ConvLSTM AE checkpoint not found: {checkpoint_path}")
+            raise FileNotFoundError(f"未找到 ConvLSTM AE 模型权重文件: {checkpoint_path}")
 
         self.frame_height = int(frame_height)
         self.frame_width = int(frame_width)
         self._device = self._resolve_device()
-        self._use_amp = self._device.type == "cuda"
+        self._use_amp = self._device.type == "cuda"  # 利用自动混合精度加速编码过程
 
         model = ConvLSTMAutoEncoder(
             in_channels=self.in_channels,
@@ -682,18 +715,19 @@ class ConvLSTMAEWeatherEncoder:
             frame_width=self.frame_width,
         ).float().to(self._device)
         model.load_state_dict(torch.load(checkpoint_path, map_location=self._device))
-        model.eval()
+        model.eval()  # 固定 Batch Normalization、Dropout 的运行方式
         self._model = model
 
     def preprocess_frames(self, frames: np.ndarray) -> np.ndarray:
+        """预处理：数据对齐校验 -> 偏度修正裁剪 -> 根据训练总集分布做标准缩放均一化。"""
         self._ensure_norm_stats_loaded()
 
         arr = np.asarray(frames, dtype=np.float32).copy()
         if arr.ndim != 4:
-            raise ValueError(f"weather frames must be [T, C, H, W], got {arr.shape}")
+            raise ValueError(f"气象序列维度必须为 [T, C, H, W]，但获得的是 {arr.shape}")
         if arr.shape[1] != self.channel_count:
             raise ValueError(
-                f"weather channel count mismatch: expected {self.channel_count}, got {arr.shape[1]}"
+                f"气象数据通道数错误：期望为 {self.channel_count}，但获得的是 {arr.shape[1]}"
             )
 
         for channel in self.log1p_channels:
@@ -707,10 +741,14 @@ class ConvLSTMAEWeatherEncoder:
         frames: np.ndarray,
         expected_windows: Optional[int] = None,
     ) -> np.ndarray:
+        """
+        核心气象序列嵌入函数（长块接口）。
+        沿滑动窗口机制裁剪处理连续数据集并喂入 AutoEncoder 将其转换为固定尺寸特征表示以便比较或者建立检索树。
+        """
         frames = self.preprocess_frames(frames)
         if frames.shape[0] < self.window_size:
             raise ValueError(
-                f"weather frame count is smaller than window_size: {frames.shape[0]} < {self.window_size}"
+                f"气象输入序列总长度不足时间窗口的大小预设值: {frames.shape[0]} < {self.window_size}"
             )
 
         self._ensure_model_loaded(frames.shape[2], frames.shape[3])
@@ -718,7 +756,7 @@ class ConvLSTMAEWeatherEncoder:
         window_view = np.moveaxis(window_view, -1, 1)
         num_windows = int(window_view.shape[0])
         if expected_windows is not None and num_windows != int(expected_windows):
-            raise RuntimeError(f"expected {expected_windows} windows but got {num_windows}")
+            raise RuntimeError(f"预期获得 {expected_windows} 窗口的数据切片量但返回了 {num_windows} 个")
 
         encoded = np.empty((num_windows, self.output_dim), dtype=np.float32)
         micro_batch = max(1, self.batch_size)
@@ -727,7 +765,9 @@ class ConvLSTMAEWeatherEncoder:
             end = min(start + micro_batch, num_windows)
             batch_np = np.ascontiguousarray(window_view[start:end], dtype=np.float32)
             batch_tensor = torch.from_numpy(batch_np).to(device=self._device, dtype=torch.float32)
+            # 无需反向传播，节约并且加快推理运行
             with torch.inference_mode():
+                # 用混合精度降低运算负荷加速计算
                 with torch.amp.autocast("cuda", enabled=self._use_amp):
                     batch_encoded = self._model.encode(batch_tensor)
             encoded[start:end] = batch_encoded.float().cpu().numpy()
@@ -735,10 +775,11 @@ class ConvLSTMAEWeatherEncoder:
         return encoded
 
     def transform_window(self, weather_window: np.ndarray) -> np.ndarray:
+        """对单一查询或窗口直接转换处理，相当于 block 方法封装对预期 1 窗口断言控制。"""
         return self.transform_frame_block(weather_window, expected_windows=1)
 
     def fit(self, *args, **kwargs) -> None:
-        """Compatibility no-op for the previous PCA encoder API."""
+        """保留方法向后兼容以往旧设计接口(例如 PCA 的拟合函数)。实际上神经网络属于线下提前固化模型无需这一操作。"""
         return None
 
 
@@ -928,6 +969,7 @@ class SimilarDayRetriever320:
         n_windows: int,
         stage_name: str,
     ) -> Iterator[np.ndarray]:
+        safe_stage_name = stage_name.encode("ascii", errors="ignore").decode("ascii").strip() or "weather_batch"
         total_batches = math.ceil(n_windows / self.build_batch_size)
         for batch_idx, start in enumerate(range(0, n_windows, self.build_batch_size), start=1):
             current_size = min(self.build_batch_size, n_windows - start)
@@ -937,7 +979,7 @@ class SimilarDayRetriever320:
 
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
                 print(
-                    f"[{stage_name}] éŽµè§„î‚¼ {batch_idx}/{total_batches} "
+                    f"[{safe_stage_name}] 批次 {batch_idx}/{total_batches} "
                     f"windows={start}:{start + current_size - 1}"
                 )
             yield batch_vectors
@@ -1346,6 +1388,7 @@ def print_retrieval_result(result: RetrievalResult, print_json: bool = False) ->
 
 
 def add_build_arguments(parser: argparse.ArgumentParser) -> None:
+    """向命令行解析器添加共享的建库配置及运行参数。"""
     parser.add_argument("--load-csv", type=str, default=str(DEFAULT_LOAD_CSV))
     parser.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5))
     parser.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR))
@@ -1361,6 +1404,7 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
+    """智能推断查询时间点：优先读取显式参数，其次读取未来测试集期初，否则回退使用训练集期末。"""
     if getattr(args, "query_start", None):
         return pd.Timestamp(args.query_start)
 
@@ -1379,6 +1423,7 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
 
 
 def command_build(args: argparse.Namespace) -> None:
+    """CLI 命令处理函数：触发并执行离线库构建流程。"""
     retriever = SimilarDayRetriever320(
         weather_dim=args.weather_dim,
         time_weight=args.time_weight,
@@ -1398,6 +1443,7 @@ def command_build(args: argparse.Namespace) -> None:
 
 
 def command_query(args: argparse.Namespace) -> None:
+    """CLI 命令处理函数：加载检索模型与离线相似特征库库并执行单次线上检索预测。"""
     retriever = SimilarDayRetriever320.load(args.artifact_dir)
     query_timestamp = resolve_query_timestamp(args)
     weather_store = HDF5WeatherSequenceStore(args.weather_h5)
@@ -1413,6 +1459,7 @@ def command_query(args: argparse.Namespace) -> None:
 
 
 def command_smoke_test(args: argparse.Namespace) -> None:
+    """CLI 命令处理函数：在极小规模数据上串联执行构建及查询以校验整个检索系统运行畅通无阻。"""
     retriever = SimilarDayRetriever320(
         weather_dim=args.weather_dim,
         time_weight=args.time_weight,
@@ -1446,6 +1493,7 @@ def command_smoke_test(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构造整个脚本支持的包含多层级子命令的主命令行参数解析应用。"""
     parser = argparse.ArgumentParser(description="320维气象编码相似日检索系统")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
