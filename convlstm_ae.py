@@ -577,78 +577,113 @@ def evaluate_reconstruction_metrics(
     device: torch.device,
     use_amp: bool,
 ) -> dict:
-    """Compute reconstruction metrics with the same validation loader."""
+    """
+    计算验证集上的重构指标（MSE, MAE, RMSE, R2）。
+    
+    参数:
+        model: 待评估的 ConvLSTM AutoEncoder 模型
+        loader: 验证集的数据加载器
+        device: 运行设备 (CPU/CUDA)
+        use_amp: 是否开启自动混合精度 (AMP) 推理
+        
+    返回:
+        包含各项指标的字典 {"mse": ..., "mae": ..., "rmse": ..., "r2": ...}
+    """
     model.eval()
-    total_squared_error = 0.0
-    total_absolute_error = 0.0
-    total_elements = 0
-    target_sum = 0.0
-    target_squared_sum = 0.0
+    total_squared_error = 0.0  # 累计平方误差 (L2)
+    total_absolute_error = 0.0 # 累计绝对误差 (L1)
+    total_elements = 0         # 总像素点/特征点数
+    target_sum = 0.0           # 目标值的总和 (计算 R2 用)
+    target_squared_sum = 0.0   # 目标值的平方和 (计算 R2 用)
 
     for batch in loader:
+        # 将批次数据移至指定设备
         batch = batch.to(device=device, dtype=torch.float32)
 
+        # 开启自动混合精度推理
         with torch.amp.autocast("cuda", enabled=use_amp):
             reconstructed = model(batch)
 
+        # 计算残差 (重建值 - 原始值)
         diff = reconstructed - batch
+        
+        # 统计各项误差
         total_squared_error += diff.square().sum().item()
         total_absolute_error += diff.abs().sum().item()
         total_elements += diff.numel()
+        
+        # 统计标签数据的基本信息，用于后续计算方差
         target_sum += batch.sum().item()
         target_squared_sum += batch.square().sum().item()
 
+    # 计算均方误差 (MSE) 和 平均绝对误差 (MAE)
     mse = total_squared_error / max(total_elements, 1)
     mae = total_absolute_error / max(total_elements, 1)
+    # 计算均方根误差 (RMSE)
     rmse = float(np.sqrt(mse))
+    
+    # 计算 R2 分数 (决定系数)
+    # R2 = 1 - SSR / SST
     target_mean = target_sum / max(total_elements, 1)
+    # 总体平方和 (Total Sum of Squares)
     total_variance = target_squared_sum - total_elements * (target_mean ** 2)
+    
     if total_variance <= 1e-12:
-        r2 = 0.0
+        r2 = 0.0  # 防止除以 0
     else:
         r2 = 1.0 - (total_squared_error / total_variance)
+        
     return {"mse": mse, "mae": mae, "rmse": rmse, "r2": r2}
 
 
 def run_training(args: argparse.Namespace) -> None:
+    """
+    执行完整的模型训练流程。
+    包括设备检测、数据预处理、模型加载、主循环训练、验证及早停。
+    """
+    # 1. 基本参数合法性检查
     if args.train_epochs <= 0:
-        raise ValueError("train_epochs must be positive.")
+        raise ValueError("train_epochs 必须为正数")
     if args.learning_rate <= 0:
-        raise ValueError("learning_rate must be positive.")
+        raise ValueError("learning_rate 必须为正数")
     if args.patience <= 0:
-        raise ValueError("patience must be positive.")
+        raise ValueError("patience 必须为正数")
 
+    # 2. 设置训练设备 (GPU 或 CPU)
     if USE_GPU and torch.cuda.is_available():
         device = torch.device(f"cuda:{GPU_ID}")
-        print(f"[设备] 使用 GPU: cuda:{GPU_ID}")
+        print(f"[设备] 环境检测完毕，使用 GPU: {device}")
     else:
         device = torch.device("cpu")
-        print("[设备] 使用 CPU")
+        print("[设备] 未检测到 GPU 或未配置使用，采用 CPU 训练")
 
+    # 3. 数据加载与标准化预处理
     h5_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), H5_PATH)
     train_data, val_data, mean, std, height, width = load_and_preprocess(
         h5_path, LOG1P_CHANNELS, TRAIN_RATIO
     )
 
+    # 4. 初始化 Dataset 和 DataLoader
     train_dataset = MeteoDataset(train_data, WINDOW_SIZE)
     val_dataset = MeteoDataset(val_data, WINDOW_SIZE)
-    print(f"[数据集] 训练样本: {len(train_dataset)} | 验证样本: {len(val_dataset)}")
+    print(f"[数据] 训练集样本: {len(train_dataset)} | 验证集样本: {len(val_dataset)}")
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=True, # 训练时开启打乱
         num_workers=NUM_WORKERS,
         pin_memory=(device.type == "cuda"),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        shuffle=False, # 验证时不打乱
         num_workers=NUM_WORKERS,
         pin_memory=(device.type == "cuda"),
     )
 
+    # 5. 初始化模型 (ConvLSTM AutoEncoder)
     model = ConvLSTMAutoEncoder(
         in_channels=IN_CHANNELS,
         hidden_channels=HIDDEN_DIM,
@@ -659,86 +694,106 @@ def run_training(args: argparse.Namespace) -> None:
         frame_width=width,
     ).float().to(device)
 
+    # 打印模型参数规模
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[模型] 总参数: {total_params:,} | 可训练: {trainable_params:,}")
+    print(f"[模型] 总参数: {total_params:,} | 可训练参数: {trainable_params:,}")
 
-    criterion = nn.MSELoss()
+    # 6. 设置评估函数、优化器及 AMP 缩放器
+    criterion = nn.MSELoss() # 重构任务通常使用 MSE 作为 Loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    use_amp = device.type == "cuda"
+    use_amp = (device.type == "cuda") # 仅在 GPU 上开启 AMP
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # 7. 准备 Checkpoint 目录并保存标准化统计参数
     os.makedirs(args.checkpoints, exist_ok=True)
-    best_val_loss = float("inf")
     best_model_path = os.path.join(args.checkpoints, BEST_MODEL_FILE)
-    checkpoint_path = os.path.join(args.checkpoints, "checkpoint.pth")
+    checkpoint_path = os.path.join(args.checkpoints, "checkpoint.pth") # EarlyStopping 使用的临时存档
     norm_stats_path = os.path.join(args.checkpoints, NORM_STATS_FILE)
+    
+    # 初始化早停工具
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
 
+    # 保存均值和标准差，供后续推理/测试阶段进行逆向变换或一致性预处理
     np.savez(
         norm_stats_path,
         mean=mean,
         std=std,
         log1p_channels=np.array(LOG1P_CHANNELS),
     )
-    print(f"[保存] 标准化统计量: {norm_stats_path}")
+    print(f"[持久化] 标准化参数已存至: {norm_stats_path}")
 
+    # 8. 打印训练配置总览
     print("\n" + "=" * 72)
-    print("开始训练 ConvLSTM AutoEncoder")
-    print(f"  hidden_dim={HIDDEN_DIM}, latent_dim={LATENT_DIM}, num_layers={NUM_LAYERS}")
-    print(f"  batch_size={BATCH_SIZE}, lr={args.learning_rate}, epochs={args.train_epochs}")
-    print(f"  lradj={args.lradj}, patience={args.patience}")
-    print(f"  use_amp={use_amp}")
+    print(">>> 启动 ConvLSTM AutoEncoder 训练任务")
+    print(f"    - 网络参数: Hidden={HIDDEN_DIM}, Latent={LATENT_DIM}, Layers={NUM_LAYERS}")
+    print(f"    - 训练超参: Batch={BATCH_SIZE}, LR={args.learning_rate}, Epochs={args.train_epochs}")
+    print(f"    - 策略配置: LR_Adj={args.lradj}, EarlyStop_Patience={args.patience}")
+    print(f"    - 系统状态: AMP={use_amp}, Device={device}")
     print("=" * 72)
 
+    # 9. 主训练循环 (Training Loop)
     for epoch in range(1, args.train_epochs + 1):
-        t0 = time.time()
+        t_start = time.time()
 
+        # 执行一个 Epoch 的训练
         train_loss = train_one_epoch(
             model, train_loader, optimizer, criterion, device, scaler, use_amp
         )
+        # 执行验证
         val_loss = validate(model, val_loader, criterion, device, use_amp)
 
-        elapsed = time.time() - t0
-        lr_now = optimizer.param_groups[0]["lr"]
+        t_end = time.time()
+        lr_current = optimizer.param_groups[0]["lr"]
+        
+        # 实时日志输出
         print(
             f"Epoch {epoch:3d}/{args.train_epochs} | "
-            f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-            f"LR: {lr_now:.2e} | Time: {elapsed:.1f}s"
+            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+            f"LR: {lr_current:.2e} | 耗时: {t_end - t_start:.1f}s"
         )
 
-        # 把存档主导权彻底交还给 EarlyStopping 工具对象去验证 val_loss 以及保存最优检查点
+        # 检查是否满足早停条件并保存进度
         early_stopping(val_loss, model, args.checkpoints)
         
         if early_stopping.early_stop:
-            print("Early stopping triggered. Model validation saturated.")
+            print(f"[早停] 在第 {epoch} 轮触发，模型性能已不再显著提升。")
             break
 
+        # 调整下一轮的学习率
         adjust_learning_rate(optimizer, epoch, args)
 
+    # 10. 训练结束，将最优检查点固化为最终模型文件
     if os.path.exists(checkpoint_path):
-        # 原汁原味读取 EarlyStopping 打包的最强记忆点
+        # 加载 EarlyStopping 保存的最优状态字典
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        # 再将其重新烙下明确标记的最强部署印记，防止以后迭代时搞混最佳权重
+        # 另存为正式的 best_model 文件
         torch.save(model.state_dict(), best_model_path)
         best_val_loss = early_stopping.val_loss_min
+    else:
+        best_val_loss = float("inf")
 
     print("\n" + "=" * 72)
-    print(f"训练完成！最优验证 Loss: {best_val_loss:.6f}")
-    print(f"模型权重: {best_model_path}")
-    print(f"标准化统计量: {norm_stats_path}")
+    print(f"训练结束！最优验证 Loss (MSE): {best_val_loss:.6f}")
+    print(f"权重路径: {best_model_path}")
+    print(f"统计文件: {norm_stats_path}")
     print("=" * 72)
 
 
 def run_test(args: argparse.Namespace) -> None:
+    """
+    独立测试环节：加载已有权重，在验证集上全面评估重构质量。
+    """
+    # 1. 设备设置
     if USE_GPU and torch.cuda.is_available():
         device = torch.device(f"cuda:{GPU_ID}")
-        print(f"[设备] 使用 GPU: cuda:{GPU_ID}")
+        print(f"[设备] 测试模式使用 GPU: {device}")
     else:
         device = torch.device("cpu")
-        print("[设备] 使用 CPU")
+        print("[设备] 测试模式使用 CPU")
 
+    # 2. 数据准备 (只需验证部分数据)
     h5_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), H5_PATH)
     _, val_data, mean, std, height, width = load_and_preprocess(
         h5_path, LOG1P_CHANNELS, TRAIN_RATIO
@@ -746,7 +801,7 @@ def run_test(args: argparse.Namespace) -> None:
 
     val_dataset = MeteoDataset(val_data, WINDOW_SIZE)
     if len(val_dataset) <= 0:
-        raise ValueError("验证集样本数为 0，无法执行测试。")
+        raise ValueError("验证集样本数为 0，请检查数据分流或路径。")
 
     val_loader = DataLoader(
         val_dataset,
@@ -756,6 +811,7 @@ def run_test(args: argparse.Namespace) -> None:
         pin_memory=(device.type == "cuda"),
     )
 
+    # 3. 构建模型并加载预训练权重
     model = ConvLSTMAutoEncoder(
         in_channels=IN_CHANNELS,
         hidden_channels=HIDDEN_DIM,
@@ -766,27 +822,34 @@ def run_test(args: argparse.Namespace) -> None:
         frame_width=width,
     ).float().to(device)
 
+    # 确定权重路径：优先使用命令行指定的路径，否则使用默认路径
     checkpoint_path = args.test_checkpoint or os.path.join(args.checkpoints, BEST_MODEL_FILE)
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"测试所需模型文件不存在: {checkpoint_path}")
+        raise FileNotFoundError(f"找不到需要测试的模型权重文件: {checkpoint_path}")
 
-    print(f"[测试] 加载模型: {checkpoint_path}")
+    print(f"[测试] 正在加载权重: {checkpoint_path}")
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
+    # 4. 执行评估
     criterion = nn.MSELoss()
-    use_amp = device.type == "cuda"
+    use_amp = (device.type == "cuda")
+    
+    # 获取原始 MSE Loss
     val_loss = validate(model, val_loader, criterion, device, use_amp)
+    # 获取详细的重构物理指标
     metrics = evaluate_reconstruction_metrics(model, val_loader, device, use_amp)
 
+    # 5. 打印测试报告
     print("\n" + "=" * 72)
-    print("ConvLSTM AutoEncoder 验证集测试结果")
-    print(f"  checkpoints: {checkpoint_path}")
-    print(f"  val_samples: {len(val_dataset)}")
-    print(f"  norm_mean_shape: {tuple(mean.shape)} | norm_std_shape: {tuple(std.shape)}")
-    print(f"  MSELoss(): {val_loss:.6f}")
-    print(f"  MAE:       {metrics['mae']:.6f}")
-    print(f"  RMSE:      {metrics['rmse']:.6f}")
-    print(f"  R2:        {metrics['r2']:.6f}")
+    print("ConvLSTM AutoEncoder 气象数据重构性能测试报告")
+    print(f"  测试权重: {checkpoint_path}")
+    print(f"  样本数量: {len(val_dataset)}")
+    print(f"  标准化态: Mean={tuple(mean.shape)}, Std={tuple(std.shape)}")
+    print("-" * 72)
+    print(f"  1. MSE Loss (Criterion): {val_loss:.8f}")
+    print(f"  2. MAE (物理绝对值误差): {metrics['mae']:.8f}")
+    print(f"  3. RMSE (均方根误差):   {metrics['rmse']:.8f}")
+    print(f"  4. R2 Score (决定系数):  {metrics['r2']:.8f}")
     print("=" * 72)
 
 
@@ -849,31 +912,43 @@ def run_smoke_test() -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ConvLSTM AutoEncoder 气象时空特征编码器")
-    parser.add_argument("--smoke-test", action="store_true", help="使用随机数据验证模型结构")
-    parser.add_argument("--train-epochs", type=int, default=EPOCHS, help="训练轮数")
-    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="初始学习率")
-    parser.add_argument("--patience", type=int, default=5, help="早停耐心轮数")
+    # 配置命令行解析器
+    parser = argparse.ArgumentParser(description="ConvLSTM AutoEncoder - 气象时序时空特征重构与编码系统")
+    
+    # 模式选择
+    parser.add_argument("--smoke-test", action="store_true", help="冒烟测试：使用虚拟数据验证模型结构和显存占用")
+    parser.add_argument("--test-only", action="store_true", help="测试模式：加载最优权重并在验证集上跑分")
+    
+    # 训练关键参数
+    parser.add_argument("--train-epochs", type=int, default=EPOCHS, help="最大训练轮数 (Epochs)")
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="学习率 (Learning Rate)")
+    parser.add_argument("--patience", type=int, default=5, help="早停耐心值 (Patience)，超过此轮数 Loss 不降则停止")
     parser.add_argument(
         "--lradj",
         type=str,
         default="cosine",
         choices=["type1", "type2", "cosine", "none"],
-        help="学习率调整策略",
+        help="学习率衰减策略",
     )
-    parser.add_argument("--checkpoints", type=str, default=CHECKPOINT_DIR, help="checkpoint 保存目录")
-    parser.add_argument("--test-only", action="store_true", help="load the best checkpoint and evaluate on the validation set")
+    
+    # 路径配置
+    parser.add_argument("--checkpoints", type=str, default=CHECKPOINT_DIR, help="模型权重和统计量的保存目录")
     parser.add_argument(
         "--test-checkpoint",
         type=str,
         default="",
-        help="checkpoint path for test-only mode; defaults to checkpoints/convlstm_ae_best.pth",
+        help="测试模式下的特定权重文件路径 (不填则默认加载保存的最优模型)",
     )
+    
     cli_args = parser.parse_args()
 
+    # 根据参数进入不同分支
     if cli_args.smoke_test:
+        # 进入模型验证冒烟测试
         run_smoke_test()
     elif cli_args.test_only:
+        # 进入纯推理测试评估模式
         run_test(cli_args)
     else:
+        # 进入常规训练/验证流程
         run_training(cli_args)
