@@ -4,6 +4,7 @@ ConvLSTM AutoEncoder for meteorological spatiotemporal sequence encoding.
 Usage:
     python convlstm_ae.py
     python convlstm_ae.py --smoke-test
+    python convlstm_ae.py --test-only
 """
 
 import argparse
@@ -569,6 +570,46 @@ def validate(
     return total_loss / max(n_batches, 1)
 
 
+@torch.inference_mode()
+def evaluate_reconstruction_metrics(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+) -> dict:
+    """Compute reconstruction metrics with the same validation loader."""
+    model.eval()
+    total_squared_error = 0.0
+    total_absolute_error = 0.0
+    total_elements = 0
+    target_sum = 0.0
+    target_squared_sum = 0.0
+
+    for batch in loader:
+        batch = batch.to(device=device, dtype=torch.float32)
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            reconstructed = model(batch)
+
+        diff = reconstructed - batch
+        total_squared_error += diff.square().sum().item()
+        total_absolute_error += diff.abs().sum().item()
+        total_elements += diff.numel()
+        target_sum += batch.sum().item()
+        target_squared_sum += batch.square().sum().item()
+
+    mse = total_squared_error / max(total_elements, 1)
+    mae = total_absolute_error / max(total_elements, 1)
+    rmse = float(np.sqrt(mse))
+    target_mean = target_sum / max(total_elements, 1)
+    total_variance = target_squared_sum - total_elements * (target_mean ** 2)
+    if total_variance <= 1e-12:
+        r2 = 0.0
+    else:
+        r2 = 1.0 - (total_squared_error / total_variance)
+    return {"mse": mse, "mae": mae, "rmse": rmse, "r2": r2}
+
+
 def run_training(args: argparse.Namespace) -> None:
     if args.train_epochs <= 0:
         raise ValueError("train_epochs must be positive.")
@@ -690,6 +731,65 @@ def run_training(args: argparse.Namespace) -> None:
     print("=" * 72)
 
 
+def run_test(args: argparse.Namespace) -> None:
+    if USE_GPU and torch.cuda.is_available():
+        device = torch.device(f"cuda:{GPU_ID}")
+        print(f"[设备] 使用 GPU: cuda:{GPU_ID}")
+    else:
+        device = torch.device("cpu")
+        print("[设备] 使用 CPU")
+
+    h5_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), H5_PATH)
+    _, val_data, mean, std, height, width = load_and_preprocess(
+        h5_path, LOG1P_CHANNELS, TRAIN_RATIO
+    )
+
+    val_dataset = MeteoDataset(val_data, WINDOW_SIZE)
+    if len(val_dataset) <= 0:
+        raise ValueError("验证集样本数为 0，无法执行测试。")
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    model = ConvLSTMAutoEncoder(
+        in_channels=IN_CHANNELS,
+        hidden_channels=HIDDEN_DIM,
+        latent_dim=LATENT_DIM,
+        num_layers=NUM_LAYERS,
+        seq_len=WINDOW_SIZE,
+        frame_height=height,
+        frame_width=width,
+    ).float().to(device)
+
+    checkpoint_path = args.test_checkpoint or os.path.join(args.checkpoints, BEST_MODEL_FILE)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"测试所需模型文件不存在: {checkpoint_path}")
+
+    print(f"[测试] 加载模型: {checkpoint_path}")
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+
+    criterion = nn.MSELoss()
+    use_amp = device.type == "cuda"
+    val_loss = validate(model, val_loader, criterion, device, use_amp)
+    metrics = evaluate_reconstruction_metrics(model, val_loader, device, use_amp)
+
+    print("\n" + "=" * 72)
+    print("ConvLSTM AutoEncoder 验证集测试结果")
+    print(f"  checkpoints: {checkpoint_path}")
+    print(f"  val_samples: {len(val_dataset)}")
+    print(f"  norm_mean_shape: {tuple(mean.shape)} | norm_std_shape: {tuple(std.shape)}")
+    print(f"  MSELoss(): {val_loss:.6f}")
+    print(f"  MAE:       {metrics['mae']:.6f}")
+    print(f"  RMSE:      {metrics['rmse']:.6f}")
+    print(f"  R2:        {metrics['r2']:.6f}")
+    print("=" * 72)
+
+
 # =============================================================================
 # Smoke test
 # =============================================================================
@@ -762,9 +862,18 @@ if __name__ == "__main__":
         help="学习率调整策略",
     )
     parser.add_argument("--checkpoints", type=str, default=CHECKPOINT_DIR, help="checkpoint 保存目录")
+    parser.add_argument("--test-only", action="store_true", help="load the best checkpoint and evaluate on the validation set")
+    parser.add_argument(
+        "--test-checkpoint",
+        type=str,
+        default="",
+        help="checkpoint path for test-only mode; defaults to checkpoints/convlstm_ae_best.pth",
+    )
     cli_args = parser.parse_args()
 
     if cli_args.smoke_test:
         run_smoke_test()
+    elif cli_args.test_only:
+        run_test(cli_args)
     else:
         run_training(cli_args)
