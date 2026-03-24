@@ -785,6 +785,52 @@ class ConvLSTMAEWeatherEncoder:
         """对单一查询或窗口直接转换处理，相当于 block 方法封装对预期 1 窗口断言控制。"""
         return self.transform_frame_block(weather_window, expected_windows=1)
 
+    def transform_window_batch(
+        self,
+        window_batch: np.ndarray,
+        expected_windows: Optional[int] = None,
+    ) -> np.ndarray:
+        self._ensure_norm_stats_loaded()
+
+        windows = np.asarray(window_batch, dtype=np.float32)
+        if windows.ndim != 5 or windows.shape[1] != self.window_size:
+            raise ValueError(
+                f"窗口批次必须为 [N, {self.window_size}, C, H, W]，实际 {windows.shape}"
+            )
+        if windows.shape[2] != self.channel_count:
+            raise ValueError(
+                f"窗口批次通道数必须为 {self.channel_count}，实际 {windows.shape[2]}"
+            )
+
+        self._ensure_model_loaded(windows.shape[3], windows.shape[4])
+
+        arr = np.array(windows, dtype=np.float32, copy=True, order="C")
+        for channel in self.log1p_channels:
+            arr[:, :, channel, :, :] = np.log1p(
+                np.clip(arr[:, :, channel, :, :], a_min=0.0, a_max=None)
+            )
+
+        channel_mean = self.channel_mean.reshape(1, 1, self.channel_count, 1, 1)
+        channel_std = self.channel_std.reshape(1, 1, self.channel_count, 1, 1)
+        arr = (arr - channel_mean) / channel_std
+
+        num_windows = int(arr.shape[0])
+        if expected_windows is not None and num_windows != int(expected_windows):
+            raise RuntimeError(f"期望得到 {expected_windows} 个窗口，实际为 {num_windows}。")
+
+        encoded = np.empty((num_windows, self.output_dim), dtype=np.float32)
+        micro_batch = max(1, self.batch_size)
+        for start in range(0, num_windows, micro_batch):
+            end = min(start + micro_batch, num_windows)
+            batch_np = np.array(arr[start:end], dtype=np.float32, copy=True, order="C")
+            batch_tensor = torch.from_numpy(batch_np).to(device=self._device, dtype=torch.float32)
+            with torch.inference_mode():
+                with torch.amp.autocast("cuda", enabled=self._use_amp):
+                    batch_encoded = self._model.encode(batch_tensor)
+            encoded[start:end] = batch_encoded.float().cpu().numpy()
+
+        return encoded
+
     def fit(self, *args, **kwargs) -> None:
         """保留方法向后兼容以往旧设计接口(例如 PCA 的拟合函数)。实际上神经网络属于线下提前固化模型无需这一操作。"""
         return None
@@ -810,6 +856,7 @@ class SimilarDayRetriever:
         pred_len: int = 96,
         train_ratio: float = 2.0 / 3.0,
         freq: str = "15min",
+        build_stride: Optional[int] = None,
         build_batch_size: int = 384,
         ae_checkpoint_path: Union[str, Path] = DEFAULT_AE_CHECKPOINT,
         ae_norm_stats_path: Union[str, Path] = DEFAULT_AE_NORM_STATS,
@@ -835,12 +882,15 @@ class SimilarDayRetriever:
         self.pred_len = int(pred_len)
         self.train_ratio = float(train_ratio)
         self.freq = str(freq)
+        self.build_stride = self.pred_len if build_stride is None else int(build_stride)
         self.build_batch_size = int(build_batch_size)
         self.ae_checkpoint_path = str(Path(ae_checkpoint_path).resolve())
         self.ae_norm_stats_path = str(Path(ae_norm_stats_path).resolve())
         self.encoder_batch_size = int(encoder_batch_size)
         self.stats = tuple(stats)
         self.log1p_channels = tuple(int(x) for x in log1p_channels)
+        if self.build_stride <= 0:
+            raise ValueError(f"build_stride must be positive, got {self.build_stride}")
 
         # 核心功能组件，只有在 build() 或 load() 后才会被实例化或赋予数据
         self.weather_encoder: Optional[ConvLSTMAEWeatherEncoder] = None
@@ -888,6 +938,63 @@ class SimilarDayRetriever:
         df = df.sort_values("date").reset_index(drop=True)
         df["load"] = df["load"].astype(np.float32)
         return df
+
+    @staticmethod
+    def _is_midnight_timestamp(timestamp: pd.Timestamp) -> bool:
+        ts = pd.Timestamp(timestamp)
+        return (
+            ts.hour == 0
+            and ts.minute == 0
+            and ts.second == 0
+            and ts.microsecond == 0
+            and ts.nanosecond == 0
+        )
+
+    def _build_train_window_starts(
+        self,
+        load_dates: Sequence[pd.Timestamp],
+        train_row_count: int,
+        max_train_windows: Optional[int] = None,
+    ) -> np.ndarray:
+        train_row_count = int(train_row_count)
+        max_start = train_row_count - self.pred_len
+        if max_start < 0:
+            raise ValueError(
+                f"训练样本不足以形成长度为 {self.pred_len} 的完整窗口: train_row_count={train_row_count}"
+            )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(load_dates))
+        first_midnight_index = None
+        for idx in range(max_start + 1):
+            if self._is_midnight_timestamp(dates[idx]):
+                first_midnight_index = idx
+                break
+        if first_midnight_index is None:
+            raise ValueError("训练数据中找不到从 00:00:00 开始的完整日窗口。")
+
+        start_indices = np.arange(
+            first_midnight_index,
+            max_start + 1,
+            self.build_stride,
+            dtype=np.int64,
+        )
+        if start_indices.size == 0:
+            raise ValueError("当前 build_stride 设置下无法生成任何训练窗口。")
+
+        valid_mask = np.array(
+            [self._is_midnight_timestamp(dates[int(idx)]) for idx in start_indices],
+            dtype=bool,
+        )
+        start_indices = start_indices[valid_mask]
+        if start_indices.size == 0:
+            raise ValueError("当前 build_stride 无法保持窗口起点对齐到 00:00:00。")
+
+        if max_train_windows is not None:
+            start_indices = start_indices[: int(max_train_windows)]
+        if start_indices.size == 0:
+            raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
+
+        return start_indices
 
     def _compute_channel_stats(
         self, weather_store: HDF5WeatherSequenceStore, frame_count: int
@@ -956,7 +1063,6 @@ class SimilarDayRetriever:
         total_batches = math.ceil(n_windows / self.build_batch_size)
         for batch_idx, start in enumerate(range(0, n_windows, self.build_batch_size), start=1):
             current_size = min(self.build_batch_size, n_windows - start)
-            # 对于给定的窗口数量 N_win，需要读取 N_win + pred_len - 1 帧
             end = start + current_size + self.pred_len - 1
             frames = weather_store.get_block(start, end)
             raw = encoder.extract_raw_features_from_block(frames, expected_windows=current_size)
@@ -966,34 +1072,44 @@ class SimilarDayRetriever:
                     f"[{stage_name}] 批次 {batch_idx}/{total_batches} "
                     f"windows={start}:{start + current_size - 1}"
                 )
-            # 通过 yield 挂起，供调用方消费特征，节约内存
             yield raw
 
     def _iter_weather_embedding_batches(
         self,
         weather_store: HDF5WeatherSequenceStore,
         encoder: ConvLSTMAEWeatherEncoder,
-        n_windows: int,
+        window_start_indices: Sequence[int],
         stage_name: str,
     ) -> Iterator[np.ndarray]:
         """
         分批产生经过 ConvLSTM 自编码器嵌入后的特征向量流。
         """
         # 兼容性处理：部分环境下由于编码问题可能需要清洗阶段名称中的非 ASCII 字符（如在原始终端导出日志时）
+        start_indices = np.asarray(window_start_indices, dtype=np.int64)
+        if start_indices.ndim != 1 or start_indices.size == 0:
+            raise ValueError("window_start_indices 必须是一维且非空。")
+
         safe_stage_name = stage_name.encode("ascii", errors="ignore").decode("ascii").strip() or "weather_batch"
-        total_batches = math.ceil(n_windows / self.build_batch_size)
-        for batch_idx, start in enumerate(range(0, n_windows, self.build_batch_size), start=1):
-            current_size = min(self.build_batch_size, n_windows - start)
-            # 计算当前窗口组所需的总帧数范围
-            end = start + current_size + self.pred_len - 1
-            frames = weather_store.get_block(start, end)
-            # 使用神经网络执行前向传播生成潜向量
-            batch_vectors = encoder.transform_frame_block(frames, expected_windows=current_size)
+        effective_batch_size = max(1, min(self.build_batch_size, encoder.batch_size))
+        total_batches = math.ceil(len(start_indices) / effective_batch_size)
+        frame_shape = tuple(int(x) for x in weather_store.frame_shape)
+
+        for batch_idx, offset in enumerate(range(0, len(start_indices), effective_batch_size), start=1):
+            batch_starts = start_indices[offset : offset + effective_batch_size]
+            current_size = len(batch_starts)
+            batch_windows = np.empty((current_size, self.pred_len, *frame_shape), dtype=np.float32)
+            for row_idx, start_idx in enumerate(batch_starts):
+                batch_windows[row_idx] = weather_store.get_window(int(start_idx), self.pred_len)
+
+            batch_vectors = encoder.transform_window_batch(
+                batch_windows,
+                expected_windows=current_size,
+            )
 
             if batch_idx == 1 or batch_idx == total_batches or batch_idx % max(1, total_batches // 8) == 0:
                 print(
-                    f"[{stage_name}] 批次 {batch_idx}/{total_batches} "
-                    f"windows={start}:{start + current_size - 1}"
+                    f"[{safe_stage_name}] 批次 {batch_idx}/{total_batches} "
+                    f"windows={int(batch_starts[0])}:{int(batch_starts[-1])}"
                 )
             yield batch_vectors
 
@@ -1041,8 +1157,14 @@ class SimilarDayRetriever:
 
         total_rows = len(load_df)
         default_train_rows = int(total_rows * self.train_ratio)
+        load_dates = pd.DatetimeIndex(load_df["date"])
+        window_start_indices = self._build_train_window_starts(
+            load_dates=load_dates,
+            train_row_count=default_train_rows,
+            max_train_windows=max_train_windows,
+        )
         # 根据给定的预测长度推算可以产生的监督滑动窗口总数
-        n_windows = default_train_rows - self.pred_len + 1
+        n_windows = int(len(window_start_indices))
         if n_windows <= 0:
             raise ValueError(
                 f"训练窗口数无效: total_rows={total_rows}, pred_len={self.pred_len}, train_ratio={self.train_ratio}"
@@ -1054,14 +1176,17 @@ class SimilarDayRetriever:
             raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
 
         # 验证气象和负荷在起跑线上是对齐的
-        train_frame_count = n_windows + self.pred_len - 1
-        weather_store.verify_alignment(load_df["date"].iloc[:train_frame_count])
+        train_frame_count = int(window_start_indices[-1] + self.pred_len)
+        weather_store.verify_alignment(load_dates[:train_frame_count])
         # 准备对应标签侧的负荷滑动窗口、起始时间戳列表
-        start_timestamps = pd.DatetimeIndex(load_df["date"].iloc[:n_windows])
+        start_timestamps = pd.DatetimeIndex(load_dates[window_start_indices])
         load_values = load_df["load"].to_numpy(dtype=np.float32)
         # 使用 numpy 高效滑窗构建 ground truth 的历史曲线
-        load_curves = sliding_window_view(load_values[:train_frame_count], self.pred_len)[:n_windows]
-        load_curves = np.ascontiguousarray(load_curves.astype(np.float32))
+        load_curves = np.stack(
+            [load_values[int(start) : int(start) + self.pred_len] for start in window_start_indices],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        load_curves = np.ascontiguousarray(load_curves)
 
         print("=" * 72)
         print("开始构建时空相似日检索库 (ConvLSTM-AE)")
@@ -1110,7 +1235,7 @@ class SimilarDayRetriever:
         for batch_vectors in self._iter_weather_embedding_batches(
             weather_store=weather_store,
             encoder=encoder,
-            n_windows=n_windows,
+            window_start_indices=window_start_indices,
             stage_name="向量生成",
         ):
             weather_vectors[cursor : cursor + len(batch_vectors)] = batch_vectors
@@ -1168,6 +1293,9 @@ class SimilarDayRetriever:
         """
         # 确保系统已完成构建或加载
         self._ensure_built()
+        query_timestamp = pd.Timestamp(query_timestamp)
+        if not self._is_midnight_timestamp(query_timestamp):
+            raise ValueError(f"query_timestamp must start at 00:00:00 for daily retrieval, got {query_timestamp}")
         
         # 统一输入格式为 [1, Dim]
         weather_embedding = np.asarray(weather_embedding, dtype=np.float32).reshape(1, -1)
@@ -1333,6 +1461,7 @@ class SimilarDayRetriever:
             "pred_len": self.pred_len,
             "train_ratio": self.train_ratio,
             "freq": self.freq,
+            "build_stride": self.build_stride,
             "build_batch_size": self.build_batch_size,
             "ae_checkpoint_path": self.ae_checkpoint_path,
             "ae_norm_stats_path": self.ae_norm_stats_path,
@@ -1376,6 +1505,7 @@ class SimilarDayRetriever:
             pred_len=int(metadata["pred_len"]),
             train_ratio=float(metadata["train_ratio"]),
             freq=str(metadata["freq"]),
+            build_stride=int(metadata.get("build_stride", metadata["pred_len"])),
             build_batch_size=int(metadata["build_batch_size"]),
             ae_checkpoint_path=metadata.get("ae_checkpoint_path", DEFAULT_AE_CHECKPOINT),
             ae_norm_stats_path=metadata.get("ae_norm_stats_path", DEFAULT_AE_NORM_STATS),
@@ -1476,6 +1606,16 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
     train_rows = int(len(load_df) * float(args.train_ratio))
     if train_rows >= len(load_df):
         train_rows = len(load_df) - 1
+    fallback_dates = pd.DatetimeIndex(load_df["date"].iloc[train_rows:])
+    midnight_mask = (
+        (fallback_dates.hour == 0)
+        & (fallback_dates.minute == 0)
+        & (fallback_dates.second == 0)
+        & (fallback_dates.microsecond == 0)
+        & (fallback_dates.nanosecond == 0)
+    )
+    if np.any(midnight_mask):
+        return pd.Timestamp(fallback_dates[midnight_mask][0])
     return pd.Timestamp(load_df["date"].iloc[train_rows])
 
 
