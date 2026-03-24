@@ -9,6 +9,7 @@ Usage:
 import argparse
 import os
 import time
+import h5py
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -17,12 +18,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from utils.tools import EarlyStopping, adjust_learning_rate
-
-try:
-    import h5py
-except ImportError:
-    h5py = None
-
 
 # =============================================================================
 # 全局配置 (Global Config) - 超参数、路径、数据字段等的收口定义
