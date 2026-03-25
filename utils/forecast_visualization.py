@@ -5,6 +5,7 @@ forecast_visualization.py - 预测结果可视化与未来预测工具模块
 并使用已训练模型进行未来连续多步负荷预测的完整流程。支持分位数预测结果的展示与置信区间绘制。
 """
 
+import copy
 import json
 import os
 from typing import Any, Callable, Optional, Sequence
@@ -67,6 +68,58 @@ def _find_quantile_index(quantiles: Sequence[float], value: float) -> Optional[i
         if abs(float(quantile) - value) < 1e-8:
             return idx
     return None
+
+
+def _build_future_similar_day_prior_tensor(
+    similar_day_result: Any,
+    ref_data: Any,
+    pred_len: int,
+    top_k: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    将未来预测时的 Top-K 相似日检索结果整理为模型可直接使用的先验张量。
+
+    参数:
+        similar_day_result (Any): 包含检索到的相似日负荷曲线及得分的对象
+        ref_data (Any): 用于数据归一化的参考数据集对象（包含 Scaler）
+        pred_len (int): 预测长度
+        top_k (int): 取前 K 个相似日
+        device (torch.device): 数据放置的目标设备 (CPU/CUDA)
+
+    返回:
+        Optional[torch.Tensor]: 形状为 [1, pred_len, top_k + 1] 的先验特征张量。
+                                如果检索结果无效则返回 None。
+    """
+    if similar_day_result is None or int(pred_len) <= 0 or int(top_k) <= 0:
+        return None
+
+    # 从检索结果中提取负荷曲线数据，各行代表一个相似日的负荷序列
+    curves = np.asarray(getattr(similar_day_result, "load_curves", []), dtype=np.float32)
+    # 容错处理：确保曲线数组是二维的 [n_similar_days, time_steps]
+    if curves.ndim == 1:
+        curves = curves.reshape(1, -1)
+    if curves.ndim != 2 or curves.size == 0:
+        return None
+
+    # 截取预测视窗长度部分的负荷曲线
+    curves = curves[:, : int(pred_len)]
+    # 使用参考数据集的缩放算子对相似日负荷进行归一化，使其处于模型训练时的数值空间
+    curves_scaled = ref_data.scale_target(curves.reshape(-1, 1)).reshape(curves.shape[0], curves.shape[1])
+    # 提取各相似日对应的检索相似度得分
+    scores = np.asarray(getattr(similar_day_result, "similarity_scores", []), dtype=np.float32)
+
+    from utils.weather_e2e import _build_similar_day_prior_features
+
+    # 调用底层构建工具，将多条相似日曲线与得分融合为 [pred_len, top_k + 1] 维度的特征矩阵
+    prior_features = _build_similar_day_prior_features(
+        load_curves=curves_scaled,
+        similarity_scores=scores,
+        pred_len=int(pred_len),
+        top_k=int(top_k),
+        shift_steps=0,
+    )
+    return torch.as_tensor(prior_features, dtype=torch.float32, device=device).unsqueeze(0)
 
 
 def restore_sliding_window_2d(data_2d: np.ndarray) -> np.ndarray:
@@ -167,15 +220,18 @@ def plot_pred_vs_true(
         title_prefix (str): 图像主标题的前缀
         y_label (str): y 轴自定义标签名字
     """
+    # 尝试切换后端，防止在某些环境中绘图引擎冲突
     try:
         plt.switch_backend("TkAgg")
     except Exception:
         pass
 
+    # 根据是否需要反归一化，确定 npy 文件的数据源路径
     if use_inverse:
         pred_path = os.path.join(results_dir, "pred_inv.npy")
         true_path = os.path.join(results_dir, "true_inv.npy")
         quantile_path = os.path.join(results_dir, "quantile_preds_inv.npy")
+        # 如果反归一化文件不存在，则回退到原始归一化文件
         if not os.path.exists(pred_path):
             pred_path = os.path.join(results_dir, "pred.npy")
             true_path = os.path.join(results_dir, "true.npy")
@@ -185,20 +241,26 @@ def plot_pred_vs_true(
         true_path = os.path.join(results_dir, "true.npy")
         quantile_path = os.path.join(results_dir, "quantile_preds.npy")
 
+    # 检查核心文件是否存在，不存在则跳过绘图
     if not os.path.exists(pred_path) or not os.path.exists(true_path):
         print("Prediction files not found, skip plotting.")
         return
 
+    # 加载预测值与真实值
     preds = np.load(pred_path)
     trues = np.load(true_path)
 
+    # 检查是否存在分位数预测结果，并提取 P10 与 P90 的索引
     has_quantiles = os.path.exists(quantile_path)
     quantile_preds = np.load(quantile_path) if has_quantiles else None
     p10_idx = _find_quantile_index(quantiles or [], 0.1) if has_quantiles else None
     p90_idx = _find_quantile_index(quantiles or [], 0.9) if has_quantiles else None
+    # 只有当包含分位数预测、且指定了 P10/P90 索引时，才能绘制置信区间带
     can_plot_band = has_quantiles and p10_idx is not None and p90_idx is not None
 
+    # 将滑窗采样形状的数据还原为一维时间序列
     if preds.ndim == 3:
+        # [batch_size, pred_len, d_model]
         pred_seq = restore_sliding_window_3d(preds)
         true_seq = restore_sliding_window_3d(trues)
         if pred_seq.ndim == 2:
@@ -209,12 +271,14 @@ def plot_pred_vs_true(
             pred_series = pred_seq.reshape(-1)
             true_series = true_seq.reshape(-1)
     elif preds.ndim == 2:
+        # [batch_size, pred_len]
         pred_series = restore_sliding_window_2d(preds)
         true_series = restore_sliding_window_2d(trues)
     else:
         pred_series = preds.reshape(-1)
         true_series = trues.reshape(-1)
 
+    # 如果可以绘制置信区间带，对应提取 P10 和 P90 序列并解滑窗
     if can_plot_band:
         q_p10_raw = quantile_preds[:, :, p10_idx : p10_idx + 1]
         q_p90_raw = quantile_preds[:, :, p90_idx : p90_idx + 1]
@@ -229,17 +293,22 @@ def plot_pred_vs_true(
             p10_series = p10_seq.reshape(-1)
             p90_series = p90_seq.reshape(-1)
 
+    # 计算预测指标并在控制台打印
     eval_df = cal_eval(true_series, pred_series)
     print("[Plot Eval] metrics:")
     print(eval_df)
 
+    # 创建保存目录
     os.makedirs(results_dir, exist_ok=True)
     mape_val = eval_df.iloc[0]["MAPE"]
 
+    # 初始化绘图画布
     fig, ax = plt.subplots(1, 1, figsize=(15, 5), facecolor="white")
+    # 绘制真实值与 P50 预测值
     ax.plot(true_series, label="GroundTruth", alpha=0.8, color="tab:blue")
     ax.plot(pred_series, label="Prediction (P50)", alpha=0.7, color="tab:orange")
 
+    # 绘制 P10-P90 置信区间阴影部分
     if can_plot_band:
         ax.fill_between(
             range(len(p10_series)),
@@ -250,6 +319,7 @@ def plot_pred_vs_true(
             label="P10-P90 Confidence Interval",
         )
 
+    # 图表细节配置：图例、网格、标题及标签
     ax.legend()
     ax.grid(True, linestyle="--", alpha=0.5)
     if np.isfinite(mape_val):
@@ -258,6 +328,8 @@ def plot_pred_vs_true(
         ax.set_title(f"{title_prefix} - MAPE: NaN")
     ax.set_xlabel("Time Step")
     ax.set_ylabel(y_label)
+    
+    # 自动调整布局并保存图像
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, out_name), dpi=600, bbox_inches="tight")
     plt.show()
@@ -297,11 +369,13 @@ def predict_future_load_from_csv(
         y_label: Y 轴文字名称
         similar_day_result: 可选的相似日检索结果；若提供，则叠加其 Top-K 负荷曲线到未来预测图
     """
+    # 基础参数校验
     if quantiles is None:
         raise ValueError("quantiles must be provided.")
     if data_provider_fn is None:
         raise ValueError("data_provider_fn must be provided.")
 
+    # 提取 P10、P50 (中位数) 和 P90 分位数的索引，用于结果展示和区间绘制
     p10_idx = _find_quantile_index(quantiles, 0.1)
     p50_idx = _find_quantile_index(quantiles, 0.5)
     p90_idx = _find_quantile_index(quantiles, 0.9)
@@ -312,6 +386,7 @@ def predict_future_load_from_csv(
     print(f"Future Forecast: from {future_path}")
     print("=" * 60)
 
+    # 路径合法性检查
     abs_future_path = os.path.abspath(future_path)
     if not os.path.exists(abs_future_path):
         print(f"Future file not found, skip: {abs_future_path}")
@@ -322,6 +397,7 @@ def predict_future_load_from_csv(
         print(f"History file not found, skip: {history_path}")
         return
 
+    # 加载历史负荷数据与带有未来时间戳的气象/占位文件
     try:
         history_df = _load_ordered_dataframe(history_path, args.target)
         future_df = pd.read_csv(abs_future_path)
@@ -329,60 +405,86 @@ def predict_future_load_from_csv(
         print(f"Load csv failed: {exc}")
         return
 
+    # 预处理未来数据的时间戳
     if "date" not in future_df.columns:
         print(f"Future file missing date column: {abs_future_path}")
         return
     future_df["date"] = pd.to_datetime(future_df["date"])
     future_df = future_df.sort_values("date").reset_index(drop=True)
 
+    # 确保历史数据长度满足模型的 lookback 窗口要求
     if len(history_df) < args.seq_len:
         print(f"History length ({len(history_df)}) < seq_len ({args.seq_len}), skip.")
         return
 
+    # 计算实际预测步目，受限于 steps 参数、CSV 行数和模型最大预测能力
     predict_steps = min(int(steps), len(future_df), args.pred_len)
     if predict_steps < args.pred_len:
         print(f"Future rows ({predict_steps}) < pred_len ({args.pred_len}), skip.")
         return
 
-    ref_data, _ = data_provider_fn(args, "train", weather_store)
+    # 获取训练集的数据提供器，主要为了获取归一化算子 (Scaler)
+    ref_args = copy.copy(args)
+    if hasattr(ref_args, "use_similar_day_prior"):
+        ref_args.use_similar_day_prior = False
+    ref_data, _ = data_provider_fn(ref_args, "train", weather_store)
 
+    # 提取时间轴：seq_len 长度的历史日期 + pred_len 长度的未来日期
     hist_dates = pd.to_datetime(history_df["date"].iloc[-args.seq_len :].values)
     future_dates = pd.to_datetime(future_df["date"].iloc[: args.pred_len].values)
+    
+    # 提取历史负荷并进行归一化
     hist_load = history_df[args.target].iloc[-args.seq_len :].values.astype(np.float32).reshape(-1, 1)
     hist_load_scaled = ref_data.scale_target(hist_load)
 
-    # 扩展气象数据范围：历史 + 未来预测期
+    # 准备气象特征：涵盖历史窗口与未来预测窗口，共 seq_len + pred_len 步
     all_dates = np.concatenate([hist_dates, future_dates])
     hist_weather = weather_store.fetch_frames_by_dates(all_dates)
+    
+    # 如果模型启用了相似日先验且提供了检索结果，则构建先验张量
+    similar_day_prior_tensor = None
+    if bool(getattr(model, "use_similar_day_prior", False)) and similar_day_result is not None:
+        similar_day_prior_tensor = _build_future_similar_day_prior_tensor(
+            similar_day_result=similar_day_result,
+            ref_data=ref_data,
+            pred_len=args.pred_len,
+            top_k=int(getattr(model, "similar_day_top_k", getattr(args, "similar_day_top_k", 3))),
+            device=device,
+        )
 
-    # 内生变量时间标记（仅历史期）
+    # 生成时间位置编码 (Time Features)
+    # 内生变量标记仅针对历史窗口
     x_mark_np = time_features(pd.to_datetime(hist_dates), freq=args.freq).transpose(1, 0).astype(np.float32)
-    # 外生变量时间标记（历史 + 未来期）
+    # 外生变量标记针对全部窗口 (历史 + 未来)
     exo_mark_np = time_features(pd.to_datetime(all_dates), freq=args.freq).transpose(1, 0).astype(np.float32)
 
-    # 执行模型前向预测算子，此时禁用了梯度追踪
+    # 切换模型为评估模式，并禁用梯度计算
     model.eval()
     with torch.inference_mode():
-        # [B, L, 1] - 提供目标序列前截断序列的输入窗口
+        # 封装为 Tensor 并增加 Batch 维度 (B=1)
+        # batch_x: [1, seq_len, 1] 历史负荷
         batch_x = torch.as_tensor(hist_load_scaled, dtype=torch.float32, device=device).unsqueeze(0)
-        # [B, L_endo, T] - 提供目标序列输入窗口对应的时间特性
+        # batch_x_mark: [1, seq_len, T] 历史时间编码
         batch_x_mark = torch.as_tensor(x_mark_np, dtype=torch.float32, device=device).unsqueeze(0)
-        # [B, L_exo, T] - 外源时频变量的时间标记提取（用于在 timeXer 中计算更长的交叉注意力映射）
+        # batch_exo_mark: [1, seq_len + pred_len, T] 全局时间编码
         batch_exo_mark = torch.as_tensor(exo_mark_np, dtype=torch.float32, device=device).unsqueeze(0)
-        # [B, L_exo, C, H, W] - 直接取出气象库内的环境光栅时基文件组合特征矩阵
+        # batch_weather_x: [1, seq_len + pred_len, C, H, W] 气象格点数据
         batch_weather_x = torch.as_tensor(hist_weather, dtype=torch.float32, device=device).unsqueeze(0)
 
+        # 执行模型前向传播，得到分位数预测结果
         outputs = model(
             load_x=batch_x,
             x_mark_enc=batch_x_mark,
             x_exo_mark=batch_exo_mark,
             weather_x=batch_weather_x,
+            similar_day_prior=similar_day_prior_tensor,
         )
 
-    # 模型输出维度：[Batch=1, pred_len, n_quantiles]
+    # 处理模型输出，维度为 [1, pred_len, n_quantiles]
     quantile_scaled = outputs[0, : args.pred_len, :].detach().cpu().numpy()
     p50_scaled = quantile_scaled[:, p50_idx]
 
+    # 根据配置决定是否执行反归一化，将预测值转回真实单位
     if use_inverse:
         preds_p50 = ref_data.inverse_transform_target(p50_scaled.reshape(-1, 1)).reshape(-1)
         history_target = history_df[args.target].values
@@ -402,17 +504,19 @@ def predict_future_load_from_csv(
         preds_p10 = quantile_scaled[:, p10_idx] if p10_idx is not None else None
         preds_p90 = quantile_scaled[:, p90_idx] if p90_idx is not None else None
 
-    future_dates = pd.Series(future_dates[:predict_steps])
+    # 根据 predict_steps 截取有效预测部分
+    effective_future_dates = pd.Series(future_dates[:predict_steps])
     preds_p50 = preds_p50[:predict_steps]
     if preds_p10 is not None:
         preds_p10 = preds_p10[:predict_steps]
     if preds_p90 is not None:
         preds_p90 = preds_p90[:predict_steps]
 
+    # 保存预测结果到 CSV 文件
     os.makedirs(results_dir, exist_ok=True)
     out_csv = os.path.join(results_dir, "future_load_prediction.csv")
     output_payload = {
-        "date": future_dates,
+        "date": effective_future_dates,
         f"{args.target}_pred_P50": preds_p50,
     }
     if preds_p10 is not None:
@@ -421,27 +525,31 @@ def predict_future_load_from_csv(
         output_payload[f"{args.target}_pred_P90"] = preds_p90
     pd.DataFrame(output_payload).to_csv(out_csv, index=False, encoding="utf-8-sig")
 
+    # 在控制台打印预测数值概览
     print(f"\nFuture {predict_steps}-step {args.target} predictions:")
     if preds_p10 is not None and preds_p90 is not None:
         print(f"{'Time':<25} {'P10':<12} {'P50':<12} {'P90':<12}")
         print("-" * 65)
         for i in range(predict_steps):
             print(
-                f"  {future_dates.iloc[i]}: "
+                f"  {effective_future_dates.iloc[i]}: "
                 f"{preds_p10[i]:<12.4f} {preds_p50[i]:<12.4f} {preds_p90[i]:<12.4f}"
             )
     else:
         print(f"{'Time':<25} {'P50':<12}")
         print("-" * 40)
         for i in range(predict_steps):
-            print(f"  {future_dates.iloc[i]}: {preds_p50[i]:<12.4f}")
+            print(f"  {effective_future_dates.iloc[i]}: {preds_p50[i]:<12.4f}")
 
+    # 开始可视化：合并历史尾部数据与未来预测数据
     n_history = min(args.seq_len, len(history_target))
     history_tail = history_target[-n_history:]
     future_x = range(n_history, n_history + predict_steps)
 
     plt.figure(figsize=(15, 6), facecolor="white")
+    # 绘制历史曲线
     plt.plot(range(n_history), history_tail, label="Historical Load", color="tab:blue", alpha=0.8)
+    # 绘制预测曲线 (P50)
     plt.plot(
         future_x,
         preds_p50,
@@ -451,6 +559,7 @@ def predict_future_load_from_csv(
         marker="o",
         markersize=2,
     )
+    # 填充 P10 到 P90 的置信区间阴影
     if preds_p10 is not None and preds_p90 is not None:
         plt.fill_between(
             future_x,
@@ -460,6 +569,8 @@ def predict_future_load_from_csv(
             color="tab:orange",
             label="P10-P90 Confidence Interval",
         )
+        
+    # 如果提供了相似日结果，将其负荷曲线也绘制在预测图上进行参考对比
     if similar_day_result is not None:
         similar_curves = np.asarray(getattr(similar_day_result, "load_curves", []), dtype=np.float32)
         similar_times = list(getattr(similar_day_result, "historical_timestamps", []))
@@ -487,6 +598,8 @@ def predict_future_load_from_csv(
                     linestyle="--",
                     alpha=0.9,
                 )
+    
+    # 绘制预测起点分割线
     plt.axvline(x=n_history - 0.5, color="gray", linestyle="--", alpha=0.6, label="Prediction Start")
     plt.legend(loc="upper left")
     plt.grid(True, linestyle="--", alpha=0.5)
@@ -495,6 +608,7 @@ def predict_future_load_from_csv(
     plt.ylabel(y_label)
     plt.tight_layout()
 
+    # 保存并展示预测图
     out_fig = os.path.join(results_dir, "future_load_prediction.png")
     plt.savefig(out_fig, dpi=600, bbox_inches="tight")
     plt.show()

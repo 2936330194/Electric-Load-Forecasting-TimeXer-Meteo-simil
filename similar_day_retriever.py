@@ -1579,6 +1579,7 @@ class SimilarDayRetriever:
         weather_embedding: np.ndarray,
         query_timestamp: Union[str, pd.Timestamp],
         top_k: int = 3,
+        history_end_timestamp_exclusive: Optional[Union[str, pd.Timestamp]] = None,
     ) -> RetrievalResult:
         """
         [底层接口] 输入已压缩好的潜向量表征，拼接时间特征后打分找相似日。
@@ -1587,6 +1588,9 @@ class SimilarDayRetriever:
             weather_embedding: 编码器产生的气象密集表示，尺寸应为 (weather_dim,)。
             query_timestamp: 预测发生的时间锚点，用于提取月、日、小时等周期规律进行加权。
             top_k: 设定返回分数最高的多少条历史片段。
+            history_end_timestamp_exclusive:
+                若提供，则仅允许检索起始时间严格早于该时间点的历史窗口。
+                常用于训练/验证阶段避免把“当前日”或“未来日”的真实负荷作为先验泄漏给模型。
 
         Returns:
             RetrievalResult: 封装了相似片段负荷序列以及评估得分的结果对象。
@@ -1609,7 +1613,32 @@ class SimilarDayRetriever:
         fused_query = self._fuse_and_normalize(weather_embedding, time_vector)
         
         # 3. 在索引库中执行精确内积搜索（等价于余弦相似度）
-        scores, ids = self.index.search(fused_query, top_k=top_k)
+        # 根据是否提供历史截止时间戳，选择不同的检索策略
+        if history_end_timestamp_exclusive is None:
+            # 策略 A: 全库检索。直接使用构建好的向量索引进行顶层 K 个近邻搜索
+            scores, ids = self.index.search(fused_query, top_k=top_k)
+        else:
+            # 策略 B: 过滤检索。仅在指定时间戳之前的历史数据中搜索，防止数据泄露
+            cutoff_ts = pd.Timestamp(history_end_timestamp_exclusive)
+            # 找出所有起始时间早于截止时间的索引位置
+            valid_indices = np.flatnonzero(self.start_timestamps < cutoff_ts)
+            
+            if valid_indices.size == 0:
+                # 容错处理：若无合规历史数据，返回空结果
+                scores = np.empty((1, 0), dtype=np.float32)
+                ids = np.empty((1, 0), dtype=np.int64)
+            else:
+                # 确定检索上限，不能超过候选集大小
+                limited_top_k = min(int(top_k), int(valid_indices.size))
+                # 提取符合条件的候选特征向量
+                candidate_vectors = self.base_vectors[valid_indices]
+                # 计算查询向量与合规候选向量之间的内积（由于已做 L2 归一化，即等价于余弦相似度）
+                candidate_scores = np.matmul(fused_query, candidate_vectors.T).astype(np.float32, copy=False)
+                # 对得分进行降序排列，取前 limited_top_k 个索引
+                order = np.argsort(-candidate_scores[0])[:limited_top_k]
+                # 整理最终得分与对应的原始库索引 ID
+                scores = candidate_scores[:, order]
+                ids = valid_indices[order].reshape(1, -1).astype(np.int64, copy=False)
 
         # 4. 根据返回的索引，从底库中提取对应的负荷曲线和时间戳
         retrieved_ids = [int(idx) for idx in ids[0].tolist() if int(idx) >= 0]
@@ -1634,6 +1663,7 @@ class SimilarDayRetriever:
         weather_window: np.ndarray,
         query_timestamp: Union[str, pd.Timestamp],
         top_k: int = 3,
+        history_end_timestamp_exclusive: Optional[Union[str, pd.Timestamp]] = None,
     ) -> RetrievalResult:
         """
         [中层接口] 直接受理时序未编码的 [pred_len, C, H, W] 的气象高维张量。将其编码降维后调度检索。
@@ -1658,6 +1688,7 @@ class SimilarDayRetriever:
             weather_embedding[0],
             query_timestamp=query_timestamp,
             top_k=top_k,
+            history_end_timestamp_exclusive=history_end_timestamp_exclusive,
         )
 
     def search_by_timestamp(
@@ -1665,6 +1696,7 @@ class SimilarDayRetriever:
         query_timestamp: Union[str, pd.Timestamp],
         top_k: int = 3,
         weather_store: Optional[HDF5WeatherSequenceStore] = None,
+        history_end_timestamp_exclusive: Optional[Union[str, pd.Timestamp]] = None,
     ) -> RetrievalResult:
         """
         [高层接口] 用户仅需输入待查询时间的锚点。内部根据日期去气象库抽帧加载，进行相似性检索。
@@ -1688,6 +1720,7 @@ class SimilarDayRetriever:
                 weather_window,
                 query_timestamp=query_timestamp,
                 top_k=top_k,
+                history_end_timestamp_exclusive=history_end_timestamp_exclusive,
             )
         finally:
             # 如果是当前函数开启的句柄，则负责关闭
