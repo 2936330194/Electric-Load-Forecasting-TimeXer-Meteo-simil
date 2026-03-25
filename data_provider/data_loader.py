@@ -474,10 +474,10 @@ class Dataset_Custom(Dataset):
         df_raw = df_raw[["date"] + cols + [self.target]]  # 重新排列
 
         # ==================== 按比例划分数据集 ====================
-        # 训练集 : 验证集 : 测试集 = 6 : 3 : 1
+        # 训练集 : 验证集 : 测试集 = 8 : 2 : 2
         total_len = len(df_raw)
-        num_train = int(total_len * 0.6)
-        num_vali = int(total_len * 0.3)
+        num_train = int(total_len * 2/3)
+        num_vali = int(total_len * 1/6)
         num_test = total_len - num_train - num_vali  # 剩余部分给测试集，保证总长度一致
 
         # 计算各数据集的边界索引
@@ -485,7 +485,7 @@ class Dataset_Custom(Dataset):
         border1s = [0, num_train - self.seq_len, num_train + num_vali - self.seq_len]
         border2s = [num_train, num_train + num_vali, total_len]
         
-        # |<-- 训练集 60% -->|<-- 验证集 30% -->|<-- 测试集 10% -->|
+        # |<-- 训练集 66.67% -->|<-- 验证集 16.67% -->|<-- 测试集 16.67% -->|
 
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
