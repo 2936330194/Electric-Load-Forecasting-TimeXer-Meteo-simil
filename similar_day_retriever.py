@@ -985,7 +985,7 @@ class SimilarDayRetriever:
         self.stats = tuple(stats)
         self.log1p_channels = tuple(int(x) for x in log1p_channels)
         if self.build_stride <= 0:
-            raise ValueError(f"build_stride must be positive, got {self.build_stride}")
+            raise ValueError(f"build_stride 必须为正整数，但实际值为 {self.build_stride}")
 
         # 核心功能组件，只有在 build() 或 load() 后才会被实例化或赋予数据
         self.weather_encoder: Optional[ConvLSTMAEWeatherEncoder] = None
@@ -1035,38 +1035,58 @@ class SimilarDayRetriever:
         return df
 
     def _daily_window_start_offset(self) -> pd.Timedelta:
+        """
+        根据采样频率计算每日检索窗口的起始偏移量。
+        
+        通常电力负荷数据中每日的第一个数据点并不是 00:00，而是偏移一个频率间隔（如 00:15）。
+        该方法确立一个标准偏移量，用于在检索库中统一定位每日查询窗口的锚点。
+        """
         offset = pd.Timedelta(self.freq)
         if offset <= pd.Timedelta(0):
-            raise ValueError(f"freq must resolve to a positive timedelta, got {self.freq}")
+            raise ValueError(f"freq 必须解析为正的时间间隔，但实际值为 {self.freq}")
         if offset >= pd.Timedelta(days=1):
-            raise ValueError(f"freq must be finer than one day for daily retrieval, got {self.freq}")
+            raise ValueError(f"对于按日检索，freq 必须小于一天，但实际值为 {self.freq}")
         return offset
 
     def _format_daily_window_start_time(self) -> str:
+        """将偏移量转换为可读的 HH:MM:SS 格式，主要用于生成更友好的异常错误提示信息。"""
         total_seconds = int(self._daily_window_start_offset().total_seconds())
         hours, rem = divmod(total_seconds, 3600)
         minutes, seconds = divmod(rem, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def _expected_daily_window_start(self, timestamp: pd.Timestamp) -> pd.Timestamp:
+        """根据输入的时间戳，推算其所属日期的标准检索起始时间锚点（日期归一化 + 偏移）。"""
         ts = pd.Timestamp(timestamp)
         return ts.normalize() + self._daily_window_start_offset()
 
     def _is_daily_window_start_timestamp(self, timestamp: pd.Timestamp) -> bool:
+        """校验给定的时间戳是否恰好是该日的窗口起始锚点。"""
         ts = pd.Timestamp(timestamp)
         return ts == self._expected_daily_window_start(ts)
 
     def _normalize_query_timestamp(self, query_timestamp: Union[str, pd.Timestamp]) -> pd.Timestamp:
+        """
+        [辅助接口] 标准化查询时间。
+        
+        该方法允许用户输入该日 00:00:00 作为简易锚点（程序会自动后移一个采样间隔），
+        或者直接输入已对齐的起始时间。如果输入既不对齐也不在零点，则报异常中断。
+        """
         ts = pd.Timestamp(query_timestamp)
         midnight = ts.normalize()
         expected_start = self._expected_daily_window_start(ts)
+        
+        # 宽容性设计：如果输入的是 00:00，则自动平移到每日首个采样点
         if ts == midnight:
             return expected_start
+            
+        # 校验严谨性：如果输入已经是对齐的时间点，则直接返回
         if ts == expected_start:
             return ts
+            
         raise ValueError(
-            "query_timestamp must be aligned to the daily window start "
-            f"({self._format_daily_window_start_time()}) or be 00:00:00 as a day anchor, got {ts}"
+            "query_timestamp 必须对齐到每日窗口的起始时间 "
+            f"({self._format_daily_window_start_time()}) 或为当天的 00:00:00，但实际值为 {ts}"
         )
 
     def _build_train_window_starts(
@@ -1472,8 +1492,8 @@ class SimilarDayRetriever:
         )
         if self.weather_dim != AE_LATENT_DIM:
             raise ValueError(
-                f"weather_dim must match the trained ConvLSTM-AE latent dim {AE_LATENT_DIM}, "
-                f"got {self.weather_dim}"
+                f"气象编码器的weather_dim必须与训练好的ConvLSTM-AE隐空间维度 {AE_LATENT_DIM} 相匹配，"
+                f"但实际值为 {self.weather_dim}"
             )
 
         # 针对神经网络编码器（ConvLSTM-AE），其权重已在训练阶段固化，此处 fit 仅为保持接口一致性。
