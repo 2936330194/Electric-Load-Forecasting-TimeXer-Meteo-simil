@@ -266,6 +266,9 @@ class WeatherGridStore:
         h5_specs: Sequence[Tuple],
         expected_in_channels: int,
         fill_value: float = 0.0,
+        use_channel_normalization: bool = False,
+        log1p_channels: Optional[Sequence[int]] = None,
+        normalization_eps: float = 1e-6,
     ):
         """
         初始化 WeatherGridStore。
@@ -279,8 +282,29 @@ class WeatherGridStore:
         """
         # 运行时延迟检查库依赖
         _require_weather_runtime()
+        # 记录期望输入的特征通道总数，用于后续文件一致性校验
         self.expected_in_channels = int(expected_in_channels)
+        # 初始化 HDF5 规格配置列表（物理路径、起始时间、频率等）
         self.h5_specs = []
+        # 是否启用通道级全局标准化（Z-Score Normalization）
+        self.use_channel_normalization = bool(use_channel_normalization)
+        # 提取并格式化 log1p 通道列表，确保为有序且唯一的整数元组
+        log1p_channels = () if log1p_channels is None else log1p_channels
+        self.log1p_channels = tuple(sorted({int(ch) for ch in log1p_channels}))
+        # 校验 log1p 通道索引是否在合法范围内 [0, expected_in_channels-1]
+        for channel in self.log1p_channels:
+            if channel < 0 or channel >= self.expected_in_channels:
+                raise ValueError(
+                    f"log1p channel index out of range: {channel}, "
+                    f"expected within [0, {self.expected_in_channels - 1}]"
+                )
+        # 设置标准化计算时的数值稳定性极小值 epsilon，强制不低于 1e-12
+        self.normalization_eps = max(float(normalization_eps), 1e-12)
+        # 懒加载初始化：用于存储拟合后的通道均值与标准差
+        self.channel_mean: Optional[np.ndarray] = None
+        self.channel_std: Optional[np.ndarray] = None
+        # 记录参与归一化统计量计算的样本总数
+        self._normalization_sample_count = 0
         
         # 遍历规格配置，补充由于缺省可能丢失的开始时间和时间戳步长
         for spec in h5_specs:
@@ -410,6 +434,280 @@ class WeatherGridStore:
         """实例析构时自我保护清理"""
         self.close()
 
+    def has_fitted_channel_normalization(self) -> bool:
+        """
+        判断当前 WeatherGridStore 是否已经具备可用的通道级标准化统计量。
+        
+        若未启用标准化，则默认视为“已就绪”；若已启用，则需确保均值和标准差均已计算。
+        """
+        if not self.use_channel_normalization:
+            return True
+        return self.channel_mean is not None and self.channel_std is not None
+
+    def _apply_log1p_transform_inplace(self, frames: np.ndarray) -> np.ndarray:
+        """
+        对指定长尾分布的气象通道执行 log1p 变换 (ln(1+x))。
+        
+        该操作通常用于具有长尾分布特征的物理量（如降水量），以减小数值波动范围并使其更接近正态分布。
+        操作是原地（In-place）进行的。
+        
+        参数:
+            frames (np.ndarray): 输入气象帧，形状 [N, C, H, W]。
+            
+        返回:
+            np.ndarray: 变换后的气象帧。
+        """
+        if not self.log1p_channels:
+            return frames
+        for channel in self.log1p_channels:
+            # 限制最小值为 0，防止 log 处理负值带来的数值异常
+            frames[:, channel, :, :] = np.log1p(
+                np.clip(frames[:, channel, :, :], a_min=0.0, a_max=None)
+            )
+        return frames
+
+    def _apply_channel_normalization_inplace(self, frames: np.ndarray) -> np.ndarray:
+        """
+        基于预先拟合的全局统计量对气象帧各通道执行 Z-Score 标准化 (x' = (x - mean) / std)。
+        
+        操作是原地（In-place）进行的。若未拟合统计量则抛出异常。
+        
+        参数:
+            frames (np.ndarray): 输入气象帧，形状 [N, C, H, W]。
+            
+        返回:
+            np.ndarray: 标准化后的气象帧。
+        """
+        if not self.use_channel_normalization:
+            return frames
+        if self.channel_mean is None or self.channel_std is None:
+            raise RuntimeError(
+                "气象通道标准化统计量尚未拟合。请先调用 fit_channel_normalization_from_dates(...)。"
+            )
+        # 利用广播机制对所有空间位置执行线性变换
+        frames -= self.channel_mean.reshape(1, -1, 1, 1)
+        frames /= self.channel_std.reshape(1, -1, 1, 1)
+        return frames
+
+    def preprocess_weather_frames(
+        self,
+        frames: np.ndarray,
+        apply_normalization: bool = True,
+    ) -> np.ndarray:
+        """
+        对气象帧执行完整的预处理流水线：
+        1. 物理量变换：对指定的长尾通道进行 log1p 处理。
+        2. 数值标准化：对各通道执行基于训练集的 Z-Score 全局变换。
+        
+        该方法确保了推理阶段和训练阶段的数据预处理逻辑严格一致。
+        
+        参数:
+            frames (np.ndarray): 原始气象帧阵列。
+            apply_normalization (bool): 是否执行标准化步骤。默认为 True。
+
+        返回:
+            np.ndarray: 预处理后的 float32 格式阵列。
+        """
+        frames = np.asarray(frames, dtype=np.float32)
+        if frames.ndim != 4:
+            raise ValueError(f"气象帧必须为 4D 张量 [N, C, H, W]，但得到形状 {tuple(frames.shape)}")
+        
+        # 1. log1p 变换（若配置）
+        self._apply_log1p_transform_inplace(frames)
+        # 2. Z-Score 标准化（若启用）
+        if apply_normalization:
+            self._apply_channel_normalization_inplace(frames)
+        return frames
+
+    def _accumulate_channel_stats(self, frames: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
+        """
+        对单批次气象帧进行统计量累加计算（用于增量计算均值和方差）。
+        
+        计算各通道在当前批次下的：
+        - 样本总和 (sum(x))
+        - 样本平方和 (sum(x^2))
+        - 总元素个数 (count)
+        
+        参数:
+            frames (np.ndarray): 输入原始气象帧。
+            
+        返回:
+            Tuple: (通道级和 [C], 通道级平方和 [C], 元素总数)
+        """
+        frames = np.asarray(frames, dtype=np.float32)
+        if frames.ndim != 4:
+            raise ValueError(f"气象帧必须为 4D 张量 [N, C, H, W]，但得到形状 {tuple(frames.shape)}")
+        if frames.shape[0] == 0:
+            zeros = np.zeros((self.expected_in_channels,), dtype=np.float64)
+            return zeros, zeros.copy(), 0
+
+        # 在统计之前先应用必要的非线性变换（如 log1p）
+        self._apply_log1p_transform_inplace(frames)
+        
+        # 计算该批次各维度的统计信息
+        channel_sum = frames.sum(axis=(0, 2, 3), dtype=np.float64)
+        frames64 = frames.astype(np.float64, copy=False)
+        channel_sq_sum = np.sum(frames64 * frames64, axis=(0, 2, 3), dtype=np.float64)
+        element_count = int(frames.shape[0] * frames.shape[2] * frames.shape[3])
+        
+        return channel_sum, channel_sq_sum, element_count
+
+    def _finalize_channel_stats(
+        self,
+        channel_sum: np.ndarray,
+        channel_sq_sum: np.ndarray,
+        element_count: int,
+        sample_count: int,
+        stage_name: str,
+        elapsed_sec: float,
+    ) -> None:
+        """
+        根据全局累计的和与平方和，计算最终的均值与标准差。
+        
+        采用数值稳定的方差计算方针：Var = E[X^2] - (E[X])^2。
+        计算结果将直接更新到实例成员变量 `self.channel_mean` 和 `self.channel_std`。
+        """
+        if element_count <= 0:
+            raise RuntimeError("拟合失败：未找到可用的气象元素。")
+
+        # 1. 计算均值
+        mean64 = channel_sum / float(element_count)
+        # 2. 计算方差并确保非负（由于浮点精度问题可能出现微小负数，在此截断）
+        var64 = np.maximum(channel_sq_sum / float(element_count) - mean64 ** 2, self.normalization_eps ** 2)
+        # 3. 计算标准差
+        std64 = np.sqrt(var64)
+
+        # 写入结果并转换为 float32 节省内存空间
+        self.channel_mean = mean64.astype(np.float32)
+        self.channel_std = np.maximum(std64, self.normalization_eps).astype(np.float32)
+        self._normalization_sample_count = int(sample_count)
+
+        print(
+            f"[气象] 通道归一化统计量拟合完成 ({stage_name}): "
+            f"样本数={sample_count}, log1p通道={list(self.log1p_channels)}, "
+            f"耗时={elapsed_sec:.1f}s"
+        )
+
+    def fit_channel_normalization_from_dates(
+        self,
+        dates: Sequence[pd.Timestamp],
+        chunk_size: int = 512,
+        stage_name: str = "train dates",
+    ) -> None:
+        """
+        通过遍历指定的日期序列，分块从磁盘 HDF5 文件动态读取并拟合数据统计量。
+        
+        该方法适用于训练集规模巨大且无法一次性全部载入内存的情况。
+        它会依据日期构建对齐计划，分批（chunk）抽取气象画面并在 CPU/内存中完成统计。
+        
+        参数:
+            dates (Sequence[pd.Timestamp]): 用于拟合统计量的日期清单。
+            chunk_size (int): 每次迭代加载的画面数量（防止 OOM）。
+            stage_name (str): 用于日志打印的阶段标识。
+        """
+        if not self.use_channel_normalization or self.has_fitted_channel_normalization():
+            return
+        if self.frame_shape is None:
+            raise RuntimeError("气象帧形制（frame_shape）未初始化，无法进行拟合。")
+
+        # 1. 构建抽取执行计划
+        alignment = self.build_alignment(dates)
+        valid = np.asarray(alignment["valid"], dtype=bool)
+        valid_count = int(valid.sum())
+        if valid_count <= 0:
+            raise RuntimeError("在提供的日期序列中未找到任何有效的气象覆盖点，无法拟合统计量。")
+
+        # 初始化统计累加器
+        channel_sum = np.zeros((self.expected_in_channels,), dtype=np.float64)
+        channel_sq_sum = np.zeros((self.expected_in_channels,), dtype=np.float64)
+        element_count = 0
+        chunk_size = max(1, int(chunk_size))
+
+        print(
+            f"[气象] 正在分块拟合通道统计量 ({stage_name}): "
+            f"目标点数={len(valid)}, 有效点数={valid_count}, 分块大小={chunk_size}"
+        )
+        t0 = time.time()
+        
+        # 2. 分块读取与统计循环
+        for start in range(0, len(valid), chunk_size):
+            end = min(start + chunk_size, len(valid))
+            # 仅提取原始未预处理画面
+            raw_chunk = self.fetch_raw_frames_from_alignment(alignment, start, end)
+            # 过滤无效填充点
+            if not valid[start:end].all():
+                raw_chunk = raw_chunk[valid[start:end]]
+            if raw_chunk.size == 0:
+                continue
+            
+            # 执行本块统计
+            chunk_sum, chunk_sq_sum, chunk_count = self._accumulate_channel_stats(raw_chunk)
+            channel_sum += chunk_sum
+            channel_sq_sum += chunk_sq_sum
+            element_count += chunk_count
+
+        # 3. 汇总并生成最终变换参数
+        self._finalize_channel_stats(
+            channel_sum=channel_sum,
+            channel_sq_sum=channel_sq_sum,
+            element_count=element_count,
+            sample_count=valid_count,
+            stage_name=stage_name,
+            elapsed_sec=time.time() - t0,
+        )
+
+    def fit_channel_normalization_from_frames(
+        self,
+        raw_frames: np.ndarray,
+        chunk_size: int = 512,
+        stage_name: str = "train cache",
+    ) -> None:
+        """
+        针对已经缓存在内存中的气象特征矩阵，直接执行统计量拟合。
+        
+        常用于气象特征已提前全量预加载完成的情境下快速初始化。
+        
+        参数:
+            raw_frames (np.ndarray): 内存中的气象阵列, 形状 [N, C, H, W]。
+            chunk_size (int): 统计分块大小。
+            stage_name (str): 日志标识。
+        """
+        if not self.use_channel_normalization or self.has_fitted_channel_normalization():
+            return
+
+        raw_frames = np.asarray(raw_frames, dtype=np.float32)
+        if raw_frames.ndim != 4:
+            raise ValueError(f"气象画面阵列应为 4D，但得到 {tuple(raw_frames.shape)}")
+
+        channel_sum = np.zeros((self.expected_in_channels,), dtype=np.float64)
+        channel_sq_sum = np.zeros((self.expected_in_channels,), dtype=np.float64)
+        element_count = 0
+        chunk_size = max(1, int(chunk_size))
+
+        print(
+            f"[气象] 正在从内存缓存拟合统计量 ({stage_name}): "
+            f"画面总数={raw_frames.shape[0]}, 块大小={chunk_size}"
+        )
+        t0 = time.time()
+        
+        for start in range(0, raw_frames.shape[0], chunk_size):
+            end = min(start + chunk_size, raw_frames.shape[0])
+            # 克隆并执行计算，避免对原始缓存数据的影响（这里 _accumulate_channel_stats 会进行 inplace log1p）
+            chunk = np.array(raw_frames[start:end], dtype=np.float32, copy=True)
+            chunk_sum, chunk_sq_sum, chunk_count = self._accumulate_channel_stats(chunk)
+            channel_sum += chunk_sum
+            channel_sq_sum += chunk_sq_sum
+            element_count += chunk_count
+
+        self._finalize_channel_stats(
+            channel_sum=channel_sum,
+            channel_sq_sum=channel_sq_sum,
+            element_count=element_count,
+            sample_count=int(raw_frames.shape[0]),
+            stage_name=stage_name,
+            elapsed_sec=time.time() - t0,
+        )
+
     def build_alignment(self, dates: Sequence[pd.Timestamp]) -> Dict[str, np.ndarray]:
         """
         构建目标时间戳序列与底层 HDF5 文件数据时间轴的映射及插值系数对照表。
@@ -502,7 +800,7 @@ class WeatherGridStore:
             "valid": valid,
         }
 
-    def fetch_frames_from_alignment(
+    def fetch_raw_frames_from_alignment(
         self,
         alignment: Dict[str, np.ndarray],
         start: Optional[int] = None,
@@ -559,6 +857,19 @@ class WeatherGridStore:
             frames[src_mask] = (1.0 - alpha_view) * left_frames + alpha_view * right_frames
 
         return frames
+
+    def fetch_frames_from_alignment(
+        self,
+        alignment: Dict[str, np.ndarray],
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        在完成时间对齐/插值读取后，进一步施加主预测链路统一的气象预处理。
+        返回值结构保持为 [N, C, H, W]。
+        """
+        frames = self.fetch_raw_frames_from_alignment(alignment, start=start, end=end)
+        return self.preprocess_weather_frames(frames, apply_normalization=True)
 
     def fetch_frames_by_dates(self, dates: Sequence[pd.Timestamp]) -> np.ndarray:
         """
@@ -887,6 +1198,10 @@ class LoadWeatherEndToEndDataset(Dataset):
         # 气象对齐调度与内存缓存地带
         self.weather_alignment: Optional[Dict[str, np.ndarray]] = None
         self.weather_cache: Optional[np.ndarray] = None
+        self.use_weather_normalization = bool(
+            getattr(args, "use_weather_normalization", self.weather_store.use_channel_normalization)
+        ) or self.weather_store.use_channel_normalization
+        self.weather_norm_fit_chunk_size = int(getattr(args, "weather_norm_fit_chunk_size", 512))
         
         # 相似日检索引擎配置入口
         self.use_similar_day_prior = bool(getattr(args, "use_similar_day_prior", False))
@@ -931,8 +1246,9 @@ class LoadWeatherEndToEndDataset(Dataset):
 
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
+        train_dates = pd.DatetimeIndex(df_raw["date"].iloc[: border2s[0]].to_numpy())
 
-        # 目前只对负荷目标列做缩放；气象数据保持其原始物理量尺度。
+        # 负荷目标列始终在训练段上拟合 scaler；气象数据是否做预处理由 WeatherGridStore 配置决定。
         target_values = df_raw[[self.target]].values.astype(np.float32)
         if self.scale:
             self.scaler = StandardScaler()
@@ -966,10 +1282,42 @@ class LoadWeatherEndToEndDataset(Dataset):
 
         print(f"[数据集-{self.set_type}] 正在预加载气象帧...")
         t0 = time.time()
-        # 将规划字典发送给执行管家发起海量帧读操作。内存会被完全填满对应的浮点面。
-        self.weather_cache = self.weather_store.fetch_frames_from_alignment(
-            self.weather_alignment, 0, len(self.data_x)
-        )
+        # 将规划字典发送给执行管家发起海量帧读操作。若启用气象归一化，则先用训练段统计量拟合后再标准化。
+        # 核心逻辑：若启用归一化且尚未拟合统计量，则触发拟合流程。确保验证集/测试集使用训练集的尺度。
+        if self.use_weather_normalization and not self.weather_store.has_fitted_channel_normalization():
+            # A. 若当前正在处理训练集 (set_type=0)，则直接利用内存中的原始数据进行拟合
+            if self.set_type == 0:
+                # 拉取原始气象帧到内存，用于高效计算均值和标准差
+                raw_weather_cache = self.weather_store.fetch_raw_frames_from_alignment(
+                    self.weather_alignment, 0, len(self.data_x)
+                )
+                # 执行拟合：计算通道级的 log1p 指数、均值和方差
+                self.weather_store.fit_channel_normalization_from_frames(
+                    raw_weather_cache,
+                    chunk_size=self.weather_norm_fit_chunk_size,
+                    stage_name="train split cache",
+                )
+                # 拟合完成后，对这批内存数据执行预处理（含标准化）并转为缓存
+                self.weather_cache = self.weather_store.preprocess_weather_frames(
+                    raw_weather_cache,
+                    apply_normalization=True,
+                )
+            # B. 若当前是验证集/测试集，需回溯到训练集日期序列进行拟合，保证分布一致性
+            else:
+                self.weather_store.fit_channel_normalization_from_dates(
+                    train_dates,
+                    chunk_size=self.weather_norm_fit_chunk_size,
+                    stage_name="train split dates",
+                )
+                # 拟合完成后，直接拉取并预处理本 split 特有的气象帧
+                self.weather_cache = self.weather_store.fetch_frames_from_alignment(
+                    self.weather_alignment, 0, len(self.data_x)
+                )
+        # C. 若无需拟合（已就绪或未启用），则常规拉取标准化预处理后的气象特征
+        else:
+            self.weather_cache = self.weather_store.fetch_frames_from_alignment(
+                self.weather_alignment, 0, len(self.data_x)
+            )
         mem_gb = self.weather_cache.nbytes / (1024 ** 3)
         print(
             f"[数据集-{self.set_type}] 气象缓存已就绪: shape={self.weather_cache.shape}, "
