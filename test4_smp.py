@@ -19,7 +19,7 @@ import json
 import os
 import random
 import time
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -201,7 +201,7 @@ def export_similar_day_baseline(
     future_path: str,
     artifact_dir: str = SIMILAR_DAY_ARTIFACT_DIR,
     top_k: int = SIMILAR_DAY_TOP_K,
-) -> None:
+) -> Optional[Any]:
     """
     基于离线构建好的相似日检索库，为未来预测起点检索 Top-K 历史负荷曲线，
     并导出曲线图、宽表 CSV 与检索元信息 JSON，作为系统的保底输出。
@@ -215,14 +215,14 @@ def export_similar_day_baseline(
     abs_future_path = os.path.abspath(future_path)
     if not os.path.exists(abs_future_path):
         print(f"未找到未来数据文件，跳过相似日检索: {abs_future_path}")
-        return
+        return None
 
     # 2. 动态导入相似日检索模块，增加独立运行的鲁棒性
     try:
         from similar_day_retriever import DEFAULT_ARTIFACT_DIR, SimilarDayRetriever, print_retrieval_result
     except Exception as exc:
         print(f"导入 similar_day_retriever 失败，跳过检索: {exc}")
-        return
+        return None
 
     # 3. 确定并校验离线特征库目录（结合参数传入与模块默认值）
     resolved_artifact_dir = os.path.abspath(
@@ -230,7 +230,7 @@ def export_similar_day_baseline(
     )
     if not os.path.isdir(resolved_artifact_dir):
         print(f"未找到相似日模型库目录，跳过检索: {resolved_artifact_dir}")
-        return
+        return None
 
     # 4. 尝试加载检索模型并执行基于预测起点文件的 Top-K 检索
     try:
@@ -238,7 +238,7 @@ def export_similar_day_baseline(
         result = retriever.search_from_future_csv(abs_future_path, top_k=int(top_k))
     except Exception as exc:
         print(f"执行相似日检索失败: {exc}")
-        return
+        return None
 
     # 5. 在终端展示检索结果并进行文件记录与绘图生成
     print_retrieval_result(result)
@@ -252,6 +252,7 @@ def export_similar_day_baseline(
         y_label="电负荷 (MW)",                           # Y 轴展示标签
         freq="15min",                                    # 时序默认的步长解析规则
     )
+    return result
 
 
 def validate_quantile(model, data_loader, criterion, args, device, use_amp: bool = False) -> float:
@@ -651,7 +652,7 @@ def main() -> None:
             title_prefix="Full-Map Conv + TimeXer Prediction",
             y_label="Load (MW)",
         )
-        export_similar_day_baseline(
+        similar_day_result = export_similar_day_baseline(
             results_dir=results_dir,
             future_path=FUTURE_PATH,
             artifact_dir=SIMILAR_DAY_ARTIFACT_DIR,
@@ -671,6 +672,7 @@ def main() -> None:
             data_provider_fn=weather_data_provider,
             model_label="Full-Map Conv + TimeXer",
             y_label="Load (MW)",
+            similar_day_result=similar_day_result,
         )
     finally:
         # 确保 HDF5 文件句柄被正确关闭

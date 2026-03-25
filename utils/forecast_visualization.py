@@ -276,6 +276,7 @@ def predict_future_load_from_csv(
     data_provider_fn: Optional[Callable[..., Any]] = None,
     model_label: str = "Forecast",
     y_label: str = "Load (MW)",
+    similar_day_result: Optional[Any] = None,
 ) -> None:
     """
     加载历史数据及给定的未来气象文件，执行端到端的未来多步（含扩展气象视窗）负荷预测。
@@ -294,6 +295,7 @@ def predict_future_load_from_csv(
         data_provider_fn: 返回 (dataset, dataloader) 的天气初始化回调，借此获取 Scaler
         model_label: 画图标签配置里的模型名称 (仅用来格式化图标)
         y_label: Y 轴文字名称
+        similar_day_result: 可选的相似日检索结果；若提供，则叠加其 Top-K 负荷曲线到未来预测图
     """
     if quantiles is None:
         raise ValueError("quantiles must be provided.")
@@ -458,6 +460,33 @@ def predict_future_load_from_csv(
             color="tab:orange",
             label="P10-P90 Confidence Interval",
         )
+    if similar_day_result is not None:
+        similar_curves = np.asarray(getattr(similar_day_result, "load_curves", []), dtype=np.float32)
+        similar_times = list(getattr(similar_day_result, "historical_timestamps", []))
+        similar_scores = list(getattr(similar_day_result, "similarity_scores", []))
+        if similar_curves.ndim == 1:
+            similar_curves = similar_curves.reshape(1, -1)
+        if similar_curves.ndim == 2 and similar_curves.size > 0:
+            similar_colors = ["tab:red", "tab:green", "tab:purple", "tab:brown", "tab:pink"]
+            for idx, curve in enumerate(similar_curves):
+                curve_steps = min(len(curve), predict_steps)
+                source_time = (
+                    similar_times[idx]
+                    if idx < len(similar_times)
+                    else f"Historical Match #{idx + 1}"
+                )
+                score_text = ""
+                if idx < len(similar_scores):
+                    score_text = f" | sim={float(similar_scores[idx]):.4f}"
+                plt.plot(
+                    range(n_history, n_history + curve_steps),
+                    curve[:curve_steps],
+                    label=f"Similar Day Top {idx + 1} | {source_time}{score_text}",
+                    color=similar_colors[idx % len(similar_colors)],
+                    linewidth=1.8,
+                    linestyle="--",
+                    alpha=0.9,
+                )
     plt.axvline(x=n_history - 0.5, color="gray", linestyle="--", alpha=0.6, label="Prediction Start")
     plt.legend(loc="upper left")
     plt.grid(True, linestyle="--", alpha=0.5)
