@@ -25,7 +25,11 @@ import numpy as np
 import torch
 from torch import optim
 
-from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
+from utils.forecast_visualization import (
+    plot_pred_vs_true,
+    plot_similar_day_curves,
+    predict_future_load_from_csv,
+)
 from utils.metrics import metric
 from utils.quantile import QuantileLoss
 from utils.tools import EarlyStopping, adjust_learning_rate
@@ -50,6 +54,8 @@ DATA_PATH = "湖南省电力负荷_unknow.csv"
 FUTURE_PATH = "./data/湖南省电力负荷_unknow_future.csv"
 TARGET = "load"         # 目标列名
 FEATURES = "MS"         # 任务类型：MS 表示多变量输入单变量输出
+SIMILAR_DAY_ARTIFACT_DIR = "./artifacts/similar_day_retriever_ae_128"
+SIMILAR_DAY_TOP_K = 3
 
 # 时间窗口配置
 SEQ_LEN = 96 * 7        # 历史观测窗口长度（672步，对应7天）
@@ -188,6 +194,64 @@ def _apply_use_artifacts(args: argparse.Namespace) -> argparse.Namespace:
     args.n_quantiles = len(args.quantiles)
     print(f"已从 /use 导入参数与权重: {weight_path}")
     return args
+
+
+def export_similar_day_baseline(
+    results_dir: str,
+    future_path: str,
+    artifact_dir: str = SIMILAR_DAY_ARTIFACT_DIR,
+    top_k: int = SIMILAR_DAY_TOP_K,
+) -> None:
+    """
+    基于离线构建好的相似日检索库，为未来预测起点检索 Top-K 历史负荷曲线，
+    并导出曲线图、宽表 CSV 与检索元信息 JSON，作为系统的保底输出。
+    """
+    # 打印分隔符和执行提示
+    print("\n" + "=" * 60)
+    print(f"相似日检索基线：读取自 {future_path}")
+    print("=" * 60)
+
+    # 1. 解析目标文件的绝对路径并检查是否存在
+    abs_future_path = os.path.abspath(future_path)
+    if not os.path.exists(abs_future_path):
+        print(f"未找到未来数据文件，跳过相似日检索: {abs_future_path}")
+        return
+
+    # 2. 动态导入相似日检索模块，增加独立运行的鲁棒性
+    try:
+        from similar_day_retriever import DEFAULT_ARTIFACT_DIR, SimilarDayRetriever, print_retrieval_result
+    except Exception as exc:
+        print(f"导入 similar_day_retriever 失败，跳过检索: {exc}")
+        return
+
+    # 3. 确定并校验离线特征库目录（结合参数传入与模块默认值）
+    resolved_artifact_dir = os.path.abspath(
+        str(artifact_dir) if artifact_dir is not None else str(DEFAULT_ARTIFACT_DIR)
+    )
+    if not os.path.isdir(resolved_artifact_dir):
+        print(f"未找到相似日模型库目录，跳过检索: {resolved_artifact_dir}")
+        return
+
+    # 4. 尝试加载检索模型并执行基于预测起点文件的 Top-K 检索
+    try:
+        retriever = SimilarDayRetriever.load(resolved_artifact_dir)
+        result = retriever.search_from_future_csv(abs_future_path, top_k=int(top_k))
+    except Exception as exc:
+        print(f"执行相似日检索失败: {exc}")
+        return
+
+    # 5. 在终端展示检索结果并进行文件记录与绘图生成
+    print_retrieval_result(result)
+    plot_similar_day_curves(
+        results_dir=results_dir,                         # 输出目录
+        retrieval_result=result,                         # 检索返回的结果数据对象
+        out_name="similar_day_retrieval.png",             # 导出的可视化图像文件名
+        csv_name="similar_day_retrieval.csv",             # 导出的负荷数值表格
+        json_name="similar_day_retrieval.json",           # 导出的查询元配置数据
+        title_prefix="相似日负荷检索基线",               # 保存图表的标题文案
+        y_label="电负荷 (MW)",                           # Y 轴展示标签
+        freq="15min",                                    # 时序默认的步长解析规则
+    )
 
 
 def validate_quantile(model, data_loader, criterion, args, device, use_amp: bool = False) -> float:
@@ -586,6 +650,12 @@ def main() -> None:
             quantiles=args.quantiles,
             title_prefix="Full-Map Conv + TimeXer Prediction",
             y_label="Load (MW)",
+        )
+        export_similar_day_baseline(
+            results_dir=results_dir,
+            future_path=FUTURE_PATH,
+            artifact_dir=SIMILAR_DAY_ARTIFACT_DIR,
+            top_k=SIMILAR_DAY_TOP_K,
         )
         # 运行基于真实气象预报的未来预测（CSV 导出）
         predict_future_load_from_csv(

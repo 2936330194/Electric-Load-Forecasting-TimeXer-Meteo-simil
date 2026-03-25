@@ -5,6 +5,7 @@ forecast_visualization.py - 预测结果可视化与未来预测工具模块
 并使用已训练模型进行未来连续多步负荷预测的完整流程。支持分位数预测结果的展示与置信区间绘制。
 """
 
+import json
 import os
 from typing import Any, Callable, Optional, Sequence
 
@@ -440,8 +441,155 @@ def predict_future_load_from_csv(
     print(f"Saved future prediction figure: {out_fig}")
 
 
+def plot_similar_day_curves(
+    results_dir: str,
+    retrieval_result: Any,
+    out_name: str = "similar_day_retrieval.png",
+    csv_name: str = "similar_day_retrieval.csv",
+    json_name: str = "similar_day_retrieval.json",
+    title_prefix: str = "相似日负荷检索",
+    y_label: str = "电负荷 (MW)",
+    freq: str = "15min",
+) -> None:
+    """
+    将相似日检索返回的多条历史负荷曲线绘制在一张图中，并同步导出 CSV/JSON。
+
+    参数:
+        results_dir: 图表与导出文件保存目录
+        retrieval_result: `SimilarDayRetriever` 返回的 RetrievalResult 对象或兼容对象
+        out_name: 相似日曲线图文件名
+        csv_name: 宽表格式曲线 CSV 文件名
+        json_name: 检索元信息 JSON 文件名
+        title_prefix: 图标题前缀
+        y_label: Y 轴标签
+        freq: 预测时间分辨率，默认 15 分钟
+    """
+    # 尝试切换 matplotlib 后端，防止在无显示设备的服务器上报错
+    try:
+        plt.switch_backend("TkAgg")
+    except Exception:
+        pass
+
+    # 提取负荷曲线数据并转换为 numpy 数组
+    load_curves = np.asarray(getattr(retrieval_result, "load_curves", []), dtype=np.float32)
+    if load_curves.size == 0:
+        print("未找到相似日检索曲线，跳过绘图。")
+        return
+        
+    # 如果只有一条曲线，将其调整为二维数组
+    if load_curves.ndim == 1:
+        load_curves = load_curves.reshape(1, -1)
+    if load_curves.ndim != 2:
+        raise ValueError(f"相似日 load_curves 必须是二维数组，实际形状为 {load_curves.shape}")
+
+    # 获取检索结果的元数据（查询时间、历史相似时间、相似度得分）
+    query_timestamp = str(getattr(retrieval_result, "query_timestamp", ""))
+    historical_timestamps = list(getattr(retrieval_result, "historical_timestamps", []))
+    similarity_scores = list(getattr(retrieval_result, "similarity_scores", []))
+    n_curves, n_steps = load_curves.shape
+
+    # 生成预测步数和时间轴
+    step_axis = np.arange(n_steps, dtype=np.int32)
+    forecast_time = None
+    x_axis = step_axis
+    x_label = f"预测步数 ({freq})"
+    
+    # 如果查询时间非空，则根据频率生成对应的时间序列作为 X 轴
+    try:
+        if query_timestamp:
+            forecast_time = pd.date_range(start=pd.Timestamp(query_timestamp), periods=n_steps, freq=freq)
+            x_axis = forecast_time
+            x_label = "预测时间"
+    except Exception:
+        forecast_time = None
+
+    # 创建输出目录并生成文件路径
+    os.makedirs(results_dir, exist_ok=True)
+    out_csv = os.path.join(results_dir, csv_name)
+    out_json = os.path.join(results_dir, json_name)
+    out_fig = os.path.join(results_dir, out_name)
+
+    # 构造待导出为 CSV 的数据字典
+    csv_payload = {"step": step_axis}
+    if forecast_time is not None:
+        csv_payload["forecast_time"] = forecast_time
+    for idx in range(n_curves):
+        csv_payload[f"top_{idx + 1}_load"] = load_curves[idx]
+        
+    # 保存宽表数据到带有 UTF-8 BOM 签名的 CSV 文件中（防止在 Excel 中出现中文乱码）
+    pd.DataFrame(csv_payload).to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    # 处理并保存检索元信息到 JSON 文件
+    if hasattr(retrieval_result, "to_dict"):
+        metadata = retrieval_result.to_dict()
+    else:
+        metadata = {
+            "query_timestamp": query_timestamp,
+            "historical_timestamps": historical_timestamps,
+            "similarity_scores": similarity_scores,
+            "load_curves": load_curves.tolist(),
+        }
+    metadata["curve_columns"] = [f"top_{idx + 1}_load" for idx in range(n_curves)]
+    metadata["freq"] = freq
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    # 初始化图表
+    fig, ax = plt.subplots(1, 1, figsize=(15, 6), facecolor="white")
+    # 定义绘图颜色循环，便于区分不同排名的相似日
+    color_cycle = ["tab:red", "tab:orange", "tab:green", "tab:purple", "tab:brown"]
+    
+    # 逐条绘制相似日负荷曲线
+    for idx in range(n_curves):
+        curve = load_curves[idx]
+        source_time = (
+            historical_timestamps[idx]
+            if idx < len(historical_timestamps)
+            else f"历史匹配 #{idx + 1}"
+        )
+        score_text = ""
+        if idx < len(similarity_scores):
+            score_text = f" | 相似度={float(similarity_scores[idx]):.4f}"
+            
+        # 绘制折线并配置图例
+        ax.plot(
+            x_axis,
+            curve,
+            linewidth=2,
+            color=color_cycle[idx % len(color_cycle)],
+            label=f"排名 {idx + 1} | {source_time}{score_text}",
+        )
+
+    # 设置图表标题和坐标轴标签
+    title = title_prefix
+    if query_timestamp:
+        title = f"{title_prefix}\n查询起点: {query_timestamp}"
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    # 添加网格线辅助读取
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(loc="upper left")
+    
+    # 如果 X 轴是时间对象，则格式化倾斜显示刻度标签以防重叠
+    if forecast_time is not None:
+        fig.autofmt_xdate()
+        
+    # 调整布局、保存并展示图表
+    plt.tight_layout()
+    plt.savefig(out_fig, dpi=600, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+    # 在控制台输出文件保存路径的提示信息
+    print(f"已保存相似日检索数据 (CSV): {out_csv}")
+    print(f"已保存相似日检索元信息 (JSON): {out_json}")
+    print(f"已保存相似日检索图表 (Figure): {out_fig}")
+
+
 __all__ = [
     "plot_pred_vs_true",
+    "plot_similar_day_curves",
     "predict_future_load_from_csv",
     "restore_sliding_window_2d",
     "restore_sliding_window_3d",

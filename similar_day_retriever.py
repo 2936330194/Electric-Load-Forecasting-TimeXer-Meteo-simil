@@ -931,6 +931,26 @@ class ConvLSTMAEWeatherEncoder:
         return None
 
 
+class _EncoderCompatUnpickler(pickle.Unpickler):
+    """兼容历史上以 `__main__` 路径序列化的天气编码器 pickle。"""
+
+    _LEGACY_CLASS_MAP = {
+        ("__main__", "ConvLSTMAEWeatherEncoder"): ConvLSTMAEWeatherEncoder,
+        ("__mp_main__", "ConvLSTMAEWeatherEncoder"): ConvLSTMAEWeatherEncoder,
+    }
+
+    def find_class(self, module: str, name: str):
+        mapped = self._LEGACY_CLASS_MAP.get((module, name))
+        if mapped is not None:
+            return mapped
+        return super().find_class(module, name)
+
+
+def _load_encoder_pickle(file_obj):
+    """加载 weather_encoder.pkl，并兼容旧版脚本入口写出的 pickle 路径。"""
+    return _EncoderCompatUnpickler(file_obj).load()
+
+
 class SimilarDayRetriever:
     """
     相似日检索系统主类。
@@ -1794,7 +1814,7 @@ class SimilarDayRetriever:
 
         # 3. 还原序列化的编码器
         with open(encoder_path, "rb") as f:
-            retriever.weather_encoder = pickle.load(f)
+            retriever.weather_encoder = _load_encoder_pickle(f)
 
         # 4. 读取底库大数组
         arrays = np.load(arrays_path)
