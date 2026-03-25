@@ -1034,22 +1034,39 @@ class SimilarDayRetriever:
         df["load"] = df["load"].astype(np.float32)
         return df
 
-    @staticmethod
-    def _is_midnight_timestamp(timestamp: pd.Timestamp) -> bool:
-        """
-        静态辅助方法：判断给定的时间戳是否恰好为当天的午夜零点 (00:00:00)。
-        这对于确保检索检索到的历史片段按整日对齐至关重要。
+    def _daily_window_start_offset(self) -> pd.Timedelta:
+        offset = pd.Timedelta(self.freq)
+        if offset <= pd.Timedelta(0):
+            raise ValueError(f"freq must resolve to a positive timedelta, got {self.freq}")
+        if offset >= pd.Timedelta(days=1):
+            raise ValueError(f"freq must be finer than one day for daily retrieval, got {self.freq}")
+        return offset
 
-        Args:
-            timestamp: 需要检查的时间戳对象。
-        """
+    def _format_daily_window_start_time(self) -> str:
+        total_seconds = int(self._daily_window_start_offset().total_seconds())
+        hours, rem = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _expected_daily_window_start(self, timestamp: pd.Timestamp) -> pd.Timestamp:
         ts = pd.Timestamp(timestamp)
-        return (
-            ts.hour == 0
-            and ts.minute == 0
-            and ts.second == 0
-            and ts.microsecond == 0
-            and ts.nanosecond == 0
+        return ts.normalize() + self._daily_window_start_offset()
+
+    def _is_daily_window_start_timestamp(self, timestamp: pd.Timestamp) -> bool:
+        ts = pd.Timestamp(timestamp)
+        return ts == self._expected_daily_window_start(ts)
+
+    def _normalize_query_timestamp(self, query_timestamp: Union[str, pd.Timestamp]) -> pd.Timestamp:
+        ts = pd.Timestamp(query_timestamp)
+        midnight = ts.normalize()
+        expected_start = self._expected_daily_window_start(ts)
+        if ts == midnight:
+            return expected_start
+        if ts == expected_start:
+            return ts
+        raise ValueError(
+            "query_timestamp must be aligned to the daily window start "
+            f"({self._format_daily_window_start_time()}) or be 00:00:00 as a day anchor, got {ts}"
         )
 
     def _build_train_window_starts(
@@ -1084,19 +1101,21 @@ class SimilarDayRetriever:
         dates = pd.DatetimeIndex(pd.to_datetime(load_dates))
         
         # 第一步：在可用序列中定位第一个零点位置
-        first_midnight_index = None
+        first_window_start_index = None
         for idx in range(max_start + 1):
-            if self._is_midnight_timestamp(dates[idx]):
-                first_midnight_index = idx
+            if self._is_daily_window_start_timestamp(dates[idx]):
+                first_window_start_index = idx
                 break
         
-        if first_midnight_index is None:
-            raise ValueError("训练数据中找不到从 00:00:00 开始的完整日窗口。")
+        if first_window_start_index is None:
+            raise ValueError(
+                f"训练数据中找不到从 {self._format_daily_window_start_time()} 开始的完整日窗口。"
+            )
 
         # 第二步：从第一个零点开始，按照指定的步长 (Stride) 生成索引建议。
         # Stride 通常等于 pred_len (96)，即按天滑动；也可以设为更小的值以增加样本重叠度。
         start_indices = np.arange(
-            first_midnight_index,
+            first_window_start_index,
             max_start + 1,
             self.build_stride,
             dtype=np.int64,
@@ -1106,13 +1125,15 @@ class SimilarDayRetriever:
 
         # 第三步：双重校验，确保筛选后的每一个起始索引对应的时间戳依然是零点
         valid_mask = np.array(
-            [self._is_midnight_timestamp(dates[int(idx)]) for idx in start_indices],
+            [self._is_daily_window_start_timestamp(dates[int(idx)]) for idx in start_indices],
             dtype=bool,
         )
         start_indices = start_indices[valid_mask]
         
         if start_indices.size == 0:
-            raise ValueError("当前 build_stride 无法保持窗口起点对齐到 00:00:00。")
+            raise ValueError(
+                f"当前 build_stride 无法保持窗口起点对齐到 {self._format_daily_window_start_time()}。"
+            )
 
         # 第四步：如果设置了最大窗口数限制，则执行截断
         if max_train_windows is not None:
@@ -1323,7 +1344,7 @@ class SimilarDayRetriever:
         if len(timestamps) == 0:
             return np.empty((0, 5), dtype=np.float32)
 
-        # Retrieval windows are aligned to 00:00:00, so minute/hour features are
+        # Retrieval windows are aligned to the first sample after midnight, so minute/hour features are
         # constant across the index and dilute the useful weekly and seasonal cues.
         time_vectors = np.column_stack(
             [
@@ -1532,9 +1553,7 @@ class SimilarDayRetriever:
         """
         # 确保系统已完成构建或加载
         self._ensure_built()
-        query_timestamp = pd.Timestamp(query_timestamp)
-        if not self._is_midnight_timestamp(query_timestamp):
-            raise ValueError(f"query_timestamp must start at 00:00:00 for daily retrieval, got {query_timestamp}")
+        query_timestamp = self._normalize_query_timestamp(query_timestamp)
         
         # 统一输入格式为 [1, Dim]
         weather_embedding = np.asarray(weather_embedding, dtype=np.float32).reshape(1, -1)
@@ -1846,15 +1865,14 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
     if train_rows >= len(load_df):
         train_rows = len(load_df) - 1
     fallback_dates = pd.DatetimeIndex(load_df["date"].iloc[train_rows:])
-    midnight_mask = (
-        (fallback_dates.hour == 0)
-        & (fallback_dates.minute == 0)
-        & (fallback_dates.second == 0)
-        & (fallback_dates.microsecond == 0)
-        & (fallback_dates.nanosecond == 0)
-    )
-    if np.any(midnight_mask):
-        return pd.Timestamp(fallback_dates[midnight_mask][0])
+    if len(load_df) >= 2:
+        step = pd.Timestamp(load_df["date"].iloc[1]) - pd.Timestamp(load_df["date"].iloc[0])
+    else:
+        step = pd.Timedelta("15min")
+    expected_start = fallback_dates.normalize() + step
+    window_start_mask = fallback_dates == expected_start
+    if np.any(window_start_mask):
+        return pd.Timestamp(fallback_dates[window_start_mask][0])
     return pd.Timestamp(load_df["date"].iloc[train_rows])
 
 
