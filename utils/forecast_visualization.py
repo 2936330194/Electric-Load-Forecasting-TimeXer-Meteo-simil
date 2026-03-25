@@ -10,12 +10,45 @@ import os
 from typing import Any, Callable, Optional, Sequence
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 import pandas as pd
 import torch
 
 from utils.metrics import cal_eval
 from utils.timefeatures import time_features
+
+
+def _configure_matplotlib_cjk_font() -> None:
+    """
+    为 Matplotlib 配置可用的中文字体回退，避免 Windows 下默认 DejaVu Sans 缺字。
+    """
+    preferred_fonts = [
+        "Microsoft YaHei",
+        "SimHei",
+        "SimSun",
+        "Arial Unicode MS",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "WenQuanYi Zen Hei",
+    ]
+    installed = {font.name for font in font_manager.fontManager.ttflist}
+    available = [name for name in preferred_fonts if name in installed]
+    if not available:
+        return
+
+    current = list(plt.rcParams.get("font.sans-serif", []))
+    merged = []
+    for name in available + current:
+        if name not in merged:
+            merged.append(name)
+
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = merged
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+_configure_matplotlib_cjk_font()
 
 
 def _find_quantile_index(quantiles: Sequence[float], value: float) -> Optional[int]:
