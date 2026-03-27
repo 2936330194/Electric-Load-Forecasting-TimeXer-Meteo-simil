@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from torch import optim
 
-import test4_smp as base
+import test4_smp_old as base
 from utils.quantile import QuantileLoss
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.weather_e2e import FullMapConvTimeXerQuantile, WeatherGridStore, weather_data_provider
