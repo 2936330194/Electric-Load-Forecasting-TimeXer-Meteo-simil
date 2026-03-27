@@ -1086,10 +1086,10 @@ class SimilarDayRetriever:
         train_ratio: float = 2.0 / 3.0,
         freq: str = "15min",
         weather_window_size: Optional[int] = None,
-        weather_align_mode: str = "floor",
+        weather_align_mode: str = "auto",
         weather_step_desc: Optional[str] = None,
         weather_dataset_tag: Optional[str] = None,
-        build_stride: Optional[int] = None,
+        build_stride: Optional[int] = 1,
         build_batch_size: int = 384,
         ae_checkpoint_path: Union[str, Path] = DEFAULT_AE_CHECKPOINT,
         ae_norm_stats_path: Union[str, Path] = DEFAULT_AE_NORM_STATS,
@@ -1107,9 +1107,10 @@ class SimilarDayRetriever:
             train_ratio: 按时间顺序划分的前部分序列作为建库集（由于检索的是历史发生过的片段）。
             freq: 采样频率字符串，用于辅助时间戳时间特征的提取。
             weather_window_size: 单个天气窗口的步数，由天气 H5 原生频率决定；默认与 pred_len 相同以兼容旧逻辑。
-            weather_align_mode: 负荷起始时间戳映射到天气时间轴时的对齐方式，支持 exact / floor。
+            weather_align_mode: 负荷起始时间戳映射到天气时间轴时的对齐方式，支持 auto / exact / floor。
             weather_step_desc: 天气数据步长描述，如 1h / 15min。
             weather_dataset_tag: 当前检索库绑定的天气数据集标签，默认取 H5 文件名 stem。
+            build_stride: 负荷窗口起点滑动步长，按负荷采样点计；15min 数据中 1 代表每 15 分钟建一条。
             build_batch_size: 避免OOM的内部处理块大小。
             stats: 提取使用的统计特征集合。
             log1p_channels: 偏态需要对数缩放的指标维。
@@ -1125,7 +1126,7 @@ class SimilarDayRetriever:
         self.weather_align_mode = str(weather_align_mode)
         self.weather_step_desc = None if weather_step_desc is None else str(weather_step_desc)
         self.weather_dataset_tag = None if weather_dataset_tag is None else str(weather_dataset_tag)
-        self.build_stride = self.pred_len if build_stride is None else int(build_stride)
+        self.build_stride = 1 if build_stride is None else int(build_stride)
         self.build_batch_size = int(build_batch_size)
         self.ae_checkpoint_path = str(Path(ae_checkpoint_path).resolve())
         self.ae_norm_stats_path = str(Path(ae_norm_stats_path).resolve())
@@ -1134,9 +1135,9 @@ class SimilarDayRetriever:
         self.log1p_channels = tuple(int(x) for x in log1p_channels)
         if self.weather_window_size <= 0:
             raise ValueError(f"weather_window_size 必须为正整数，但实际值为 {self.weather_window_size}")
-        if self.weather_align_mode not in {"exact", "floor"}:
+        if self.weather_align_mode not in {"auto", "exact", "floor"}:
             raise ValueError(
-                f"weather_align_mode 仅支持 exact 或 floor，但实际值为 {self.weather_align_mode}"
+                f"weather_align_mode 仅支持 auto / exact / floor，但实际值为 {self.weather_align_mode}"
             )
         if self.build_stride <= 0:
             raise ValueError(f"build_stride 必须为正整数，但实际值为 {self.build_stride}")
@@ -1156,12 +1157,99 @@ class SimilarDayRetriever:
         self.train_frame_count: Optional[int] = None
         self.train_window_count: Optional[int] = None
         self.fused_dim: Optional[int] = None
+        self.start_time_keys: Optional[np.ndarray] = None
 
     def _effective_weather_window_size(self) -> int:
         """优先使用已加载编码器上的窗口长度，以确保推理与建库配置一致。"""
         if self.weather_encoder is not None:
             return int(getattr(self.weather_encoder, "window_size", self.weather_window_size))
         return int(self.weather_window_size)
+
+    def _load_sampling_offset(self) -> pd.Timedelta:
+        """解析并校验负荷采样频率。"""
+        offset = pd.Timedelta(self.freq)
+        if offset <= pd.Timedelta(0):
+            raise ValueError(f"freq 必须解析为正的时间间隔，但实际值为 {self.freq}")
+        if offset >= pd.Timedelta(days=1):
+            raise ValueError(f"负荷采样频率必须小于一天，但实际值为 {self.freq}")
+        return offset
+
+    def _format_load_sampling_step(self) -> str:
+        """将负荷采样频率格式化为更易读的描述。"""
+        return _step_desc_from_timedelta(self._load_sampling_offset())
+
+    def _resolve_weather_align_mode(self, weather_freq: Optional[pd.Timedelta] = None) -> str:
+        """
+        自动解析负荷起点映射到天气时间轴时应采用的对齐方式。
+        当天气频率与负荷频率一致时，自动启用 exact；否则退回 floor。
+        """
+        if self.weather_align_mode in {"exact", "floor"}:
+            return self.weather_align_mode
+
+        load_freq = self._load_sampling_offset()
+        if weather_freq is not None:
+            return "exact" if weather_freq == load_freq else "floor"
+        if self.weather_step_desc is not None:
+            return "exact" if self.weather_step_desc == self._format_load_sampling_step() else "floor"
+        return "floor"
+
+    def _is_load_aligned_timestamp(self, timestamp: pd.Timestamp) -> bool:
+        """检查时间戳是否严格落在负荷采样网格上。"""
+        ts = pd.Timestamp(timestamp)
+        return ts.value % self._load_sampling_offset().value == 0
+
+    def _time_slot_keys_from_timestamps(self, timestamps: Sequence[pd.Timestamp]) -> np.ndarray:
+        """
+        将时间戳转换为“日内时刻”键值。
+        例如 14:45:00 -> 当天零点后的纳秒偏移，用于强制检索返回相同时刻起点的历史负荷过程。
+        """
+        ts_index = pd.DatetimeIndex(pd.to_datetime(timestamps))
+        if ts_index.empty:
+            return np.empty((0,), dtype=np.int64)
+        return (ts_index.asi8 - ts_index.normalize().asi8).astype(np.int64, copy=False)
+
+    def _window_timestamps_from_start(
+        self,
+        start_timestamp: Union[str, pd.Timestamp],
+        window_size: int,
+    ) -> pd.DatetimeIndex:
+        """根据窗口起点和负荷采样频率，生成窗口内每个时间步对应的时间戳。"""
+        start_ts = pd.Timestamp(start_timestamp)
+        periods = int(window_size)
+        if periods <= 0:
+            raise ValueError(f"window_size 必须为正整数，但实际值为 {window_size}")
+        return pd.date_range(
+            start=start_ts,
+            periods=periods,
+            freq=self._load_sampling_offset(),
+        )
+
+    def _collect_required_build_timestamps(
+        self,
+        load_dates: Sequence[pd.Timestamp],
+        window_start_indices: Sequence[int],
+        window_size: int,
+    ) -> pd.DatetimeIndex:
+        """
+        汇总建库阶段实际会访问到的全部负荷时间戳。
+        仅这些时间戳需要与天气 HDF5 严格 exact 对齐。
+        """
+        load_dates = pd.DatetimeIndex(pd.to_datetime(load_dates))
+        starts = np.asarray(window_start_indices, dtype=np.int64)
+        if starts.ndim != 1 or starts.size == 0:
+            return pd.DatetimeIndex([])
+
+        required_mask = np.zeros(len(load_dates), dtype=bool)
+        window_size = int(window_size)
+        for start in starts:
+            end = int(start) + window_size
+            if end > len(load_dates):
+                raise ValueError(
+                    "负荷 CSV 覆盖范围不足以生成 exact 对齐校验所需的完整窗口: "
+                    f"start={int(start)}, window_size={window_size}, available={len(load_dates)}"
+                )
+            required_mask[int(start) : end] = True
+        return load_dates[required_mask]
 
     def _resolve_weather_start_indices(
         self,
@@ -1170,11 +1258,12 @@ class SimilarDayRetriever:
     ) -> np.ndarray:
         """
         将负荷窗口起点映射到天气时间轴。
-        对于 1h 天气，这一步会把 00:15 的负荷窗口起点向下对齐到 00:00 的天气帧。
+        对于 1h 天气，这一步会把 14:45 的负荷窗口起点向下对齐到 14:00 的天气帧。
         """
+        effective_align_mode = self._resolve_weather_align_mode(weather_store.freq)
         weather_start_indices = weather_store.lookup_indices(
             load_start_timestamps,
-            align=self.weather_align_mode,
+            align=effective_align_mode,
         )
         weather_window_size = self._effective_weather_window_size()
         if weather_start_indices.size == 0:
@@ -1189,6 +1278,30 @@ class SimilarDayRetriever:
                 f"required_end={required_end}, available={len(weather_store)}"
             )
         return weather_start_indices.astype(np.int64, copy=False)
+
+    def _enforce_exact_alignment_if_needed(
+        self,
+        weather_store: HDF5WeatherSequenceStore,
+        required_timestamps: Sequence[pd.Timestamp],
+        context: str,
+    ) -> str:
+        """
+        若当前配置应使用 exact，则强制校验天气 HDF5 至少覆盖实际要访问的那些时间戳。
+        返回最终生效的对齐方式，并固化到实例状态中。
+        """
+        effective_align_mode = self._resolve_weather_align_mode(weather_store.freq)
+        if effective_align_mode == "exact":
+            required = pd.DatetimeIndex(pd.to_datetime(required_timestamps))
+            if required.empty:
+                raise ValueError(f"{context} 需要 exact 对齐，但 required_timestamps 为空。")
+            try:
+                weather_store.lookup_indices(required, align="exact")
+            except KeyError as exc:
+                raise ValueError(
+                    f"{context} 需要 exact 对齐，但天气 HDF5 未完整覆盖所需时间戳: {exc}"
+                ) from exc
+        self.weather_align_mode = effective_align_mode
+        return effective_align_mode
 
     def _ensure_built(self) -> None:
         """断言类内部结构已经完全填充，否则报错阻截使用。"""
@@ -1221,59 +1334,18 @@ class SimilarDayRetriever:
         df["load"] = df["load"].astype(np.float32)
         return df
 
-    def _daily_window_start_offset(self) -> pd.Timedelta:
-        """
-        根据采样频率计算每日检索窗口的起始偏移量。
-        
-        通常电力负荷数据中每日的第一个数据点并不是 00:00，而是偏移一个频率间隔（如 00:15）。
-        该方法确立一个标准偏移量，用于在检索库中统一定位每日查询窗口的锚点。
-        """
-        offset = pd.Timedelta(self.freq)
-        if offset <= pd.Timedelta(0):
-            raise ValueError(f"freq 必须解析为正的时间间隔，但实际值为 {self.freq}")
-        if offset >= pd.Timedelta(days=1):
-            raise ValueError(f"对于按日检索，freq 必须小于一天，但实际值为 {self.freq}")
-        return offset
-
-    def _format_daily_window_start_time(self) -> str:
-        """将偏移量转换为可读的 HH:MM:SS 格式，主要用于生成更友好的异常错误提示信息。"""
-        total_seconds = int(self._daily_window_start_offset().total_seconds())
-        hours, rem = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(rem, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-    def _expected_daily_window_start(self, timestamp: pd.Timestamp) -> pd.Timestamp:
-        """根据输入的时间戳，推算其所属日期的标准检索起始时间锚点（日期归一化 + 偏移）。"""
-        ts = pd.Timestamp(timestamp)
-        return ts.normalize() + self._daily_window_start_offset()
-
-    def _is_daily_window_start_timestamp(self, timestamp: pd.Timestamp) -> bool:
-        """校验给定的时间戳是否恰好是该日的窗口起始锚点。"""
-        ts = pd.Timestamp(timestamp)
-        return ts == self._expected_daily_window_start(ts)
-
     def _normalize_query_timestamp(self, query_timestamp: Union[str, pd.Timestamp]) -> pd.Timestamp:
         """
         [辅助接口] 标准化查询时间。
-        
-        该方法允许用户输入该日 00:00:00 作为简易锚点（程序会自动后移一个采样间隔），
-        或者直接输入已对齐的起始时间。如果输入既不对齐也不在零点，则报异常中断。
+        查询必须严格对齐到负荷采样频率，例如 15min 数据只能接受 00:00/00:15/00:30/00:45 等时刻。
         """
         ts = pd.Timestamp(query_timestamp)
-        midnight = ts.normalize()
-        expected_start = self._expected_daily_window_start(ts)
-        
-        # 宽容性设计：如果输入的是 00:00，则自动平移到每日首个采样点
-        if ts == midnight:
-            return expected_start
-            
-        # 校验严谨性：如果输入已经是对齐的时间点，则直接返回
-        if ts == expected_start:
+        if self._is_load_aligned_timestamp(ts):
             return ts
-            
+
         raise ValueError(
-            "query_timestamp 必须对齐到每日窗口的起始时间 "
-            f"({self._format_daily_window_start_time()}) 或为当天的 00:00:00，但实际值为 {ts}"
+            "query_timestamp 必须严格对齐到负荷采样频率 "
+            f"({self._format_load_sampling_step()})，但实际值为 {ts}"
         )
 
     def _build_train_window_starts(
@@ -1285,9 +1357,9 @@ class SimilarDayRetriever:
         """
         计算并筛选出所有合法的训练窗口起始索引。
         算法逻辑：
-        1. 寻找负荷序列中第一个出现的午夜零点作为起始锚点。
-        2. 按照 build_stride (步长) 向后滑动，生成候选索引序列。
-        3. 验证每个起始位置的时间戳是否符合零点对齐要求。
+        1. 在训练区间内，以 build_stride 为步长生成所有候选窗口起点；
+        2. 仅保留严格对齐到负荷采样频率的起点；
+        3. 确保每个起点都能向后取满 pred_len 个点。
 
         Args:
             load_dates: 负荷数据的时间戳序列。
@@ -1298,7 +1370,6 @@ class SimilarDayRetriever:
             np.ndarray: 包含所有合法起始索引的 int64 数组。
         """
         train_row_count = int(train_row_count)
-        # 最大的起始索引不能超过（总行数 - 预测窗口长度）
         max_start = train_row_count - self.pred_len
         if max_start < 0:
             raise ValueError(
@@ -1306,23 +1377,8 @@ class SimilarDayRetriever:
             )
 
         dates = pd.DatetimeIndex(pd.to_datetime(load_dates))
-        
-        # 第一步：在可用序列中定位第一个零点位置
-        first_window_start_index = None
-        for idx in range(max_start + 1):
-            if self._is_daily_window_start_timestamp(dates[idx]):
-                first_window_start_index = idx
-                break
-        
-        if first_window_start_index is None:
-            raise ValueError(
-                f"训练数据中找不到从 {self._format_daily_window_start_time()} 开始的完整日窗口。"
-            )
-
-        # 第二步：从第一个零点开始，按照指定的步长 (Stride) 生成索引建议。
-        # Stride 通常等于 pred_len (96)，即按天滑动；也可以设为更小的值以增加样本重叠度。
         start_indices = np.arange(
-            first_window_start_index,
+            0,
             max_start + 1,
             self.build_stride,
             dtype=np.int64,
@@ -1330,22 +1386,21 @@ class SimilarDayRetriever:
         if start_indices.size == 0:
             raise ValueError("当前 build_stride 设置下无法生成任何训练窗口。")
 
-        # 第三步：双重校验，确保筛选后的每一个起始索引对应的时间戳依然是零点
         valid_mask = np.array(
-            [self._is_daily_window_start_timestamp(dates[int(idx)]) for idx in start_indices],
+            [self._is_load_aligned_timestamp(dates[int(idx)]) for idx in start_indices],
             dtype=bool,
         )
         start_indices = start_indices[valid_mask]
-        
+
         if start_indices.size == 0:
             raise ValueError(
-                f"当前 build_stride 无法保持窗口起点对齐到 {self._format_daily_window_start_time()}。"
+                "当前 build_stride 无法保持窗口起点对齐到负荷采样频率 "
+                f"{self._format_load_sampling_step()}。"
             )
 
-        # 第四步：如果设置了最大窗口数限制，则执行截断
         if max_train_windows is not None:
             start_indices = start_indices[: int(max_train_windows)]
-        
+
         if start_indices.size == 0:
             raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
 
@@ -1552,8 +1607,8 @@ class SimilarDayRetriever:
         if len(timestamps) == 0:
             return np.empty((0, 5), dtype=np.float32)
 
-        # Retrieval windows are aligned to the first sample after midnight, so minute/hour features are
-        # constant across the index and dilute the useful weekly and seasonal cues.
+        # 检索时会强制限制到与查询相同的日内时刻槽位，因此小时/分钟在候选集中是常量，
+        # 显式加入这两项只会稀释周/年季节性等更有区分度的模式。
         time_vectors = np.column_stack(
             [
                 timestamps.dayofweek.to_numpy(dtype=np.float32) / 6.0 - 0.5,
@@ -1647,9 +1702,21 @@ class SimilarDayRetriever:
         if n_windows <= 0:
             raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
 
+        required_exact_timestamps = self._collect_required_build_timestamps(
+            load_dates=load_dates,
+            window_start_indices=window_start_indices[:n_windows],
+            window_size=self._effective_weather_window_size(),
+        )
+        effective_align_mode = self._enforce_exact_alignment_if_needed(
+            weather_store,
+            required_exact_timestamps,
+            context="建库阶段",
+        )
+
         train_frame_count = int(window_start_indices[-1] + self.pred_len)
         # 准备对应标签侧的负荷滑动窗口、起始时间戳列表
         start_timestamps = pd.DatetimeIndex(load_dates[window_start_indices])
+        start_time_keys = self._time_slot_keys_from_timestamps(start_timestamps)
         weather_start_indices = self._resolve_weather_start_indices(weather_store, start_timestamps)
         load_values = load_df["load"].to_numpy(dtype=np.float32)
         # 使用 numpy 高效滑窗构建 ground truth 的历史曲线
@@ -1658,6 +1725,10 @@ class SimilarDayRetriever:
             axis=0,
         ).astype(np.float32, copy=False)
         load_curves = np.ascontiguousarray(load_curves)
+        unique_weather_start_indices, weather_inverse_indices = np.unique(
+            weather_start_indices,
+            return_inverse=True,
+        )
 
         print("=" * 72)
         print("开始构建时空相似日检索库 (ConvLSTM-AE)")
@@ -1668,9 +1739,14 @@ class SimilarDayRetriever:
         print(f"训练窗口数: {n_windows}")
         print(f"负荷窗口长度: {self.pred_len}")
         print(
-            f"气象窗口长度: {self._effective_weather_window_size()} "
-            f"(step={self.weather_step_desc}, align={self.weather_align_mode})"
+            f"负荷滑窗步长: {self.build_stride} "
+            f"(step={self._format_load_sampling_step()})"
         )
+        print(
+            f"气象窗口长度: {self._effective_weather_window_size()} "
+            f"(step={self.weather_step_desc}, align={effective_align_mode})"
+        )
+        print(f"唯一气象窗口数: {len(unique_weather_start_indices)}")
         print(f"时间权重 alpha: {self.time_weight}")
         print(f"气象统计量: {self.stats}")
         print("=" * 72)
@@ -1704,18 +1780,20 @@ class SimilarDayRetriever:
             total_samples=n_windows,
         )
 
-        # 此后分配底库潜向量内存（仅[N, Latent_Dim]大小所以可以直接全部放进内存）
-        weather_vectors = np.empty((n_windows, encoder.output_dim), dtype=np.float32)
+        # 对于 1h 天气 + 15min 负荷，4 个相邻负荷起点会重复映射到同一个天气窗口。
+        # 先对唯一天气起点编码，再按 inverse 映射回所有负荷窗口，避免重复跑 AE。
+        unique_weather_vectors = np.empty((len(unique_weather_start_indices), encoder.output_dim), dtype=np.float32)
         cursor = 0
-        # 第散遍扫描：产生用于建库的最终被降维表征
+        # 第三遍扫描：产生用于建库的最终被降维表征
         for batch_vectors in self._iter_weather_embedding_batches(
             weather_store=weather_store,
             encoder=encoder,
-            weather_start_indices=weather_start_indices,
+            weather_start_indices=unique_weather_start_indices,
             stage_name="向量生成",
         ):
-            weather_vectors[cursor : cursor + len(batch_vectors)] = batch_vectors
+            unique_weather_vectors[cursor : cursor + len(batch_vectors)] = batch_vectors
             cursor += len(batch_vectors)
+        weather_vectors = np.ascontiguousarray(unique_weather_vectors[weather_inverse_indices])
 
         # 组建并融合时间特征得到最终在向量空间待检索的“指纹”
         time_vectors = self._build_time_vectors(start_timestamps)
@@ -1736,6 +1814,7 @@ class SimilarDayRetriever:
         self.train_frame_count = int(train_frame_count)
         self.train_window_count = int(n_windows)
         self.fused_dim = int(fused_vectors.shape[1])
+        self.start_time_keys = start_time_keys
         self.weather_window_size = int(self.weather_encoder.window_size)
         self.log1p_channels = tuple(self.weather_encoder.log1p_channels)
 
@@ -1785,37 +1864,30 @@ class SimilarDayRetriever:
 
         # 1. 构建当前查询点的时间描述符（周期性特征）并应用权重 alpha
         time_vector = self._build_time_vectors([pd.Timestamp(query_timestamp)])
-        
+
         # 2. 融合气象潜向量与时间特征，并执行全局 L2 归一化
         fused_query = self._fuse_and_normalize(weather_embedding, time_vector)
-        
-        # 3. 在索引库中执行精确内积搜索（等价于余弦相似度）
-        # 根据是否提供历史截止时间戳，选择不同的检索策略
-        if history_end_timestamp_exclusive is None:
-            # 策略 A: 全库检索。直接使用构建好的向量索引进行顶层 K 个近邻搜索
-            scores, ids = self.index.search(fused_query, top_k=top_k)
-        else:
-            # 策略 B: 过滤检索。仅在指定时间戳之前的历史数据中搜索，防止数据泄露
+
+        # 3. 严格限制候选集起始时刻与查询时刻的日内槽位一致，确保返回的负荷过程起点完全同刻。
+        if self.start_time_keys is None or len(self.start_time_keys) != len(self.start_timestamps):
+            self.start_time_keys = self._time_slot_keys_from_timestamps(self.start_timestamps)
+        query_time_key = self._time_slot_keys_from_timestamps([query_timestamp])[0]
+        valid_mask = self.start_time_keys == query_time_key
+        if history_end_timestamp_exclusive is not None:
             cutoff_ts = pd.Timestamp(history_end_timestamp_exclusive)
-            # 找出所有起始时间早于截止时间的索引位置
-            valid_indices = np.flatnonzero(self.start_timestamps < cutoff_ts)
-            
-            if valid_indices.size == 0:
-                # 容错处理：若无合规历史数据，返回空结果
-                scores = np.empty((1, 0), dtype=np.float32)
-                ids = np.empty((1, 0), dtype=np.int64)
-            else:
-                # 确定检索上限，不能超过候选集大小
-                limited_top_k = min(int(top_k), int(valid_indices.size))
-                # 提取符合条件的候选特征向量
-                candidate_vectors = self.base_vectors[valid_indices]
-                # 计算查询向量与合规候选向量之间的内积（由于已做 L2 归一化，即等价于余弦相似度）
-                candidate_scores = np.matmul(fused_query, candidate_vectors.T).astype(np.float32, copy=False)
-                # 对得分进行降序排列，取前 limited_top_k 个索引
-                order = np.argsort(-candidate_scores[0])[:limited_top_k]
-                # 整理最终得分与对应的原始库索引 ID
-                scores = candidate_scores[:, order]
-                ids = valid_indices[order].reshape(1, -1).astype(np.int64, copy=False)
+            valid_mask &= self.start_timestamps < cutoff_ts
+        valid_indices = np.flatnonzero(valid_mask)
+
+        if valid_indices.size == 0:
+            scores = np.empty((1, 0), dtype=np.float32)
+            ids = np.empty((1, 0), dtype=np.int64)
+        else:
+            limited_top_k = min(int(top_k), int(valid_indices.size))
+            candidate_vectors = self.base_vectors[valid_indices]
+            candidate_scores = np.matmul(fused_query, candidate_vectors.T).astype(np.float32, copy=False)
+            order = np.argsort(-candidate_scores[0])[:limited_top_k]
+            scores = candidate_scores[:, order]
+            ids = valid_indices[order].reshape(1, -1).astype(np.int64, copy=False)
 
         # 4. 根据返回的索引，从底库中提取对应的负荷曲线和时间戳
         retrieved_ids = [int(idx) for idx in ids[0].tolist() if int(idx) >= 0]
@@ -1883,6 +1955,7 @@ class SimilarDayRetriever:
         常被测算验证环节(Backtest)使用。
         """
         self._ensure_built()
+        query_timestamp = self._normalize_query_timestamp(query_timestamp)
         
         # 自动管理 HDF5 存储句柄
         created_store = False
@@ -1893,11 +1966,19 @@ class SimilarDayRetriever:
             created_store = True
 
         try:
+            effective_align_mode = self._enforce_exact_alignment_if_needed(
+                weather_store,
+                self._window_timestamps_from_start(
+                    query_timestamp,
+                    self._effective_weather_window_size(),
+                ),
+                context=f"查询窗口 {pd.Timestamp(query_timestamp)}",
+            )
             # 1. 根据时间戳从 HDF5 中提取对应的气象图像序列
             weather_window = weather_store.get_window_by_timestamp(
                 query_timestamp,
                 self._effective_weather_window_size(),
-                align=self.weather_align_mode,
+                align=effective_align_mode,
             )
             # 2. 转发至中层接口进行编码和检索
             return self.search_by_weather_window(
@@ -2063,6 +2144,7 @@ class SimilarDayRetriever:
                 getattr(retriever.weather_encoder, "window_size", retriever.weather_window_size),
             )
         )
+        retriever.start_time_keys = retriever._time_slot_keys_from_timestamps(retriever.start_timestamps)
         retriever.log1p_channels = tuple(getattr(retriever.weather_encoder, "log1p_channels", retriever.log1p_channels))
         return retriever
 
@@ -2082,6 +2164,10 @@ def print_retrieval_result(result: RetrievalResult, print_json: bool = False) ->
 
     print("=" * 72)
     print(f"查询时间点 (Query): {result.query_timestamp}")
+    if len(result.historical_indices) == 0:
+        print("  [无结果] 在当前历史范围内找不到与查询起始时刻完全一致的候选窗口。")
+        print("=" * 72)
+        return
     # 遍历 Top-K 结果进行排版打印
     for rank, (idx, ts, score, curve) in enumerate(
         zip(
@@ -2115,6 +2201,12 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--time-weight", type=float, default=1.22, help="时间特征权重 (alpha)")
     parser.add_argument("--pred-len", type=int, default=96, help="预测步长/窗口长度")
     parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0, help="前多少比例的数据用于建库")
+    parser.add_argument(
+        "--build-stride",
+        type=int,
+        default=1,
+        help="负荷窗口起点滑动步长（按负荷采样点计；15min 数据中 1 表示每 15 分钟建一条）",
+    )
     parser.add_argument("--build-batch-size", type=int, default=384, help="建库批处理规格")
     parser.add_argument(
         "--ae-checkpoint",
@@ -2145,21 +2237,12 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
         if "date" in future_df.columns and len(future_df) > 0:
             return pd.Timestamp(future_df["date"].iloc[0])
 
-    # 3. 兜底方案：计算训练集（库）的最后一个可能的时间点
+    # 3. 兜底方案：回退到训练/检索分界线之后的第一个时间点
     load_df = pd.read_csv(args.load_csv)
     load_df["date"] = pd.to_datetime(load_df["date"])
     train_rows = int(len(load_df) * float(args.train_ratio))
     if train_rows >= len(load_df):
         train_rows = len(load_df) - 1
-    fallback_dates = pd.DatetimeIndex(load_df["date"].iloc[train_rows:])
-    if len(load_df) >= 2:
-        step = pd.Timestamp(load_df["date"].iloc[1]) - pd.Timestamp(load_df["date"].iloc[0])
-    else:
-        step = pd.Timedelta("15min")
-    expected_start = fallback_dates.normalize() + step
-    window_start_mask = fallback_dates == expected_start
-    if np.any(window_start_mask):
-        return pd.Timestamp(fallback_dates[window_start_mask][0])
     return pd.Timestamp(load_df["date"].iloc[train_rows])
 
 
@@ -2221,9 +2304,10 @@ def _build_retriever_from_cli_args(
         pred_len=args.pred_len,
         train_ratio=args.train_ratio,
         weather_window_size=int(getattr(runtime_config, "window_size")),
-        weather_align_mode="floor",
+        weather_align_mode="auto",
         weather_step_desc=str(getattr(runtime_config, "step_desc")),
         weather_dataset_tag=str(getattr(runtime_config, "dataset_tag")),
+        build_stride=args.build_stride,
         build_batch_size=args.build_batch_size,
         ae_checkpoint_path=ae_checkpoint_path,
         ae_norm_stats_path=ae_norm_stats_path,
