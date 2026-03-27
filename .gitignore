@@ -8,3 +8,4 @@ results/
 data/
 *.pt
 *.pth
+*.npz

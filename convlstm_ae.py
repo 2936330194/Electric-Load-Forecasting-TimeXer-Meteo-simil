@@ -10,8 +10,10 @@ Usage:
 import argparse
 import os
 import time
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
+
 import h5py
-from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -25,10 +27,11 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 # =============================================================================
 
 # 指定气象网格数据集存储路径
-H5_PATH = "./data/hunan_grid_meteo_20250101_20260228.h5"
+H5_PATH = "./data/hunan_grid_2024_2025_filtered.h5"
+LEGACY_H5_PATH = "./data/hunan_grid_meteo_20250101_20260228.h5"
 
-# 气象通道字段定义 (按照通道 index 顺序严格对应)
-CHANNEL_NAMES = [
+# 旧版 10 通道气象字段定义，作为变量名缺失时的兜底映射
+LEGACY_CHANNEL_NAMES = [
     "temperature_2m",         # 0: 2米温度
     "relative_humidity_2m",   # 1: 2米相对湿度
     "apparent_temperature",   # 2: 体感温度
@@ -43,14 +46,16 @@ CHANNEL_NAMES = [
 
 # 降水等符合长尾分布规律的指标极其容易受极端天气 (如洪涝暴雨) 产生巨大数值偏移
 # 使用 log1p(x+1) 能有效将极值拖缩回去，在网络训练中更容易学到连续特征
-LOG1P_CHANNELS = [9]
+LOG1P_VARIABLE_NAMES = {"precipitation"}
+DEFAULT_WINDOW_HOURS = 24
+DEFAULT_STRIDE_HOURS = 6
 
 # ----------------- 模型超参数 (Model Hyperparameters) -----------------
-WINDOW_SIZE = 96     # 时间窗大小：96代表1天的数据包含着每15分钟一个步长组成的96个连续帧
+WINDOW_SIZE = 24     # 默认窗口大小：对 hourly 数据为 1 天；15min 数据会在运行时自动推断为 96
 HIDDEN_DIM = 16      # ConvLSTM 的隐藏特征通道层数，提取出的特征更抽象，参数也随之成平方倍增加
 LATENT_DIM = 128      # 最后编码得到的潜向量长度映射 (决定了后续在检索库搜索时向量的体积大小)
 NUM_LAYERS = 1       # 级联的 ConvLSTM 提取深度层数 (1层通常具备基础表征，多层计算较慢)
-IN_CHANNELS = 10     # 对应上面的 CHANNEL_NAMES
+IN_CHANNELS = 5      # 默认兼容 hourly 版；实际训练/测试时会根据 H5 元数据自动覆盖
 
 # ----------------- 训练控制超参数 (Training Hyperparameters) ----------
 BATCH_SIZE = 16      # 每批次包含的天数样本，受限于 4D 张量 (B, T, C, H, W) 的极长的时间步长，极易发生显存崩塌
@@ -402,11 +407,19 @@ class MeteoDataset(Dataset):
     """
     def __init__(self, data: np.ndarray, window_size: int = WINDOW_SIZE, stride: int = 24):
         super().__init__()
-        self.window_size = window_size
-        self.stride = stride
+        self.window_size = int(window_size)
+        self.stride = int(stride)
+        if self.window_size <= 0:
+            raise ValueError("window_size 必须为正数。")
+        if self.stride <= 0:
+            raise ValueError("stride 必须为正数。")
         
         # 保留下数据的引用
         self.data = data
+        if len(self.data) < self.window_size:
+            raise ValueError(
+                f"数据长度 {len(self.data)} 小于窗口长度 {self.window_size}，无法构造滑动窗口样本。"
+            )
         
         # 计算滑动窗口游标能截取到的样本总个数
         self.n_samples = (len(self.data) - self.window_size) // self.stride + 1
@@ -436,9 +449,203 @@ def _find_first_4d_dataset(h5_obj):
     return None
 
 
-def load_and_preprocess(
+def _find_named_1d_dataset(h5_obj, candidate_names: Sequence[str]):
+    """
+    递归遍历 HDF5 对象，找到名称匹配的 1 维数据集。
+    主要用于提取 variables / timestamps 之类的元数据。
+    """
+    normalized_candidates = tuple(str(name).lower() for name in candidate_names)
+    for key in h5_obj.keys():
+        item = h5_obj[key]
+        key_lower = str(key).lower()
+        if isinstance(item, h5py.Dataset) and item.ndim == 1:
+            if any(candidate in key_lower for candidate in normalized_candidates):
+                return item
+        if isinstance(item, h5py.Group):
+            found = _find_named_1d_dataset(item, candidate_names)
+            if found is not None:
+                return found
+    return None
+
+
+def _decode_string_array(values) -> List[str]:
+    """
+    将 HDF5 中的 bytes / object / string 数组统一转为 Python 字符串列表。
+    """
+    decoded = []
+    for value in np.asarray(values).reshape(-1):
+        if isinstance(value, (bytes, bytearray)):
+            decoded.append(value.decode("utf-8"))
+        else:
+            decoded.append(str(value))
+    return decoded
+
+
+def _build_default_channel_names(channels: int) -> List[str]:
+    """
+    当 H5 内没有可靠的变量名时，构造一个稳定的兜底通道名列表。
+    """
+    if channels == len(LEGACY_CHANNEL_NAMES):
+        return list(LEGACY_CHANNEL_NAMES)
+    return [f"channel_{idx}" for idx in range(channels)]
+
+
+def _infer_step_seconds_from_timestamps(timestamp_values: Sequence[str]) -> Optional[int]:
+    """
+    从时间戳数组中推断原始气象数据步长（秒）。
+    """
+    if len(timestamp_values) < 2:
+        return None
+
+    try:
+        timestamps_ns = np.asarray(timestamp_values, dtype="datetime64[ns]").astype(np.int64)
+    except (TypeError, ValueError):
+        return None
+
+    diffs = np.diff(timestamps_ns)
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.size == 0:
+        return None
+
+    step_seconds = int(positive_diffs.min() // 1_000_000_000)
+    return step_seconds if step_seconds > 0 else None
+
+
+def _infer_steps_for_hours(step_seconds: Optional[int], hours: int, fallback: int) -> int:
+    """
+    将“若干小时”的业务窗口换算为当前采样频率下的步数。
+    例如:
+    - 15min 数据: 24 小时 -> 96 步, 6 小时 -> 24 步
+    - 1h 数据:    24 小时 -> 24 步, 6 小时 -> 6 步
+    """
+    if step_seconds is None or step_seconds <= 0:
+        return int(fallback)
+
+    total_seconds = int(hours) * 3600
+    steps, remainder = divmod(total_seconds, step_seconds)
+    if steps <= 0:
+        return 1
+    if remainder != 0:
+        return max(1, int(round(total_seconds / step_seconds)))
+    return int(steps)
+
+
+def _resolve_log1p_channels(channel_names: Sequence[str]) -> List[int]:
+    """
+    根据变量名自动确定哪些通道应该做 log1p 平滑。
+    """
+    resolved = []
+    for idx, channel_name in enumerate(channel_names):
+        lowered = str(channel_name).lower()
+        if any(token in lowered for token in LOG1P_VARIABLE_NAMES):
+            resolved.append(idx)
+    return resolved
+
+
+def _resolve_h5_path(h5_path: str) -> str:
+    """
+    将相对路径解析为相对当前脚本目录的绝对路径。
+    """
+    if os.path.isabs(h5_path):
+        return h5_path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, h5_path)
+
+
+@dataclass
+class MeteoRuntimeConfig:
+    h5_path: str
+    dataset_name: str
+    total_steps: int
+    in_channels: int
+    frame_height: int
+    frame_width: int
+    channel_names: List[str]
+    log1p_channels: List[int]
+    step_seconds: Optional[int]
+    window_size: int
+    stride: int
+
+    @property
+    def dataset_tag(self) -> str:
+        return os.path.splitext(os.path.basename(self.h5_path))[0]
+
+    @property
+    def step_desc(self) -> str:
+        if self.step_seconds is None:
+            return "unknown"
+        if self.step_seconds % 3600 == 0:
+            return f"{self.step_seconds // 3600}h"
+        if self.step_seconds % 60 == 0:
+            return f"{self.step_seconds // 60}min"
+        return f"{self.step_seconds}s"
+
+
+def inspect_h5_runtime_config(
     h5_path: str,
-    log1p_channels: List[int],
+    window_size: Optional[int] = None,
+    stride: Optional[int] = None,
+) -> MeteoRuntimeConfig:
+    """
+    读取 H5 元数据，得到模型和数据管线真正需要的运行时配置。
+    """
+    resolved_h5_path = _resolve_h5_path(h5_path)
+    if not os.path.exists(resolved_h5_path):
+        raise FileNotFoundError(f"找不到 HDF5 文件: {resolved_h5_path}")
+
+    with h5py.File(resolved_h5_path, "r") as f:
+        dataset = _find_first_4d_dataset(f)
+        if dataset is None:
+            raise ValueError(f"HDF5 文件中未找到 4D 数据集: {resolved_h5_path}")
+
+        total_steps, in_channels, frame_height, frame_width = dataset.shape
+
+        variable_dataset = _find_named_1d_dataset(f, ("variables", "variable", "channel_names", "channels"))
+        if variable_dataset is not None:
+            channel_names = _decode_string_array(variable_dataset[...])
+        else:
+            channel_names = _build_default_channel_names(in_channels)
+
+        if len(channel_names) != in_channels:
+            print(
+                f"[数据] 变量名数量 {len(channel_names)} 与通道数 {in_channels} 不一致，"
+                "将回退到默认通道命名。"
+            )
+            channel_names = _build_default_channel_names(in_channels)
+
+        timestamp_dataset = _find_named_1d_dataset(f, ("timestamps", "timestamp", "times", "time"))
+        timestamp_values = _decode_string_array(timestamp_dataset[...]) if timestamp_dataset is not None else []
+
+    step_seconds = _infer_step_seconds_from_timestamps(timestamp_values)
+    effective_window_size = (
+        int(window_size)
+        if window_size is not None and int(window_size) > 0
+        else _infer_steps_for_hours(step_seconds, DEFAULT_WINDOW_HOURS, WINDOW_SIZE)
+    )
+    effective_stride = (
+        int(stride)
+        if stride is not None and int(stride) > 0
+        else _infer_steps_for_hours(step_seconds, DEFAULT_STRIDE_HOURS, max(1, effective_window_size // 4))
+    )
+    effective_log1p_channels = _resolve_log1p_channels(channel_names)
+
+    return MeteoRuntimeConfig(
+        h5_path=resolved_h5_path,
+        dataset_name=dataset.name,
+        total_steps=int(total_steps),
+        in_channels=int(in_channels),
+        frame_height=int(frame_height),
+        frame_width=int(frame_width),
+        channel_names=channel_names,
+        log1p_channels=effective_log1p_channels,
+        step_seconds=step_seconds,
+        window_size=int(effective_window_size),
+        stride=int(effective_stride),
+    )
+
+
+def load_and_preprocess(
+    runtime_config: MeteoRuntimeConfig,
     train_ratio: float = TRAIN_RATIO,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
     """
@@ -449,6 +656,7 @@ def load_and_preprocess(
     if h5py is None:
         raise ImportError("需要先安装 h5py: pip install h5py")
 
+    h5_path = runtime_config.h5_path
     print(f"[数据] 加载 HDF5: {h5_path}")
     with h5py.File(h5_path, "r") as f:
         dataset = _find_first_4d_dataset(f)
@@ -465,8 +673,9 @@ def load_and_preprocess(
     # 第 1 步：平滑处理
     # 大部分时候气象降水 (precipitation) 数据呈现严重的右偏长尾分布 (非常多 0，少数极端大暴雨)
     # log1p 即 log(x+1)，能压制极值，使得网络更容易学到降水的特征而不是被极值干扰导致的严重 loss 震荡
-    for ch_idx in log1p_channels:
-        print(f"[预处理] channel {ch_idx} ({CHANNEL_NAMES[ch_idx]}): 取 log1p(x+1) 进行异常值平滑")
+    for ch_idx in runtime_config.log1p_channels:
+        channel_name = runtime_config.channel_names[ch_idx]
+        print(f"[预处理] channel {ch_idx} ({channel_name}): 取 log1p(x+1) 进行异常值平滑")
         data[:, ch_idx, :, :] = np.log1p(np.maximum(data[:, ch_idx, :, :], 0.0))
 
     # 第 2 步：依据比例分割时序数据作为训练集和验证集
@@ -636,6 +845,19 @@ def evaluate_reconstruction_metrics(
     return {"mse": mse, "mae": mae, "rmse": rmse, "r2": r2}
 
 
+def _resolve_checkpoint_dir(base_checkpoint_dir: str, runtime_config: MeteoRuntimeConfig) -> str:
+    """
+    默认情况下按数据集文件名拆分 checkpoint 目录，避免不同通道配置互相覆盖。
+    如果用户显式传了自定义目录，则保持原样。
+    """
+    normalized_base = os.path.normpath(base_checkpoint_dir)
+    default_base = os.path.normpath(CHECKPOINT_DIR)
+    if normalized_base == default_base:
+        dataset_dir = os.path.join(base_checkpoint_dir, runtime_config.dataset_tag)
+        return dataset_dir
+    return base_checkpoint_dir
+
+
 def run_training(args: argparse.Namespace) -> None:
     """
     执行完整的模型训练流程。
@@ -658,14 +880,26 @@ def run_training(args: argparse.Namespace) -> None:
         print("[设备] 未检测到 GPU 或未配置使用，采用 CPU 训练")
 
     # 3. 数据加载与标准化预处理
-    h5_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), H5_PATH)
+    runtime_config = inspect_h5_runtime_config(
+        args.h5_path,
+        window_size=args.window_size,
+        stride=args.stride,
+    )
     train_data, val_data, mean, std, height, width = load_and_preprocess(
-        h5_path, LOG1P_CHANNELS, TRAIN_RATIO
+        runtime_config, TRAIN_RATIO
     )
 
     # 4. 初始化 Dataset 和 DataLoader
-    train_dataset = MeteoDataset(train_data, WINDOW_SIZE)
-    val_dataset = MeteoDataset(val_data, WINDOW_SIZE)
+    train_dataset = MeteoDataset(
+        train_data,
+        window_size=runtime_config.window_size,
+        stride=runtime_config.stride,
+    )
+    val_dataset = MeteoDataset(
+        val_data,
+        window_size=runtime_config.window_size,
+        stride=runtime_config.stride,
+    )
     print(f"[数据] 训练集样本: {len(train_dataset)} | 验证集样本: {len(val_dataset)}")
 
     train_loader = DataLoader(
@@ -685,11 +919,11 @@ def run_training(args: argparse.Namespace) -> None:
 
     # 5. 初始化模型 (ConvLSTM AutoEncoder)
     model = ConvLSTMAutoEncoder(
-        in_channels=IN_CHANNELS,
+        in_channels=runtime_config.in_channels,
         hidden_channels=HIDDEN_DIM,
         latent_dim=LATENT_DIM,
         num_layers=NUM_LAYERS,
-        seq_len=WINDOW_SIZE,
+        seq_len=runtime_config.window_size,
         frame_height=height,
         frame_width=width,
     ).float().to(device)
@@ -707,10 +941,11 @@ def run_training(args: argparse.Namespace) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # 7. 准备 Checkpoint 目录并保存标准化统计参数
-    os.makedirs(args.checkpoints, exist_ok=True)
-    best_model_path = os.path.join(args.checkpoints, BEST_MODEL_FILE)
-    checkpoint_path = os.path.join(args.checkpoints, "checkpoint.pth") # EarlyStopping 使用的临时存档
-    norm_stats_path = os.path.join(args.checkpoints, NORM_STATS_FILE)
+    checkpoint_dir = _resolve_checkpoint_dir(args.checkpoints, runtime_config)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    best_model_path = os.path.join(checkpoint_dir, BEST_MODEL_FILE)
+    checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth") # EarlyStopping 使用的临时存档
+    norm_stats_path = os.path.join(checkpoint_dir, NORM_STATS_FILE)
     
     # 初始化早停工具
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
@@ -720,7 +955,15 @@ def run_training(args: argparse.Namespace) -> None:
         norm_stats_path,
         mean=mean,
         std=std,
-        log1p_channels=np.array(LOG1P_CHANNELS),
+        log1p_channels=np.array(runtime_config.log1p_channels, dtype=np.int64),
+        channel_names=np.array(runtime_config.channel_names, dtype="<U64"),
+        h5_path=np.array([runtime_config.h5_path], dtype="<U512"),
+        window_size=np.array([runtime_config.window_size], dtype=np.int64),
+        stride=np.array([runtime_config.stride], dtype=np.int64),
+        step_seconds=np.array(
+            [-1 if runtime_config.step_seconds is None else runtime_config.step_seconds],
+            dtype=np.int64,
+        ),
     )
     print(f"[持久化] 标准化参数已存至: {norm_stats_path}")
 
@@ -729,6 +972,11 @@ def run_training(args: argparse.Namespace) -> None:
     print(">>> 启动 ConvLSTM AutoEncoder 训练任务")
     print(f"    - 网络参数: Hidden={HIDDEN_DIM}, Latent={LATENT_DIM}, Layers={NUM_LAYERS}")
     print(f"    - 训练超参: Batch={BATCH_SIZE}, LR={args.learning_rate}, Epochs={args.train_epochs}")
+    print(
+        f"    - 数据配置: H5={runtime_config.h5_path}, Dataset={runtime_config.dataset_name}, "
+        f"Step={runtime_config.step_desc}, Window={runtime_config.window_size}, "
+        f"Stride={runtime_config.stride}, Channels={runtime_config.in_channels}"
+    )
     print(f"    - 策略配置: LR_Adj={args.lradj}, EarlyStop_Patience={args.patience}")
     print(f"    - 系统状态: AMP={use_amp}, Device={device}")
     print("=" * 72)
@@ -755,7 +1003,7 @@ def run_training(args: argparse.Namespace) -> None:
         )
 
         # 检查是否满足早停条件并保存进度
-        early_stopping(val_loss, model, args.checkpoints)
+        early_stopping(val_loss, model, checkpoint_dir)
         
         if early_stopping.early_stop:
             print(f"[早停] 在第 {epoch} 轮触发，模型性能已不再显著提升。")
@@ -794,12 +1042,20 @@ def run_test(args: argparse.Namespace) -> None:
         print("[设备] 测试模式使用 CPU")
 
     # 2. 数据准备 (只需验证部分数据)
-    h5_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), H5_PATH)
+    runtime_config = inspect_h5_runtime_config(
+        args.h5_path,
+        window_size=args.window_size,
+        stride=args.stride,
+    )
     _, val_data, mean, std, height, width = load_and_preprocess(
-        h5_path, LOG1P_CHANNELS, TRAIN_RATIO
+        runtime_config, TRAIN_RATIO
     )
 
-    val_dataset = MeteoDataset(val_data, WINDOW_SIZE)
+    val_dataset = MeteoDataset(
+        val_data,
+        window_size=runtime_config.window_size,
+        stride=runtime_config.stride,
+    )
     if len(val_dataset) <= 0:
         raise ValueError("验证集样本数为 0，请检查数据分流或路径。")
 
@@ -813,17 +1069,18 @@ def run_test(args: argparse.Namespace) -> None:
 
     # 3. 构建模型并加载预训练权重
     model = ConvLSTMAutoEncoder(
-        in_channels=IN_CHANNELS,
+        in_channels=runtime_config.in_channels,
         hidden_channels=HIDDEN_DIM,
         latent_dim=LATENT_DIM,
         num_layers=NUM_LAYERS,
-        seq_len=WINDOW_SIZE,
+        seq_len=runtime_config.window_size,
         frame_height=height,
         frame_width=width,
     ).float().to(device)
 
     # 确定权重路径：优先使用命令行指定的路径，否则使用默认路径
-    checkpoint_path = args.test_checkpoint or os.path.join(args.checkpoints, BEST_MODEL_FILE)
+    checkpoint_dir = _resolve_checkpoint_dir(args.checkpoints, runtime_config)
+    checkpoint_path = args.test_checkpoint or os.path.join(checkpoint_dir, BEST_MODEL_FILE)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"找不到需要测试的模型权重文件: {checkpoint_path}")
 
@@ -843,6 +1100,10 @@ def run_test(args: argparse.Namespace) -> None:
     print("\n" + "=" * 72)
     print("ConvLSTM AutoEncoder 气象数据重构性能测试报告")
     print(f"  测试权重: {checkpoint_path}")
+    print(
+        f"  数据配置: Step={runtime_config.step_desc}, Window={runtime_config.window_size}, "
+        f"Stride={runtime_config.stride}, Channels={runtime_config.in_channels}"
+    )
     print(f"  样本数量: {len(val_dataset)}")
     print(f"  标准化态: Mean={tuple(mean.shape)}, Std={tuple(std.shape)}")
     print("-" * 72)
@@ -858,7 +1119,7 @@ def run_test(args: argparse.Namespace) -> None:
 # =============================================================================
 
 
-def run_smoke_test() -> None:
+def run_smoke_test(args: argparse.Namespace) -> None:
     """
     冒烟测试 (Smoke Test)：
     用于在正式训练前，使用随机生成的伪造数据验证整个模型的前向传播逻辑和张量形状变换是否正确。
@@ -868,7 +1129,26 @@ def run_smoke_test() -> None:
     print("Smoke Test: 验证 ConvLSTM AutoEncoder 模型的张量维度变动")
     print("=" * 72)
 
-    height, width = 62, 61
+    try:
+        runtime_config = inspect_h5_runtime_config(
+            args.h5_path,
+            window_size=args.window_size,
+            stride=args.stride,
+        )
+        height, width = runtime_config.frame_height, runtime_config.frame_width
+        in_channels = runtime_config.in_channels
+        window_size = runtime_config.window_size
+        print(
+            f"[数据] 基于 H5 元数据构造冒烟测试: "
+            f"Step={runtime_config.step_desc}, Window={window_size}, Channels={in_channels}"
+        )
+    except Exception as exc:
+        runtime_config = None
+        height, width = 62, 61
+        in_channels = IN_CHANNELS
+        window_size = WINDOW_SIZE
+        print(f"[数据] 读取 H5 元数据失败，回退到默认形状执行冒烟测试: {exc}")
+
     batch_size = 2 # 仅测试用，不需要太大尺寸
 
     # 自动探测环境：有 GPU 且启动 GPU 配置则放入 cuda:0，否则用 CPU
@@ -877,11 +1157,11 @@ def run_smoke_test() -> None:
 
     # 1. 初始化模型并上移设备
     model = ConvLSTMAutoEncoder(
-        in_channels=IN_CHANNELS,
+        in_channels=in_channels,
         hidden_channels=HIDDEN_DIM,
         latent_dim=LATENT_DIM,
         num_layers=NUM_LAYERS,
-        seq_len=WINDOW_SIZE,
+        seq_len=window_size,
         frame_height=height,
         frame_width=width,
     ).float().to(device)
@@ -891,7 +1171,7 @@ def run_smoke_test() -> None:
     print(f"[模型] 总参数量规模: {total_params:,}")
 
     # 3. 构造随机假输入 [Batch, 序列长, 气象通道, 网格高, 网格宽]
-    x = torch.randn(batch_size, WINDOW_SIZE, IN_CHANNELS, height, width, device=device)
+    x = torch.randn(batch_size, window_size, in_channels, height, width, device=device)
     print(f"[输入] x.shape 必须为: {tuple(x.shape)}")
 
     # 4. 执行不追踪梯度的纯粹前向推理
@@ -924,6 +1204,27 @@ if __name__ == "__main__":
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="学习率 (Learning Rate)")
     parser.add_argument("--patience", type=int, default=5, help="早停耐心值 (Patience)，超过此轮数 Loss 不降则停止")
     parser.add_argument(
+        "--h5-path",
+        type=str,
+        default=H5_PATH,
+        help=(
+            "训练/测试所使用的气象 HDF5 路径。默认使用 hourly 版；"
+            f"旧版 10 通道 15min 可指定为 {LEGACY_H5_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=0,
+        help="滑动窗口长度。默认按 H5 时间分辨率自动推断：hourly=24, 15min=96。",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=0,
+        help="滑动窗口步长。默认按 H5 时间分辨率自动推断：hourly=6, 15min=24。",
+    )
+    parser.add_argument(
         "--lradj",
         type=str,
         default="cosine",
@@ -945,7 +1246,7 @@ if __name__ == "__main__":
     # 根据参数进入不同分支
     if cli_args.smoke_test:
         # 进入模型验证冒烟测试
-        run_smoke_test()
+        run_smoke_test(cli_args)
     elif cli_args.test_only:
         # 进入纯推理测试评估模式
         run_test(cli_args)
