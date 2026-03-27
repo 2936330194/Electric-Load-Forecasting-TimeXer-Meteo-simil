@@ -1,17 +1,15 @@
 """
 similar_day_retriever_320.py
 
-基于《相似日检索系统架构设计文档_单年精简版》的独立实现：
-
-1. 使用 2025 年负荷数据前 2/3 训练段构建离线检索库
-2. 将未来 10 个通道 96 步 的气象窗口编码为 128 维潜向量
+1. 使用 2024 年负荷数据前 2/3 训练段构建离线检索库
+2. 将未来 5 个通道 24/96 步 的气象窗口编码为 128 维潜向量
 3. 叠加 5 维时间特征并进行时间权重提权
 4. 采用 Exact Inner Product Search 返回 Top-K 相似历史负荷曲线
 
 说明：
 - 本程序不改动 `convlstm_ae.py` 的训练流程，但在推理时依赖其定义的模型结构和训练出的权重。
 - 128 维气象编码通过预训练模型完成：
-  原始气象帧 -> 对数变换(log1p) -> 通道级标准化 -> ConvLSTM-AE Encoder -> 128 维潜映射(Latent)
+  原始气象帧 -> 通道级标准化 -> ConvLSTM-AE Encoder -> 128 维潜映射(Latent)
 - faiss 可用时优先使用 IndexFlatIP；不可用时自动回退到 NumPy 精确检索
 """
 
@@ -45,26 +43,103 @@ from convlstm_ae import (
     HIDDEN_DIM as AE_HIDDEN_DIM,         # 隐藏层维度
     IN_CHANNELS as AE_IN_CHANNELS,       # 输入气象通道数
     LATENT_DIM as AE_LATENT_DIM,         # 潜变量维度 (目前为 128)
-    LOG1P_CHANNELS as AE_LOG1P_CHANNELS, # 需要 log1p 处理的通道索引
     NORM_STATS_FILE as AE_NORM_STATS_FILE,# 归一化统计文件
     NUM_LAYERS as AE_NUM_LAYERS,         # ConvLSTM 层数
     USE_GPU as AE_USE_GPU,               # 是否使用 GPU
     WINDOW_SIZE as AE_WINDOW_SIZE,       # 时间窗口步数
+    inspect_h5_runtime_config,           # 读取 H5 运行时元数据
 )
 
 ROOT_DIR = Path(__file__).resolve().parent
 # 默认的负荷历史数据 CSV 路径
-DEFAULT_LOAD_CSV = ROOT_DIR / "data" / "湖南省电力负荷_unknow.csv"
+DEFAULT_LOAD_CSV = ROOT_DIR / "data" / "湖南省电力负荷2024.csv"
 # 默认的待预测未来窗口 CSV 路径
-DEFAULT_FUTURE_CSV = ROOT_DIR / "data" / "湖南省电力负荷_unknow_future.csv"
+DEFAULT_FUTURE_CSV = ROOT_DIR / "data" / "湖南省电力负荷2024_future.csv"
 # 默认的气象网格 HDF5 数据路径
-DEFAULT_WEATHER_H5 = ROOT_DIR / "data" / "hunan_grid_meteo_20250101_20260228.h5"
-# 相似日检索库（Artifacts）的保存目录
-DEFAULT_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "similar_day_retriever_ae_128"
+DEFAULT_WEATHER_H5 = ROOT_DIR / "data" / "hunan_grid_2024_2025_filtered.h5"
+DEFAULT_AE_FALLBACK_MODEL_FILE = "checkpoint.pth"
+
+
+def _resolve_project_path(path_value: Union[str, Path]) -> Path:
+    """将相对路径统一解释为相对于 simil 项目根目录。"""
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    return path.resolve()
+
+
+def _dataset_tag_from_weather_h5(weather_h5_path: Union[str, Path]) -> str:
+    return Path(weather_h5_path).stem
+
+
+def _checkpoint_dir_for_weather(weather_h5_path: Union[str, Path]) -> Path:
+    return (_resolve_project_path(AE_CHECKPOINT_DIR) / _dataset_tag_from_weather_h5(weather_h5_path)).resolve()
+
+
+def _default_ae_checkpoint_for_weather(weather_h5_path: Union[str, Path]) -> Path:
+    checkpoint_dir = _checkpoint_dir_for_weather(weather_h5_path)
+    best_path = checkpoint_dir / AE_BEST_MODEL_FILE
+    fallback_path = checkpoint_dir / DEFAULT_AE_FALLBACK_MODEL_FILE
+    if best_path.exists() or not fallback_path.exists():
+        return best_path.resolve()
+    return fallback_path.resolve()
+
+
+def _default_ae_norm_stats_for_weather(weather_h5_path: Union[str, Path]) -> Path:
+    return (_checkpoint_dir_for_weather(weather_h5_path) / AE_NORM_STATS_FILE).resolve()
+
+
+def _default_artifact_dir_for_weather(weather_h5_path: Union[str, Path]) -> Path:
+    dataset_tag = _dataset_tag_from_weather_h5(weather_h5_path)
+    return (ROOT_DIR / "artifacts" / f"similar_day_retriever_{dataset_tag}").resolve()
+
+
+# 相似日检索库（Artifacts）的默认保存目录
+DEFAULT_ARTIFACT_DIR = _default_artifact_dir_for_weather(DEFAULT_WEATHER_H5)
 # 默认的 AE 模型权重路径
-DEFAULT_AE_CHECKPOINT = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_BEST_MODEL_FILE).resolve()
+DEFAULT_AE_CHECKPOINT = _default_ae_checkpoint_for_weather(DEFAULT_WEATHER_H5)
 # 默认的 AE 归一化统计信息路径
-DEFAULT_AE_NORM_STATS = (ROOT_DIR / AE_CHECKPOINT_DIR / AE_NORM_STATS_FILE).resolve()
+DEFAULT_AE_NORM_STATS = _default_ae_norm_stats_for_weather(DEFAULT_WEATHER_H5)
+
+
+def resolve_retriever_runtime_paths(
+    weather_h5_path: Union[str, Path],
+    artifact_dir: Optional[Union[str, Path]] = None,
+    ae_checkpoint_path: Optional[Union[str, Path]] = None,
+    ae_norm_stats_path: Optional[Union[str, Path]] = None,
+) -> Tuple[object, Path, Path, Path]:
+    """
+    根据当前选中的气象 H5，统一解析检索器运行所需的路径与运行时配置。
+    """
+    resolved_weather_h5 = _resolve_project_path(weather_h5_path)
+    runtime_config = inspect_h5_runtime_config(str(resolved_weather_h5))
+    resolved_artifact_dir = (
+        _resolve_project_path(artifact_dir)
+        if artifact_dir
+        else _default_artifact_dir_for_weather(resolved_weather_h5)
+    )
+    resolved_ae_checkpoint = (
+        _resolve_project_path(ae_checkpoint_path)
+        if ae_checkpoint_path
+        else _default_ae_checkpoint_for_weather(resolved_weather_h5)
+    )
+    resolved_ae_norm_stats = (
+        _resolve_project_path(ae_norm_stats_path)
+        if ae_norm_stats_path
+        else _default_ae_norm_stats_for_weather(resolved_weather_h5)
+    )
+    return runtime_config, resolved_artifact_dir, resolved_ae_checkpoint, resolved_ae_norm_stats
+
+
+def _step_desc_from_timedelta(freq: Optional[pd.Timedelta]) -> str:
+    if freq is None:
+        return "unknown"
+    total_seconds = int(freq.total_seconds())
+    if total_seconds % 3600 == 0:
+        return f"{total_seconds // 3600}h"
+    if total_seconds % 60 == 0:
+        return f"{total_seconds // 60}min"
+    return f"{total_seconds}s"
 
 # 针对 Windows 或某些终端环境，重新配置输出流以避免编码错误（用 replace 替换无法显示的字符）
 if hasattr(sys.stdout, "reconfigure"):
@@ -363,13 +438,49 @@ class HDF5WeatherSequenceStore:
                 f"位置 {first_bad}, csv={expected[first_bad]}, h5={actual[first_bad]}"
             )
 
-    def lookup_index(self, timestamp: Union[str, pd.Timestamp]) -> int:
-        """根据给定的时间戳对象或者字符串，反查其在 HDF5 文件中的行索引。"""
+    def lookup_index(self, timestamp: Union[str, pd.Timestamp], align: str = "exact") -> int:
+        """根据给定时间戳反查其在 HDF5 文件中的行索引，可选精确匹配或向下对齐。"""
         ts = pd.Timestamp(timestamp)
         key = int(ts.value)
-        if key not in self.timestamp_to_index:
-            raise KeyError(f"时间戳不在气象 HDF5 覆盖范围内: {ts}")
-        return self.timestamp_to_index[key]
+        if align == "exact":
+            if key not in self.timestamp_to_index:
+                raise KeyError(f"时间戳不在气象 HDF5 覆盖范围内: {ts}")
+            return self.timestamp_to_index[key]
+        if align != "floor":
+            raise ValueError(f"不支持的时间对齐方式: {align}")
+        if self.timestamps is None or len(self.timestamps) == 0:
+            raise RuntimeError("HDF5 时间轴尚未初始化。")
+
+        actual_ns = self.timestamps.asi8
+        idx = int(np.searchsorted(actual_ns, key, side="right") - 1)
+        if idx < 0:
+            raise KeyError(f"时间戳早于气象 HDF5 覆盖范围起点: {ts}")
+        return idx
+
+    def lookup_indices(
+        self,
+        timestamps: Sequence[Union[str, pd.Timestamp]],
+        align: str = "exact",
+    ) -> np.ndarray:
+        """批量反查多个时间戳对应的气象帧起始索引。"""
+        query_ts = pd.DatetimeIndex(pd.to_datetime(timestamps))
+        if query_ts.empty:
+            return np.empty((0,), dtype=np.int64)
+        if align == "exact":
+            return np.asarray([self.lookup_index(ts, align="exact") for ts in query_ts], dtype=np.int64)
+        if align != "floor":
+            raise ValueError(f"不支持的时间对齐方式: {align}")
+        if self.timestamps is None or len(self.timestamps) == 0:
+            raise RuntimeError("HDF5 时间轴尚未初始化。")
+
+        actual_ns = self.timestamps.asi8
+        query_ns = query_ts.asi8
+        indices = np.searchsorted(actual_ns, query_ns, side="right") - 1
+        bad_mask = indices < 0
+        if np.any(bad_mask):
+            bad_idx = int(np.where(bad_mask)[0][0])
+            raise KeyError(f"时间戳早于气象 HDF5 覆盖范围起点: {query_ts[bad_idx]}")
+        return indices.astype(np.int64, copy=False)
 
     def get_block(self, start: int, end: int) -> np.ndarray:
         """
@@ -391,10 +502,13 @@ class HDF5WeatherSequenceStore:
         return self.get_block(start_index, start_index + int(window_size))
 
     def get_window_by_timestamp(
-        self, timestamp: Union[str, pd.Timestamp], window_size: int
+        self,
+        timestamp: Union[str, pd.Timestamp],
+        window_size: int,
+        align: str = "exact",
     ) -> np.ndarray:
         """从某个特定时间戳开始，向后提取所需步长的气象数据。"""
-        start_index = self.lookup_index(timestamp)
+        start_index = self.lookup_index(timestamp, align=align)
         return self.get_window(start_index, int(window_size))
 
 
@@ -415,7 +529,7 @@ class StatisticalWeatherEncoder:
         weather_dim: int = AE_LATENT_DIM,
         window_size: int = 96,
         stats: Sequence[str] = ("mean", "std", "min", "max"),
-        log1p_channels: Sequence[int] = (9,),
+        log1p_channels: Sequence[int] = (),
         batch_size: int = 384,
         channel_mean: Optional[np.ndarray] = None,
         channel_std: Optional[np.ndarray] = None,
@@ -608,7 +722,7 @@ class ConvLSTMAEWeatherEncoder:
         hidden_dim: int = AE_HIDDEN_DIM,
         num_layers: int = AE_NUM_LAYERS,
         in_channels: int = AE_IN_CHANNELS,
-        log1p_channels: Sequence[int] = AE_LOG1P_CHANNELS,
+        log1p_channels: Sequence[int] = (),
     ):
         """
         初始化自编码器封装。
@@ -971,13 +1085,17 @@ class SimilarDayRetriever:
         pred_len: int = 96,
         train_ratio: float = 2.0 / 3.0,
         freq: str = "15min",
+        weather_window_size: Optional[int] = None,
+        weather_align_mode: str = "floor",
+        weather_step_desc: Optional[str] = None,
+        weather_dataset_tag: Optional[str] = None,
         build_stride: Optional[int] = None,
         build_batch_size: int = 384,
         ae_checkpoint_path: Union[str, Path] = DEFAULT_AE_CHECKPOINT,
         ae_norm_stats_path: Union[str, Path] = DEFAULT_AE_NORM_STATS,
         encoder_batch_size: int = AE_BATCH_SIZE,
         stats: Sequence[str] = ("mean", "std", "min", "max"),
-        log1p_channels: Sequence[int] = (9,),
+        log1p_channels: Sequence[int] = (),
     ):
         """
         初始化系统核心参数。
@@ -988,6 +1106,10 @@ class SimilarDayRetriever:
             pred_len: 单次查询与返回的曲线点数 (如 96 点代表 24 小时 * 每 15 分钟 1 个点)。
             train_ratio: 按时间顺序划分的前部分序列作为建库集（由于检索的是历史发生过的片段）。
             freq: 采样频率字符串，用于辅助时间戳时间特征的提取。
+            weather_window_size: 单个天气窗口的步数，由天气 H5 原生频率决定；默认与 pred_len 相同以兼容旧逻辑。
+            weather_align_mode: 负荷起始时间戳映射到天气时间轴时的对齐方式，支持 exact / floor。
+            weather_step_desc: 天气数据步长描述，如 1h / 15min。
+            weather_dataset_tag: 当前检索库绑定的天气数据集标签，默认取 H5 文件名 stem。
             build_batch_size: 避免OOM的内部处理块大小。
             stats: 提取使用的统计特征集合。
             log1p_channels: 偏态需要对数缩放的指标维。
@@ -997,6 +1119,12 @@ class SimilarDayRetriever:
         self.pred_len = int(pred_len)
         self.train_ratio = float(train_ratio)
         self.freq = str(freq)
+        self.weather_window_size = (
+            int(weather_window_size) if weather_window_size is not None else int(pred_len)
+        )
+        self.weather_align_mode = str(weather_align_mode)
+        self.weather_step_desc = None if weather_step_desc is None else str(weather_step_desc)
+        self.weather_dataset_tag = None if weather_dataset_tag is None else str(weather_dataset_tag)
         self.build_stride = self.pred_len if build_stride is None else int(build_stride)
         self.build_batch_size = int(build_batch_size)
         self.ae_checkpoint_path = str(Path(ae_checkpoint_path).resolve())
@@ -1004,6 +1132,12 @@ class SimilarDayRetriever:
         self.encoder_batch_size = int(encoder_batch_size)
         self.stats = tuple(stats)
         self.log1p_channels = tuple(int(x) for x in log1p_channels)
+        if self.weather_window_size <= 0:
+            raise ValueError(f"weather_window_size 必须为正整数，但实际值为 {self.weather_window_size}")
+        if self.weather_align_mode not in {"exact", "floor"}:
+            raise ValueError(
+                f"weather_align_mode 仅支持 exact 或 floor，但实际值为 {self.weather_align_mode}"
+            )
         if self.build_stride <= 0:
             raise ValueError(f"build_stride 必须为正整数，但实际值为 {self.build_stride}")
 
@@ -1022,6 +1156,39 @@ class SimilarDayRetriever:
         self.train_frame_count: Optional[int] = None
         self.train_window_count: Optional[int] = None
         self.fused_dim: Optional[int] = None
+
+    def _effective_weather_window_size(self) -> int:
+        """优先使用已加载编码器上的窗口长度，以确保推理与建库配置一致。"""
+        if self.weather_encoder is not None:
+            return int(getattr(self.weather_encoder, "window_size", self.weather_window_size))
+        return int(self.weather_window_size)
+
+    def _resolve_weather_start_indices(
+        self,
+        weather_store: HDF5WeatherSequenceStore,
+        load_start_timestamps: Sequence[pd.Timestamp],
+    ) -> np.ndarray:
+        """
+        将负荷窗口起点映射到天气时间轴。
+        对于 1h 天气，这一步会把 00:15 的负荷窗口起点向下对齐到 00:00 的天气帧。
+        """
+        weather_start_indices = weather_store.lookup_indices(
+            load_start_timestamps,
+            align=self.weather_align_mode,
+        )
+        weather_window_size = self._effective_weather_window_size()
+        if weather_start_indices.size == 0:
+            raise ValueError("天气窗口起始索引为空，无法继续建库。")
+
+        required_end = int(weather_start_indices.max() + weather_window_size)
+        if required_end > len(weather_store):
+            last_load_ts = pd.Timestamp(load_start_timestamps[int(np.argmax(weather_start_indices))])
+            raise ValueError(
+                "天气 HDF5 覆盖范围不足以支撑完整窗口读取: "
+                f"last_load_start={last_load_ts}, weather_window_size={weather_window_size}, "
+                f"required_end={required_end}, available={len(weather_store)}"
+            )
+        return weather_start_indices.astype(np.int64, copy=False)
 
     def _ensure_built(self) -> None:
         """断言类内部结构已经完全填充，否则报错阻截使用。"""
@@ -1316,7 +1483,7 @@ class SimilarDayRetriever:
         self,
         weather_store: HDF5WeatherSequenceStore,
         encoder: ConvLSTMAEWeatherEncoder,
-        window_start_indices: Sequence[int],
+        weather_start_indices: Sequence[int],
         stage_name: str,
     ) -> Iterator[np.ndarray]:
         """
@@ -1328,16 +1495,16 @@ class SimilarDayRetriever:
         Args:
             weather_store: 气象 HDF5 数据存储句柄。
             encoder: 已加载权重的 ConvLSTM 自编码器编码器。
-            window_start_indices: 负荷数据对应的训练窗口起始索引集合。
+            weather_start_indices: 已映射到气象时间轴上的训练窗口起始索引集合。
             stage_name: 用于进度显示的文本标签。
 
         Returns:
             Iterator[np.ndarray]: 每次 yield 一个包含 batch_size 个嵌入向量的 array [N, 128]。
         """
         # 1. 确保起始索引为一维 numpy 数组，方便后续切片操作
-        start_indices = np.asarray(window_start_indices, dtype=np.int64)
+        start_indices = np.asarray(weather_start_indices, dtype=np.int64)
         if start_indices.ndim != 1 or start_indices.size == 0:
-            raise ValueError("window_start_indices 必须是一维且非空。")
+            raise ValueError("weather_start_indices 必须是一维且非空。")
 
         # 2. 鲁棒性处理：部分环境控制台不支持中文，将 stage_name 清洗为纯 ASCII 以防打印崩溃
         safe_stage_name = stage_name.encode("ascii", errors="ignore").decode("ascii").strip() or "weather_batch"
@@ -1348,6 +1515,7 @@ class SimilarDayRetriever:
         
         # 获取单帧气象图像的形状 (C, H, W)
         frame_shape = tuple(int(x) for x in weather_store.frame_shape)
+        weather_window_size = int(getattr(encoder, "window_size", self._effective_weather_window_size()))
 
         # 4. 循环切片起始索引，执行分批转换
         for batch_idx, offset in enumerate(range(0, len(start_indices), effective_batch_size), start=1):
@@ -1357,9 +1525,9 @@ class SimilarDayRetriever:
             
             # 5. 内存管理：预分配一个 [N, T, C, H, W] 的 5 维大张量存放批量窗口数据
             # 这一步将多个不连续的磁盘读取组合成一个连续的内存块，以便于 GPU 推理
-            batch_windows = np.empty((current_size, self.pred_len, *frame_shape), dtype=np.float32)
+            batch_windows = np.empty((current_size, weather_window_size, *frame_shape), dtype=np.float32)
             for row_idx, start_idx in enumerate(batch_starts):
-                batch_windows[row_idx] = weather_store.get_window(int(start_idx), self.pred_len)
+                batch_windows[row_idx] = weather_store.get_window(int(start_idx), weather_window_size)
 
             # 6. 调用神经网络编码器，将 5 维气象序列转换为 2 维潜变量特征
             batch_vectors = encoder.transform_window_batch(
@@ -1454,6 +1622,10 @@ class SimilarDayRetriever:
         load_df = self._load_load_dataframe(load_csv_path)
         # 打开气象数据集句柄
         weather_store = HDF5WeatherSequenceStore(weather_h5_path)
+        if self.weather_dataset_tag is None:
+            self.weather_dataset_tag = Path(weather_h5_path).stem
+        if self.weather_step_desc is None:
+            self.weather_step_desc = _step_desc_from_timedelta(weather_store.freq)
 
         total_rows = len(load_df)
         default_train_rows = int(total_rows * self.train_ratio)
@@ -1475,11 +1647,10 @@ class SimilarDayRetriever:
         if n_windows <= 0:
             raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
 
-        # 验证气象和负荷在起跑线上是对齐的
         train_frame_count = int(window_start_indices[-1] + self.pred_len)
-        weather_store.verify_alignment(load_dates[:train_frame_count])
         # 准备对应标签侧的负荷滑动窗口、起始时间戳列表
         start_timestamps = pd.DatetimeIndex(load_dates[window_start_indices])
+        weather_start_indices = self._resolve_weather_start_indices(weather_store, start_timestamps)
         load_values = load_df["load"].to_numpy(dtype=np.float32)
         # 使用 numpy 高效滑窗构建 ground truth 的历史曲线
         load_curves = np.stack(
@@ -1495,7 +1666,11 @@ class SimilarDayRetriever:
         print(f"训练比例: {self.train_ratio:.6f}")
         print(f"训练帧数: {train_frame_count}")
         print(f"训练窗口数: {n_windows}")
-        print(f"窗口长度: {self.pred_len}")
+        print(f"负荷窗口长度: {self.pred_len}")
+        print(
+            f"气象窗口长度: {self._effective_weather_window_size()} "
+            f"(step={self.weather_step_desc}, align={self.weather_align_mode})"
+        )
         print(f"时间权重 alpha: {self.time_weight}")
         print(f"气象统计量: {self.stats}")
         print("=" * 72)
@@ -1506,7 +1681,8 @@ class SimilarDayRetriever:
             checkpoint_path=self.ae_checkpoint_path,
             norm_stats_path=self.ae_norm_stats_path,
             latent_dim=self.weather_dim,
-            window_size=self.pred_len,
+            window_size=self._effective_weather_window_size(),
+            in_channels=int(weather_store.frame_shape[0]),
             log1p_channels=self.log1p_channels,
             batch_size=self.encoder_batch_size,
         )
@@ -1535,7 +1711,7 @@ class SimilarDayRetriever:
         for batch_vectors in self._iter_weather_embedding_batches(
             weather_store=weather_store,
             encoder=encoder,
-            window_start_indices=window_start_indices,
+            weather_start_indices=weather_start_indices,
             stage_name="向量生成",
         ):
             weather_vectors[cursor : cursor + len(batch_vectors)] = batch_vectors
@@ -1560,6 +1736,7 @@ class SimilarDayRetriever:
         self.train_frame_count = int(train_frame_count)
         self.train_window_count = int(n_windows)
         self.fused_dim = int(fused_vectors.shape[1])
+        self.weather_window_size = int(self.weather_encoder.window_size)
         self.log1p_channels = tuple(self.weather_encoder.log1p_channels)
 
         weather_store.close()
@@ -1671,10 +1848,13 @@ class SimilarDayRetriever:
         """
         self._ensure_built()
         weather_window = np.asarray(weather_window, dtype=np.float32)
+        weather_window_size = self._effective_weather_window_size()
         
         # 维度校验：必须包含预测长度所需的所有气象帧
-        if weather_window.ndim != 4 or weather_window.shape[0] != self.pred_len:
-            raise ValueError(f"查询气象窗口必须为 [{self.pred_len}, C, H, W]，实际 {weather_window.shape}")
+        if weather_window.ndim != 4 or weather_window.shape[0] != weather_window_size:
+            raise ValueError(
+                f"查询气象窗口必须为 [{weather_window_size}, C, H, W]，实际 {weather_window.shape}"
+            )
         if weather_window.shape[1] != self.weather_encoder.channel_count:
             raise ValueError(
                 f"气象通道数错误，期望 {self.weather_encoder.channel_count}，实际 {weather_window.shape[1]}"
@@ -1714,7 +1894,11 @@ class SimilarDayRetriever:
 
         try:
             # 1. 根据时间戳从 HDF5 中提取对应的气象图像序列
-            weather_window = weather_store.get_window_by_timestamp(query_timestamp, self.pred_len)
+            weather_window = weather_store.get_window_by_timestamp(
+                query_timestamp,
+                self._effective_weather_window_size(),
+                align=self.weather_align_mode,
+            )
             # 2. 转发至中层接口进行编码和检索
             return self.search_by_weather_window(
                 weather_window,
@@ -1790,6 +1974,10 @@ class SimilarDayRetriever:
             "weather_dim_effective": self.weather_encoder.output_dim,
             "time_weight": self.time_weight,
             "pred_len": self.pred_len,
+            "weather_window_size": self._effective_weather_window_size(),
+            "weather_align_mode": self.weather_align_mode,
+            "weather_step_desc": self.weather_step_desc,
+            "weather_dataset_tag": self.weather_dataset_tag,
             "train_ratio": self.train_ratio,
             "freq": self.freq,
             "build_stride": self.build_stride,
@@ -1836,6 +2024,10 @@ class SimilarDayRetriever:
             pred_len=int(metadata["pred_len"]),
             train_ratio=float(metadata["train_ratio"]),
             freq=str(metadata["freq"]),
+            weather_window_size=int(metadata.get("weather_window_size", metadata["pred_len"])),
+            weather_align_mode=str(metadata.get("weather_align_mode", "floor")),
+            weather_step_desc=metadata.get("weather_step_desc"),
+            weather_dataset_tag=metadata.get("weather_dataset_tag"),
             build_stride=int(metadata.get("build_stride", metadata["pred_len"])),
             build_batch_size=int(metadata["build_batch_size"]),
             ae_checkpoint_path=metadata.get("ae_checkpoint_path", DEFAULT_AE_CHECKPOINT),
@@ -1865,6 +2057,13 @@ class SimilarDayRetriever:
         retriever.train_frame_count = metadata.get("train_frame_count")
         retriever.train_window_count = metadata.get("train_window_count")
         retriever.fused_dim = metadata.get("fused_dim")
+        retriever.weather_window_size = int(
+            metadata.get(
+                "weather_window_size",
+                getattr(retriever.weather_encoder, "window_size", retriever.weather_window_size),
+            )
+        )
+        retriever.log1p_channels = tuple(getattr(retriever.weather_encoder, "log1p_channels", retriever.log1p_channels))
         return retriever
 
 
@@ -1906,14 +2105,29 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     """向命令行解析器添加共享的建库配置及运行参数。"""
     parser.add_argument("--load-csv", type=str, default=str(DEFAULT_LOAD_CSV), help="负荷数据集路径")
     parser.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5), help="气象 HDF5 路径")
-    parser.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR), help="模型/库保存目录")
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="模型/库保存目录；默认按 weather_h5 文件名自动分配子目录",
+    )
     parser.add_argument("--weather-dim", type=int, default=AE_LATENT_DIM, help="目标潜向量维度")
     parser.add_argument("--time-weight", type=float, default=1.22, help="时间特征权重 (alpha)")
     parser.add_argument("--pred-len", type=int, default=96, help="预测步长/窗口长度")
     parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0, help="前多少比例的数据用于建库")
     parser.add_argument("--build-batch-size", type=int, default=384, help="建库批处理规格")
-    parser.add_argument("--ae-checkpoint", type=str, default=str(DEFAULT_AE_CHECKPOINT), help="AE 权重路径")
-    parser.add_argument("--ae-norm-stats", type=str, default=str(DEFAULT_AE_NORM_STATS), help="AE 标准化参数路径")
+    parser.add_argument(
+        "--ae-checkpoint",
+        type=str,
+        default=None,
+        help="AE 权重路径；默认按 weather_h5 自动映射到对应 checkpoint 子目录",
+    )
+    parser.add_argument(
+        "--ae-norm-stats",
+        type=str,
+        default=None,
+        help="AE 标准化参数路径；默认按 weather_h5 自动映射到对应 checkpoint 子目录",
+    )
     parser.add_argument("--encoder-batch-size", type=int, default=AE_BATCH_SIZE, help="推理批处理规格")
     parser.add_argument("--max-train-windows", type=int, default=None, help="强制截断训练样本数")
 
@@ -1949,24 +2163,97 @@ def resolve_query_timestamp(args: argparse.Namespace) -> pd.Timestamp:
     return pd.Timestamp(load_df["date"].iloc[train_rows])
 
 
-def command_build(args: argparse.Namespace) -> None:
-    """CLI 命令处理函数：触发并执行离线库构建流程。"""
-    # 1. 根据命令行参数初始化检索器实例
+def _resolve_artifact_dir_argument(
+    artifact_dir: Optional[Union[str, Path]],
+    weather_h5_path: Optional[Union[str, Path]],
+) -> Path:
+    if artifact_dir:
+        return _resolve_project_path(artifact_dir)
+    candidate_weather_h5 = weather_h5_path if weather_h5_path is not None else DEFAULT_WEATHER_H5
+    return _default_artifact_dir_for_weather(candidate_weather_h5)
+
+
+def _validate_weather_runtime_compatibility(
+    retriever: SimilarDayRetriever,
+    runtime_config: object,
+) -> None:
+    expected_weather_window = retriever._effective_weather_window_size()
+    actual_weather_window = int(getattr(runtime_config, "window_size"))
+    if actual_weather_window != expected_weather_window:
+        raise ValueError(
+            "查询天气窗口长度与检索库不匹配: "
+            f"retriever={expected_weather_window}, h5={actual_weather_window}"
+        )
+
+    expected_channels = (
+        retriever.weather_encoder.channel_count
+        if retriever.weather_encoder is not None
+        else None
+    )
+    actual_channels = int(getattr(runtime_config, "in_channels"))
+    if expected_channels is not None and actual_channels != int(expected_channels):
+        raise ValueError(
+            "查询天气通道数与检索库不匹配: "
+            f"retriever={expected_channels}, h5={actual_channels}"
+        )
+
+    if retriever.weather_step_desc is not None:
+        actual_step_desc = str(getattr(runtime_config, "step_desc"))
+        if actual_step_desc != retriever.weather_step_desc:
+            raise ValueError(
+                "查询天气时间分辨率与检索库不匹配: "
+                f"retriever={retriever.weather_step_desc}, h5={actual_step_desc}"
+            )
+
+
+def _build_retriever_from_cli_args(
+    args: argparse.Namespace,
+) -> Tuple[SimilarDayRetriever, object, Path]:
+    runtime_config, artifact_dir, ae_checkpoint_path, ae_norm_stats_path = resolve_retriever_runtime_paths(
+        weather_h5_path=args.weather_h5,
+        artifact_dir=args.artifact_dir,
+        ae_checkpoint_path=args.ae_checkpoint,
+        ae_norm_stats_path=args.ae_norm_stats,
+    )
     retriever = SimilarDayRetriever(
         weather_dim=args.weather_dim,
         time_weight=args.time_weight,
         pred_len=args.pred_len,
         train_ratio=args.train_ratio,
+        weather_window_size=int(getattr(runtime_config, "window_size")),
+        weather_align_mode="floor",
+        weather_step_desc=str(getattr(runtime_config, "step_desc")),
+        weather_dataset_tag=str(getattr(runtime_config, "dataset_tag")),
         build_batch_size=args.build_batch_size,
-        ae_checkpoint_path=args.ae_checkpoint,
-        ae_norm_stats_path=args.ae_norm_stats,
+        ae_checkpoint_path=ae_checkpoint_path,
+        ae_norm_stats_path=ae_norm_stats_path,
         encoder_batch_size=args.encoder_batch_size,
+        log1p_channels=getattr(runtime_config, "log1p_channels"),
     )
+    print("=" * 72)
+    print(f"[runtime] weather_h5: {getattr(runtime_config, 'h5_path')}")
+    print(
+        "[runtime] weather_step/window/channels: "
+        f"{getattr(runtime_config, 'step_desc')} / "
+        f"{getattr(runtime_config, 'window_size')} / "
+        f"{getattr(runtime_config, 'in_channels')}"
+    )
+    print(f"[runtime] ae_checkpoint: {ae_checkpoint_path}")
+    print(f"[runtime] ae_norm_stats: {ae_norm_stats_path}")
+    print(f"[runtime] artifact_dir: {artifact_dir}")
+    print("=" * 72)
+    return retriever, runtime_config, artifact_dir
+
+
+def command_build(args: argparse.Namespace) -> None:
+    """CLI 命令处理函数：触发并执行离线库构建流程。"""
+    # 1. 根据命令行参数初始化检索器实例
+    retriever, runtime_config, artifact_dir = _build_retriever_from_cli_args(args)
     # 2. 调用 build 方法执行数据读取、特征转换、索引构建及保存
     retriever.build(
         load_csv_path=args.load_csv,
-        weather_h5_path=args.weather_h5,
-        artifact_dir=args.artifact_dir,
+        weather_h5_path=getattr(runtime_config, "h5_path"),
+        artifact_dir=artifact_dir,
         max_train_windows=args.max_train_windows,
     )
 
@@ -1974,11 +2261,15 @@ def command_build(args: argparse.Namespace) -> None:
 def command_query(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：加载检索模型与离线相似特征库库并执行单次线上检索预测。"""
     # 1. 从指定的 Artifacts 目录加载已构建好的检索器
-    retriever = SimilarDayRetriever.load(args.artifact_dir)
+    artifact_dir = _resolve_artifact_dir_argument(args.artifact_dir, args.weather_h5)
+    retriever = SimilarDayRetriever.load(artifact_dir)
+    weather_h5_path = args.weather_h5 or retriever.weather_h5_path or DEFAULT_WEATHER_H5
+    runtime_config = inspect_h5_runtime_config(str(_resolve_project_path(weather_h5_path)))
+    _validate_weather_runtime_compatibility(retriever, runtime_config)
     # 2. 智能解析查询的时间戳起始点
     query_timestamp = resolve_query_timestamp(args)
     # 3. 打开气象数据仓库
-    weather_store = HDF5WeatherSequenceStore(args.weather_h5)
+    weather_store = HDF5WeatherSequenceStore(getattr(runtime_config, "h5_path"))
     try:
         # 4. 执行基于时间戳的相似日检索
         result = retriever.search_by_timestamp(
@@ -1997,27 +2288,18 @@ def command_smoke_test(args: argparse.Namespace) -> None:
     """CLI 命令处理函数：在极小规模数据上串联执行构建及查询以校验整个检索系统运行畅通无阻。"""
     # 冒烟测试通常用于代码变更后的快速冒泡验证
     # 1. 初始化检索器
-    retriever = SimilarDayRetriever(
-        weather_dim=args.weather_dim,
-        time_weight=args.time_weight,
-        pred_len=args.pred_len,
-        train_ratio=args.train_ratio,
-        build_batch_size=args.build_batch_size,
-        ae_checkpoint_path=args.ae_checkpoint,
-        ae_norm_stats_path=args.ae_norm_stats,
-        encoder_batch_size=args.encoder_batch_size,
-    )
+    retriever, runtime_config, artifact_dir = _build_retriever_from_cli_args(args)
     # 2. 快速构建小规模库 (默认 max_train_windows 为 384)
     retriever.build(
         load_csv_path=args.load_csv,
-        weather_h5_path=args.weather_h5,
-        artifact_dir=args.artifact_dir,
+        weather_h5_path=getattr(runtime_config, "h5_path"),
+        artifact_dir=artifact_dir,
         max_train_windows=args.max_train_windows,
     )
 
     # 3. 执行一次模拟查询
     query_timestamp = resolve_query_timestamp(args)
-    weather_store = HDF5WeatherSequenceStore(args.weather_h5)
+    weather_store = HDF5WeatherSequenceStore(getattr(runtime_config, "h5_path"))
     try:
         result = retriever.search_by_timestamp(
             query_timestamp=query_timestamp,
@@ -2044,8 +2326,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- query 子命令：负责在线检索 ---
     parser_query = subparsers.add_parser("query", help="加载离线库并执行在线检索")
-    parser_query.add_argument("--artifact-dir", type=str, default=str(DEFAULT_ARTIFACT_DIR))
-    parser_query.add_argument("--weather-h5", type=str, default=str(DEFAULT_WEATHER_H5))
+    parser_query.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="检索库目录；默认按 weather_h5 文件名自动分配子目录",
+    )
+    parser_query.add_argument(
+        "--weather-h5",
+        type=str,
+        default=None,
+        help="查询所用气象 HDF5；不传时优先使用 artifact 中保存的 weather_h5_path",
+    )
     parser_query.add_argument("--future-csv", type=str, default=str(DEFAULT_FUTURE_CSV))
     parser_query.add_argument("--load-csv", type=str, default=str(DEFAULT_LOAD_CSV))
     parser_query.add_argument("--train-ratio", type=float, default=2.0 / 3.0)

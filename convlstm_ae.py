@@ -28,7 +28,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 
 # 指定气象网格数据集存储路径
 H5_PATH = "./data/hunan_grid_2024_2025_filtered.h5"
-LEGACY_H5_PATH = "./data/hunan_grid_meteo_20250101_20260228.h5"
+LEGACY_H5_PATH = "./data/hunan_grid_2024_2025_filtered_15min.h5"
 
 # 旧版 10 通道气象字段定义，作为变量名缺失时的兜底映射
 LEGACY_CHANNEL_NAMES = [
