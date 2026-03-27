@@ -1,4 +1,4 @@
-"""
+﻿"""
 test4_smp.py - Simple Full-Map Conv + TimeXer end-to-end training
 
 核心改动：
@@ -18,13 +18,17 @@ import hashlib
 import os
 import random
 import time
-from typing import List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch import optim
 
-from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
+from utils.forecast_visualization import (
+    plot_pred_vs_true,
+    plot_similar_day_curves,
+    predict_future_load_from_csv,
+)
 from utils.metrics import metric
 from utils.quantile import QuantileLoss
 from utils.weather_e2e import (
@@ -127,6 +131,9 @@ CONTIGUOUS_TRAIN_BATCHES = True  # 训练阶段按连续窗口分块组 batch，
 # 说明：
 # - 当 FEATURES="MS" 时，TimeXer 的输入会被组织成“气象特征 + 历史负荷”，输出只预测目标负荷。
 
+SIMILAR_DAY_ARTIFACT_DIR: Optional[str] = None  # None -> resolve artifact dir from current weather H5
+SIMILAR_DAY_TOP_K = 3
+
 def _use_non_blocking_transfer(args, device: torch.device) -> bool:
     return (
         device.type == "cuda"
@@ -223,6 +230,86 @@ def _configure_runtime_weather_args(
         f"seq={args.weather_seq_len}"
     )
     return args
+
+
+def _resolve_primary_weather_h5_path(args: argparse.Namespace) -> str:
+    weather_h5_specs = getattr(args, "weather_h5_specs", None)
+    if not weather_h5_specs:
+        raise ValueError("args.weather_h5_specs is empty.")
+    return os.path.abspath(str(weather_h5_specs[0][0]))
+
+
+def export_similar_day_baseline(
+    results_dir: str,
+    future_path: str,
+    args: argparse.Namespace,
+    artifact_dir: Optional[str] = None,
+    top_k: int = 3,
+) -> Optional[Any]:
+    """
+    Run similar-day retrieval using the future CSV and export Top-K curves.
+    The artifact directory follows the selected weather H5, so both 1h and 15min
+    weather sources can use their own retrieval databases.
+    """
+    print("\n" + "=" * 60)
+    print(f"[similar-day] retrieve from future csv: {future_path}")
+    print("=" * 60)
+
+    abs_future_path = os.path.abspath(future_path)
+    if not os.path.exists(abs_future_path):
+        print(f"[similar-day] future csv not found, skip: {abs_future_path}")
+        return None
+
+    try:
+        from similar_day_retriever import (
+            SimilarDayRetriever,
+            print_retrieval_result,
+            resolve_retriever_runtime_paths,
+        )
+    except Exception as exc:
+        print(f"[similar-day] import failed, skip: {exc}")
+        return None
+
+    try:
+        weather_h5_path = _resolve_primary_weather_h5_path(args)
+        _, resolved_artifact_dir, _, _ = resolve_retriever_runtime_paths(
+            weather_h5_path=weather_h5_path,
+            artifact_dir=artifact_dir,
+        )
+    except Exception as exc:
+        print(f"[similar-day] resolve runtime paths failed, skip: {exc}")
+        return None
+
+    resolved_artifact_dir = os.path.abspath(str(resolved_artifact_dir))
+    if not os.path.isdir(resolved_artifact_dir):
+        print(f"[similar-day] artifact dir not found, skip: {resolved_artifact_dir}")
+        return None
+
+    try:
+        retriever = SimilarDayRetriever.load(resolved_artifact_dir)
+        result = retriever.search_from_future_csv(abs_future_path, top_k=int(top_k))
+    except Exception as exc:
+        print(f"[similar-day] retrieval failed, skip: {exc}")
+        return None
+
+    print(f"[similar-day] weather_h5: {weather_h5_path}")
+    print(f"[similar-day] artifact_dir: {resolved_artifact_dir}")
+    print_retrieval_result(result)
+    plot_similar_day_curves(
+        results_dir=results_dir,
+        retrieval_result=result,
+        out_name="similar_day_retrieval.png",
+        csv_name="similar_day_retrieval.csv",
+        json_name="similar_day_retrieval.json",
+        title_prefix=(
+            f"Similar-Day Load Retrieval "
+            f"({getattr(args, 'weather_source', 'weather')} / "
+            f"{getattr(args, 'weather_step_freq', 'native')})"
+        ),
+        y_label="Load (MW)",
+        freq=getattr(args, "freq", LOAD_FREQ),
+    )
+    return result
 
 
 def validate_quantile(model, data_loader, criterion, args, device, use_amp=False):
@@ -728,31 +815,6 @@ def main():
             print(f"\n>>> Start testing {setting}")
             # 在独立测试集上计算 MSE/MAE 以及各分位数覆盖表现
             results_dir = test_quantile_model(model, args, device, weather_store)
-
-            # 绘制测试集真实值与 P50 预测及其置信区间 (P10-P90) 的对比图
-            plot_pred_vs_true(
-                results_dir,
-                use_inverse=INVERSE_EVAL,
-                quantiles=args.quantiles,
-                title_prefix="Full-Map Conv + TimeXer Prediction",
-                y_label="Load (MW)",
-            )
-            
-            # 使用 future.csv 指引的时间线，调取对应时刻的气象格点做未来 24-96 小时的外推预测
-            predict_future_load_from_csv(
-                model=model,
-                args=args,
-                device=device,
-                weather_store=weather_store,
-                results_dir=results_dir,
-                future_path=FUTURE_PATH,
-                steps=PRED_LEN,
-                use_inverse=INVERSE_EVAL,
-                quantiles=args.quantiles,
-                data_provider_fn=weather_data_provider,
-                model_label="Full-Map Conv + TimeXer",
-                y_label="Load (MW)",
-            )
         else:
             # ==================== 仅推理/测试模式分支 ====================
             # 用于加载已训练好的成品模型，直接进行测试或部署应用
@@ -768,30 +830,35 @@ def main():
             print(f"\n>>> Test only {setting}")
             results_dir = test_quantile_model(model, args, device, weather_store)
 
-            # 同样生成可视化图表
-            plot_pred_vs_true(
-                results_dir,
-                use_inverse=INVERSE_EVAL,
-                quantiles=args.quantiles,
-                title_prefix="Full-Map Conv + TimeXer Prediction",
-                y_label="Load (MW)",
-            )
-            
-            # 执行外推预测
-            predict_future_load_from_csv(
-                model=model,
-                args=args,
-                device=device,
-                weather_store=weather_store,
-                results_dir=results_dir,
-                future_path=FUTURE_PATH,
-                steps=PRED_LEN,
-                use_inverse=INVERSE_EVAL,
-                quantiles=args.quantiles,
-                data_provider_fn=weather_data_provider,
-                model_label="Full-Map Conv + TimeXer",
-                y_label="Load (MW)",
-            )
+        plot_pred_vs_true(
+            results_dir,
+            use_inverse=INVERSE_EVAL,
+            quantiles=args.quantiles,
+            title_prefix="Full-Map Conv + TimeXer Prediction",
+            y_label="Load (MW)",
+        )
+        similar_day_result = export_similar_day_baseline(
+            results_dir=results_dir,
+            future_path=FUTURE_PATH,
+            args=args,
+            artifact_dir=SIMILAR_DAY_ARTIFACT_DIR,
+            top_k=SIMILAR_DAY_TOP_K,
+        )
+        predict_future_load_from_csv(
+            model=model,
+            args=args,
+            device=device,
+            weather_store=weather_store,
+            results_dir=results_dir,
+            future_path=FUTURE_PATH,
+            steps=PRED_LEN,
+            use_inverse=INVERSE_EVAL,
+            quantiles=args.quantiles,
+            data_provider_fn=weather_data_provider,
+            model_label="Full-Map Conv + TimeXer",
+            y_label="Load (MW)",
+            similar_day_result=similar_day_result,
+        )
     finally:
         # ==================== 资源释放 ====================
         # 显式关闭 HDF5 文件句柄，防止多进程下出现文件锁定异常
@@ -803,3 +870,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

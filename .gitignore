@@ -6,6 +6,7 @@ checkpoints/
 checkpoints_quantile/
 results/
 data/
+artifacts/
 *.pt
 *.pth
 *.npz
