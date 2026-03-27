@@ -6,6 +6,7 @@ forecast_visualization.py - 预测结果可视化与未来预测工具模块
 """
 
 import copy
+import inspect
 import json
 import os
 from typing import Any, Callable, Optional, Sequence
@@ -18,6 +19,7 @@ import torch
 
 from utils.metrics import cal_eval
 from utils.timefeatures import time_features
+from utils.weather_e2e import build_weather_sequence_timestamps
 
 
 def _configure_matplotlib_cjk_font() -> None:
@@ -438,8 +440,34 @@ def predict_future_load_from_csv(
     hist_load_scaled = ref_data.scale_target(hist_load)
 
     # 准备气象特征：涵盖历史窗口与未来预测窗口，共 seq_len + pred_len 步
-    all_dates = np.concatenate([hist_dates, future_dates])
-    hist_weather = weather_store.fetch_frames_by_dates(all_dates)
+    weather_freq = getattr(args, "weather_step_freq", None)
+    if weather_freq is None and getattr(weather_store, "native_freq", None) is not None:
+        weather_freq = weather_store.native_freq
+    weather_seq_len = int(getattr(args, "weather_seq_len", args.seq_len + args.pred_len))
+    weather_history_len = int(getattr(args, "weather_history_len", args.seq_len))
+    weather_mark_freq = (
+        getattr(args, "weather_mark_freq", None)
+        or getattr(args, "weather_step_freq", None)
+        or args.freq
+    )
+    reference_weather_timestamps_ns = None
+    if hasattr(weather_store, "sources"):
+        candidate_timestamps = [
+            np.asarray(source.get("timestamps_ns"), dtype=np.int64)
+            for source in getattr(weather_store, "sources", [])
+            if source.get("timestamps_ns") is not None
+        ]
+        if candidate_timestamps:
+            reference_weather_timestamps_ns = np.concatenate(candidate_timestamps, axis=0)
+
+    weather_dates = build_weather_sequence_timestamps(
+        target_start=pd.Timestamp(future_dates[0]),
+        weather_seq_len=weather_seq_len,
+        weather_history_len=weather_history_len,
+        weather_freq=weather_freq,
+        reference_timestamps_ns=reference_weather_timestamps_ns,
+    )
+    hist_weather = weather_store.fetch_frames_by_dates(weather_dates)
     
     # 如果模型启用了相似日先验且提供了检索结果，则构建先验张量
     similar_day_prior_tensor = None
@@ -456,7 +484,10 @@ def predict_future_load_from_csv(
     # 内生变量标记仅针对历史窗口
     x_mark_np = time_features(pd.to_datetime(hist_dates), freq=args.freq).transpose(1, 0).astype(np.float32)
     # 外生变量标记针对全部窗口 (历史 + 未来)
-    exo_mark_np = time_features(pd.to_datetime(all_dates), freq=args.freq).transpose(1, 0).astype(np.float32)
+    exo_mark_np = time_features(
+        pd.to_datetime(weather_dates.values),
+        freq=weather_mark_freq,
+    ).transpose(1, 0).astype(np.float32)
 
     # 切换模型为评估模式，并禁用梯度计算
     model.eval()
@@ -472,13 +503,20 @@ def predict_future_load_from_csv(
         batch_weather_x = torch.as_tensor(hist_weather, dtype=torch.float32, device=device).unsqueeze(0)
 
         # 执行模型前向传播，得到分位数预测结果
-        outputs = model(
-            load_x=batch_x,
-            x_mark_enc=batch_x_mark,
-            x_exo_mark=batch_exo_mark,
-            weather_x=batch_weather_x,
-            similar_day_prior=similar_day_prior_tensor,
-        )
+        model_kwargs = {
+            "load_x": batch_x,
+            "x_mark_enc": batch_x_mark,
+            "x_exo_mark": batch_exo_mark,
+            "weather_x": batch_weather_x,
+        }
+        forward_params = inspect.signature(model.forward).parameters
+        if (
+            similar_day_prior_tensor is not None
+            and "similar_day_prior" in forward_params
+        ):
+            model_kwargs["similar_day_prior"] = similar_day_prior_tensor
+
+        outputs = model(**model_kwargs)
 
     # 处理模型输出，维度为 [1, pred_len, n_quantiles]
     quantile_scaled = outputs[0, : args.pred_len, :].detach().cpu().numpy()

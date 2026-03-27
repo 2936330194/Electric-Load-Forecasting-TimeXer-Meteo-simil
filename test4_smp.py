@@ -66,19 +66,19 @@ FEATURES = "MS"  # 多变量输入、单变量输出
 SEQ_LEN = 96 * 7  # 输入历史长度：7 天
 LABEL_LEN = 0  # 解码端已知标签长度
 PRED_LEN = 96  # 预测长度：1 天
-LOAD_FREQ = "15min"  # 负荷序列采样频率
+LOAD_FREQ = "15min"  # 负荷序列采样频率 "15min"
 
 
 # ==================== Full-Map Conv 气象配置 ====================
 WEATHER_SOURCE_CONFIGS = {
     "15min": [
-        ("./data/hunan_grid_2024_filtered_15min.h5", "2024-01-01 00:00:00", "15min"),
+        ("./data/hunan_grid_2024_2025_filtered_15min.h5", "2024-01-01 00:00:00", "15min"),
     ],
     "1h": [
         ("./data/hunan_grid_2024_2025_filtered.h5", "2024-01-01 00:00:00", "1h"),
     ],
 }  # (气象HDF5路径, 文件起始时间, 时间分辨率)
-DEFAULT_WEATHER_SOURCE = "15min"
+DEFAULT_WEATHER_SOURCE = "1h"     # "15min"
 WEATHER_IN_CHANNELS = 5  # 气象变量通道数
 WEATHER_GRID_HEIGHT = 62  # 气象网格高度
 WEATHER_GRID_WIDTH = 61  # 气象网格宽度
@@ -121,7 +121,7 @@ GPU = 0  # 使用的 GPU 编号
 DES = "Exp"  # 实验描述后缀
 ITR = 1  # 实验重复次数
 INVERSE_EVAL = True  # 评估时是否反标准化
-TRAIN_MODE = True  # True 为训练+测试，False 为仅加载测试
+TRAIN_MODE = False  # True 为训练+测试，False 为仅加载测试
 
 
 # ==================== 数据通路配置 ====================
