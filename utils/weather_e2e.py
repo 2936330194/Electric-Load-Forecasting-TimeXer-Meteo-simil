@@ -16,6 +16,59 @@ from models.TimeXer import Model as TimeXer
 from utils.timefeatures import time_features
 
 
+def _build_similar_day_prior_features(
+    load_curves: np.ndarray,
+    similarity_scores: Sequence[float],
+    pred_len: int,
+    top_k: int,
+    shift_steps: int = 0,
+) -> np.ndarray:
+    """
+    将检索得到的 Top-K 相似日负荷曲线整理为 [pred_len, top_k + 1] 的先验矩阵。
+    第 0 列为按相似度 Softmax 融合后的加权先验，其余列为逐条相似日曲线。
+    """
+    pred_len = int(pred_len)
+    top_k = int(top_k)
+    shift_steps = int(shift_steps) % max(1, pred_len)
+
+    prior_curves = np.zeros((top_k, pred_len), dtype=np.float32)
+    weighted_prior = np.zeros((pred_len,), dtype=np.float32)
+
+    curves = np.asarray(load_curves, dtype=np.float32)
+    if curves.ndim == 1:
+        curves = curves.reshape(1, -1)
+
+    if curves.ndim == 2 and curves.size > 0:
+        usable = min(top_k, curves.shape[0])
+        for idx in range(usable):
+            curve = curves[idx]
+            if curve.shape[0] < pred_len:
+                padded = np.zeros((pred_len,), dtype=np.float32)
+                padded[: curve.shape[0]] = curve
+                curve = padded
+            else:
+                curve = curve[:pred_len]
+            prior_curves[idx] = np.roll(curve.astype(np.float32, copy=False), -shift_steps)
+
+        scores = np.asarray(similarity_scores[:usable], dtype=np.float32)
+        if scores.size > 0:
+            scores = scores - np.max(scores)
+            weights = np.exp(scores).astype(np.float32, copy=False)
+            weight_sum = float(np.sum(weights))
+            if weight_sum > 0:
+                weights = weights / weight_sum
+                weighted_prior = np.sum(
+                    prior_curves[:usable] * weights[:, None],
+                    axis=0,
+                    dtype=np.float32,
+                )
+
+    return np.concatenate(
+        [weighted_prior[:, None], prior_curves.transpose(1, 0)],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
 def _require_weather_runtime() -> None:
     """
     检查处理气象数据所需的运行时环境。
@@ -1055,6 +1108,9 @@ class FullMapConvTimeXerQuantile(nn.Module):
         self.weather_feature_dim = int(configs.weather_feature_dim)
         # 分块编码大小，防止显存溢出
         self.encode_chunk_size = int(getattr(configs, "weather_encode_chunk_size", 512))
+        self.use_similar_day_prior = bool(getattr(configs, "use_similar_day_prior", False))
+        self.similar_day_top_k = int(getattr(configs, "similar_day_top_k", 3))
+        self.similar_day_prior_dim = self.similar_day_top_k + 1 if self.use_similar_day_prior else 0
         
         # 1. 初始化气象特征提取器（Backbone）
         self.weather_backbone = FullMapWeatherConvExtractor(
@@ -1072,6 +1128,26 @@ class FullMapConvTimeXerQuantile(nn.Module):
         
         # 2. 初始化预测主干模型 (TimeXer)
         self.timexer = TimeXer(configs)
+
+        if self.use_similar_day_prior:
+            fusion_hidden_dim = int(
+                getattr(
+                    configs,
+                    "similar_day_fusion_hidden_dim",
+                    max(16, int(getattr(configs, "d_model", 128)) // 4),
+                )
+            )
+            self.similar_day_fusion_head = nn.Sequential(
+                nn.Linear(1 + self.similar_day_prior_dim, fusion_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(float(getattr(configs, "dropout", 0.1))),
+                nn.Linear(fusion_hidden_dim, 1),
+            )
+            with torch.no_grad():
+                nn.init.zeros_(self.similar_day_fusion_head[-1].weight)
+                nn.init.zeros_(self.similar_day_fusion_head[-1].bias)
+        else:
+            self.similar_day_fusion_head = None
         
         # 3. 初始化分位数回归头：将点预测投影到多个分位数平面
         self.quantile_head = nn.Linear(1, self.n_quantiles)
@@ -1137,6 +1213,7 @@ class FullMapConvTimeXerQuantile(nn.Module):
         x_exo_mark: torch.Tensor,
         weather_x: torch.Tensor,
         weather_x_index: Optional[torch.Tensor] = None,
+        similar_day_prior: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -1158,6 +1235,24 @@ class FullMapConvTimeXerQuantile(nn.Module):
         
         # 3. 截取预测窗口并应用分位数回归头
         point_pred = point_pred[:, -self.timexer.pred_len :, :]
+        if self.use_similar_day_prior and similar_day_prior is not None:
+            if similar_day_prior.ndim != 3:
+                raise ValueError(
+                    f"similar_day_prior 期望形状为 [B, pred_len, {self.similar_day_prior_dim}]，"
+                    f"实际得到 {tuple(similar_day_prior.shape)}"
+                )
+            if similar_day_prior.shape[1] != self.timexer.pred_len:
+                raise ValueError(
+                    f"similar_day_prior 的时间长度与 pred_len 不一致: "
+                    f"{similar_day_prior.shape[1]} vs {self.timexer.pred_len}"
+                )
+            if similar_day_prior.shape[2] != self.similar_day_prior_dim:
+                raise ValueError(
+                    f"similar_day_prior 的特征维度不一致: "
+                    f"{similar_day_prior.shape[2]} vs {self.similar_day_prior_dim}"
+                )
+            fusion_input = torch.cat([point_pred, similar_day_prior.float()], dim=-1)
+            point_pred = point_pred + self.similar_day_fusion_head(fusion_input)
         return self.quantile_head(point_pred)
 
 
@@ -1198,6 +1293,15 @@ class LoadWeatherEndToEndDataset(Dataset):
         self.weather_store = weather_store
         
         self.load_freq = _ensure_timedelta(self.freq)
+        self.use_similar_day_prior = bool(getattr(args, "use_similar_day_prior", False))
+        self.similar_day_top_k = int(getattr(args, "similar_day_top_k", 3))
+        similar_day_artifact_dir = getattr(args, "similar_day_artifact_dir", None)
+        self.similar_day_artifact_dir = (
+            None if similar_day_artifact_dir in (None, "") else os.path.abspath(str(similar_day_artifact_dir))
+        )
+        self._resolved_similar_day_artifact_dir: Optional[str] = None
+        self.similar_day_prior_cache: Optional[np.ndarray] = None
+
         # 预计算相对偏移数组，用于后续快速切片
         self.seq_offsets = np.arange(self.seq_len, dtype=np.int64)
         self.target_offsets = (
@@ -1272,6 +1376,8 @@ class LoadWeatherEndToEndDataset(Dataset):
         self.weather_cache: Optional[np.ndarray] = None
 
         self.__read_data__()
+        if self.use_similar_day_prior:
+            self._build_similar_day_prior_cache()
 
     def __read_data__(self) -> None:
         """
@@ -1406,6 +1512,129 @@ class LoadWeatherEndToEndDataset(Dataset):
             f"未来={self.weather_future_len}"
         )
 
+    def _resolve_primary_weather_h5_path(self) -> str:
+        weather_h5_specs = getattr(self.args, "weather_h5_specs", None)
+        if weather_h5_specs:
+            return os.path.abspath(str(weather_h5_specs[0][0]))
+        if getattr(self.weather_store, "sources", None):
+            return os.path.abspath(str(self.weather_store.sources[0]["path"]))
+        raise ValueError("无法解析当前数据集绑定的天气 H5 路径。")
+
+    def _resolve_similar_day_artifact_dir(self) -> str:
+        if self._resolved_similar_day_artifact_dir is not None:
+            return self._resolved_similar_day_artifact_dir
+        if self.similar_day_artifact_dir is not None:
+            artifact_dir = self.similar_day_artifact_dir
+        else:
+            try:
+                from similar_day_retriever import resolve_retriever_runtime_paths
+            except Exception as exc:
+                raise ImportError(f"导入 similar_day_retriever 失败，无法自动解析相似日特征库: {exc}") from exc
+            weather_h5_path = self._resolve_primary_weather_h5_path()
+            _, resolved_artifact_dir, _, _ = resolve_retriever_runtime_paths(weather_h5_path=weather_h5_path)
+            artifact_dir = os.path.abspath(str(resolved_artifact_dir))
+        self._resolved_similar_day_artifact_dir = artifact_dir
+        return artifact_dir
+
+    def _build_similar_day_prior_cache(self) -> None:
+        sample_count = len(self)
+        feature_dim = self.similar_day_top_k + 1
+        self.similar_day_prior_cache = np.zeros(
+            (sample_count, self.pred_len, feature_dim),
+            dtype=np.float32,
+        )
+        if sample_count <= 0:
+            return
+        if self.raw_dates is None:
+            raise RuntimeError("raw_dates 不可用，无法构建相似日先验。")
+
+        artifact_dir = self._resolve_similar_day_artifact_dir()
+        if not os.path.isdir(artifact_dir):
+            raise FileNotFoundError(f"相似日特征库目录不存在: {artifact_dir}")
+
+        try:
+            from similar_day_retriever import HDF5WeatherSequenceStore, SimilarDayRetriever
+        except Exception as exc:
+            raise ImportError(f"加载 similar_day_retriever 失败: {exc}") from exc
+
+        retriever = SimilarDayRetriever.load(artifact_dir)
+        if retriever.weather_h5_path is None:
+            raise RuntimeError("相似日检索库中缺少 weather_h5_path 元信息。")
+
+        query_positions = np.arange(sample_count, dtype=np.int64) + self.seq_len
+        query_timestamps = pd.DatetimeIndex(self.raw_dates.iloc[query_positions].to_numpy())
+        query_anchor_days = query_timestamps.normalize()
+        unique_anchor_days = pd.DatetimeIndex(pd.unique(query_anchor_days)).sort_values()
+        freq_ns = int(self.load_freq.value)
+
+        print(
+            f"[dataset-{self.set_type}] 正在计算相似日先验: "
+            f"样本数={sample_count}, 按天去重查询数={len(unique_anchor_days)}, top_k={self.similar_day_top_k}"
+        )
+        print(
+            f"[dataset-{self.set_type}] similar-day artifact: {artifact_dir} | "
+            f"weather_h5={retriever.weather_h5_path}"
+        )
+        t0 = time.time()
+        anchor_cache: Dict[int, Dict[str, object]] = {}
+        weather_store = HDF5WeatherSequenceStore(retriever.weather_h5_path)
+        try:
+            total_anchors = len(unique_anchor_days)
+            for anchor_idx, anchor_day in enumerate(unique_anchor_days, start=1):
+                result = retriever.search_by_timestamp(
+                    query_timestamp=anchor_day,
+                    top_k=self.similar_day_top_k,
+                    weather_store=weather_store,
+                    history_end_timestamp_exclusive=anchor_day,
+                )
+                curves = np.asarray(result.load_curves, dtype=np.float32)
+                if curves.ndim == 1:
+                    curves = curves.reshape(1, -1)
+                if curves.ndim == 2 and curves.size > 0:
+                    curves = curves[:, : self.pred_len]
+                    curves = self.scale_target(curves.reshape(-1, 1)).reshape(curves.shape[0], curves.shape[1])
+                else:
+                    curves = np.empty((0, self.pred_len), dtype=np.float32)
+
+                anchor_cache[int(anchor_day.value)] = {
+                    "query_timestamp": pd.Timestamp(result.query_timestamp),
+                    "curves": curves.astype(np.float32, copy=False),
+                    "scores": np.asarray(result.similarity_scores, dtype=np.float32),
+                }
+
+                if (
+                    anchor_idx == 1
+                    or anchor_idx == total_anchors
+                    or anchor_idx % max(1, total_anchors // 8) == 0
+                ):
+                    print(
+                        f"[dataset-{self.set_type}] 相似日锚点构建进度 {anchor_idx}/{total_anchors}: "
+                        f"{pd.Timestamp(anchor_day)}"
+                    )
+        finally:
+            weather_store.close()
+
+        for sample_idx, (query_ts, anchor_day) in enumerate(zip(query_timestamps, query_anchor_days), start=0):
+            cache_item = anchor_cache.get(int(anchor_day.value))
+            if cache_item is None:
+                continue
+            anchor_start_ts = pd.Timestamp(cache_item["query_timestamp"])
+            shift_steps = int((pd.Timestamp(query_ts).value - anchor_start_ts.value) // freq_ns) % self.pred_len
+            self.similar_day_prior_cache[sample_idx] = _build_similar_day_prior_features(
+                load_curves=np.asarray(cache_item["curves"], dtype=np.float32),
+                similarity_scores=np.asarray(cache_item["scores"], dtype=np.float32),
+                pred_len=self.pred_len,
+                top_k=self.similar_day_top_k,
+                shift_steps=shift_steps,
+            )
+
+        mem_mb = self.similar_day_prior_cache.nbytes / (1024 ** 2)
+        print(
+            f"[dataset-{self.set_type}] 相似日先验缓存就绪: "
+            f"shape={self.similar_day_prior_cache.shape}, 占用内存={mem_mb:.1f} MB, "
+            f"耗时={time.time() - t0:.1f}s"
+        )
+
     def __getitem__(self, index: int):
         """
         这里返回索引，具体的数据构筑由 build_overlap_batch 或 Collator 完成。
@@ -1419,7 +1648,7 @@ class LoadWeatherEndToEndDataset(Dataset):
     def build_overlap_batch(
         self,
         batch_indices: Sequence[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         """
         高效批次构筑函数。
         
@@ -1455,6 +1684,13 @@ class LoadWeatherEndToEndDataset(Dataset):
         
         # 2. 气象标记特征提取
         batch_exo_mark = torch.from_numpy(np.ascontiguousarray(self.weather_stamp[weather_positions]))
+        similar_day_prior = None
+        if self.use_similar_day_prior:
+            if self.similar_day_prior_cache is None:
+                raise RuntimeError("similar_day_prior_cache 尚未构建。")
+            similar_day_prior = torch.from_numpy(
+                np.ascontiguousarray(self.similar_day_prior_cache[indices])
+            )
         
         # 3. 气象帧池化优化 (Pool & Index)
         # 获取 Batch 内请求的所有互异气象点
@@ -1466,6 +1702,16 @@ class LoadWeatherEndToEndDataset(Dataset):
             np.ascontiguousarray(inverse.reshape(len(indices), self.weather_seq_len))
         )
         
+        if similar_day_prior is not None:
+            return (
+                batch_x,
+                batch_y,
+                batch_x_mark,
+                batch_exo_mark,
+                weather_frames,
+                weather_index,
+                similar_day_prior,
+            )
         return batch_x, batch_y, batch_x_mark, batch_exo_mark, weather_frames, weather_index
 
     def scale_target(self, data: np.ndarray) -> np.ndarray:
@@ -1535,7 +1781,7 @@ class OverlapAwareBatchCollator:
     def __call__(
         self,
         batch: Sequence[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         # 委托数据集执行复杂的 Batch 构筑逻辑
         return self.dataset.build_overlap_batch(batch)
 
@@ -1612,6 +1858,7 @@ __all__ = [
     "LoadWeatherEndToEndDataset",
     "OverlapAwareBatchCollator",
     "WeatherGridStore",
+    "_build_similar_day_prior_features",
     "build_weather_sequence_timestamps",
     "infer_weather_history_len",
     "weather_data_provider",
