@@ -60,7 +60,10 @@ class QuantileLoss(nn.Module):
         errors = targets - predictions
         
         # 将分位数张量转换为与预测值相同的数据类型
-        quantiles_tensor = self.quantiles_tensor.to(dtype=predictions.dtype)
+        quantiles_tensor = self.quantiles_tensor.to(
+            device=predictions.device,
+            dtype=predictions.dtype,
+        )
         
         # Pinball Loss 核心计算：
         # 对于误差 > 0 (真实值大于预测值)，损失贡献为 q * errors
@@ -69,4 +72,3 @@ class QuantileLoss(nn.Module):
         losses = torch.max(quantiles_tensor * errors, (quantiles_tensor - 1.0) * errors)
         
         return losses.mean()
-

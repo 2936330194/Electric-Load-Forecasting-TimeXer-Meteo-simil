@@ -200,6 +200,26 @@ def _load_ordered_dataframe(csv_path: str, target: str) -> pd.DataFrame:
     return df[["date"] + other_cols + [target]]
 
 
+def _scale_target_generic(ref_data: Any, data: np.ndarray) -> np.ndarray:
+    if hasattr(ref_data, "scale_target"):
+        return ref_data.scale_target(data)
+    scaler = getattr(ref_data, "scaler", None)
+    if scaler is not None and hasattr(scaler, "transform"):
+        return scaler.transform(data)
+    return data
+
+
+def _inverse_transform_target_generic(ref_data: Any, data: np.ndarray) -> np.ndarray:
+    if hasattr(ref_data, "inverse_transform_target"):
+        return ref_data.inverse_transform_target(data)
+    if hasattr(ref_data, "inverse_transform"):
+        return ref_data.inverse_transform(data)
+    scaler = getattr(ref_data, "scaler", None)
+    if scaler is not None and hasattr(scaler, "inverse_transform"):
+        return scaler.inverse_transform(data)
+    return data
+
+
 def plot_pred_vs_true(
     results_dir: str,
     feat_idx: int = 0,
@@ -341,7 +361,7 @@ def predict_future_load_from_csv(
     model,
     args,
     device,
-    weather_store: Any,
+    weather_store: Optional[Any],
     results_dir: str,
     future_path: str,
     steps: int,
@@ -429,7 +449,10 @@ def predict_future_load_from_csv(
     ref_args = copy.copy(args)
     if hasattr(ref_args, "use_similar_day_prior"):
         ref_args.use_similar_day_prior = False
-    ref_data, _ = data_provider_fn(ref_args, "train", weather_store)
+    if weather_store is None:
+        ref_data, _ = data_provider_fn(ref_args, "train")
+    else:
+        ref_data, _ = data_provider_fn(ref_args, "train", weather_store)
 
     # 提取时间轴：seq_len 长度的历史日期 + pred_len 长度的未来日期
     hist_dates = pd.to_datetime(history_df["date"].iloc[-args.seq_len :].values)
@@ -437,37 +460,41 @@ def predict_future_load_from_csv(
     
     # 提取历史负荷并进行归一化
     hist_load = history_df[args.target].iloc[-args.seq_len :].values.astype(np.float32).reshape(-1, 1)
-    hist_load_scaled = ref_data.scale_target(hist_load)
+    hist_load_scaled = _scale_target_generic(ref_data, hist_load)
 
     # 准备气象特征：涵盖历史窗口与未来预测窗口，共 seq_len + pred_len 步
-    weather_freq = getattr(args, "weather_step_freq", None)
-    if weather_freq is None and getattr(weather_store, "native_freq", None) is not None:
-        weather_freq = weather_store.native_freq
-    weather_seq_len = int(getattr(args, "weather_seq_len", args.seq_len + args.pred_len))
-    weather_history_len = int(getattr(args, "weather_history_len", args.seq_len))
-    weather_mark_freq = (
-        getattr(args, "weather_mark_freq", None)
-        or getattr(args, "weather_step_freq", None)
-        or args.freq
-    )
-    reference_weather_timestamps_ns = None
-    if hasattr(weather_store, "sources"):
-        candidate_timestamps = [
-            np.asarray(source.get("timestamps_ns"), dtype=np.int64)
-            for source in getattr(weather_store, "sources", [])
-            if source.get("timestamps_ns") is not None
-        ]
-        if candidate_timestamps:
-            reference_weather_timestamps_ns = np.concatenate(candidate_timestamps, axis=0)
+    weather_dates = None
+    hist_weather = None
+    weather_mark_freq = None
+    if weather_store is not None:
+        weather_freq = getattr(args, "weather_step_freq", None)
+        if weather_freq is None and getattr(weather_store, "native_freq", None) is not None:
+            weather_freq = weather_store.native_freq
+        weather_seq_len = int(getattr(args, "weather_seq_len", args.seq_len + args.pred_len))
+        weather_history_len = int(getattr(args, "weather_history_len", args.seq_len))
+        weather_mark_freq = (
+            getattr(args, "weather_mark_freq", None)
+            or getattr(args, "weather_step_freq", None)
+            or args.freq
+        )
+        reference_weather_timestamps_ns = None
+        if hasattr(weather_store, "sources"):
+            candidate_timestamps = [
+                np.asarray(source.get("timestamps_ns"), dtype=np.int64)
+                for source in getattr(weather_store, "sources", [])
+                if source.get("timestamps_ns") is not None
+            ]
+            if candidate_timestamps:
+                reference_weather_timestamps_ns = np.concatenate(candidate_timestamps, axis=0)
 
-    weather_dates = build_weather_sequence_timestamps(
-        target_start=pd.Timestamp(future_dates[0]),
-        weather_seq_len=weather_seq_len,
-        weather_history_len=weather_history_len,
-        weather_freq=weather_freq,
-        reference_timestamps_ns=reference_weather_timestamps_ns,
-    )
-    hist_weather = weather_store.fetch_frames_by_dates(weather_dates)
+        weather_dates = build_weather_sequence_timestamps(
+            target_start=pd.Timestamp(future_dates[0]),
+            weather_seq_len=weather_seq_len,
+            weather_history_len=weather_history_len,
+            weather_freq=weather_freq,
+            reference_timestamps_ns=reference_weather_timestamps_ns,
+        )
+        hist_weather = weather_store.fetch_frames_by_dates(weather_dates)
     
     # 如果模型启用了相似日先验且提供了检索结果，则构建先验张量
     similar_day_prior_tensor = None
@@ -484,10 +511,12 @@ def predict_future_load_from_csv(
     # 内生变量标记仅针对历史窗口
     x_mark_np = time_features(pd.to_datetime(hist_dates), freq=args.freq).transpose(1, 0).astype(np.float32)
     # 外生变量标记针对全部窗口 (历史 + 未来)
-    exo_mark_np = time_features(
-        pd.to_datetime(weather_dates.values),
-        freq=weather_mark_freq,
-    ).transpose(1, 0).astype(np.float32)
+    exo_mark_np = None
+    if weather_dates is not None:
+        exo_mark_np = time_features(
+            pd.to_datetime(weather_dates.values),
+            freq=weather_mark_freq,
+        ).transpose(1, 0).astype(np.float32)
 
     # 切换模型为评估模式，并禁用梯度计算
     model.eval()
@@ -799,6 +828,285 @@ def plot_similar_day_curves(
     print(f"已保存相似日检索数据 (CSV): {out_csv}")
     print(f"已保存相似日检索元信息 (JSON): {out_json}")
     print(f"已保存相似日检索图表 (Figure): {out_fig}")
+
+
+def predict_future_load_from_csv(
+    model,
+    args,
+    device,
+    weather_store: Optional[Any],
+    results_dir: str,
+    future_path: str,
+    steps: int,
+    use_inverse: bool = True,
+    quantiles: Optional[Sequence[float]] = None,
+    data_provider_fn: Optional[Callable[..., Any]] = None,
+    model_label: str = "Forecast",
+    y_label: str = "Load (MW)",
+    similar_day_result: Optional[Any] = None,
+) -> None:
+    """Unified future-forecast utility for both plain TimeXer and weather-enhanced variants."""
+    if quantiles is None:
+        raise ValueError("quantiles must be provided.")
+    if data_provider_fn is None:
+        raise ValueError("data_provider_fn must be provided.")
+
+    p10_idx = _find_quantile_index(quantiles, 0.1)
+    p50_idx = _find_quantile_index(quantiles, 0.5)
+    p90_idx = _find_quantile_index(quantiles, 0.9)
+    if p50_idx is None:
+        raise ValueError("quantiles must include 0.5 for P50 output.")
+
+    print("\n" + "=" * 60)
+    print(f"Future Forecast: from {future_path}")
+    print("=" * 60)
+
+    abs_future_path = os.path.abspath(future_path)
+    if not os.path.exists(abs_future_path):
+        print(f"Future file not found, skip: {abs_future_path}")
+        return
+
+    history_path = os.path.join(args.root_path, args.data_path)
+    if not os.path.exists(history_path):
+        print(f"History file not found, skip: {history_path}")
+        return
+
+    try:
+        history_df = _load_ordered_dataframe(history_path, args.target)
+        future_df = pd.read_csv(abs_future_path)
+    except Exception as exc:
+        print(f"Load csv failed: {exc}")
+        return
+
+    if "date" not in future_df.columns:
+        print(f"Future file missing date column: {abs_future_path}")
+        return
+    future_df["date"] = pd.to_datetime(future_df["date"])
+    future_df = future_df.sort_values("date").reset_index(drop=True)
+
+    if len(history_df) < args.seq_len:
+        print(f"History length ({len(history_df)}) < seq_len ({args.seq_len}), skip.")
+        return
+
+    predict_steps = min(int(steps), len(future_df), args.pred_len)
+    if predict_steps < args.pred_len:
+        print(f"Future rows ({predict_steps}) < pred_len ({args.pred_len}), skip.")
+        return
+
+    ref_args = copy.copy(args)
+    if hasattr(ref_args, "use_similar_day_prior"):
+        ref_args.use_similar_day_prior = False
+    if weather_store is None:
+        ref_data, _ = data_provider_fn(ref_args, "train")
+    else:
+        ref_data, _ = data_provider_fn(ref_args, "train", weather_store)
+
+    hist_dates = pd.to_datetime(history_df["date"].iloc[-args.seq_len :].values)
+    future_dates = pd.to_datetime(future_df["date"].iloc[: args.pred_len].values)
+    hist_load = history_df[args.target].iloc[-args.seq_len :].values.astype(np.float32).reshape(-1, 1)
+    hist_load_scaled = _scale_target_generic(ref_data, hist_load)
+
+    weather_dates = None
+    hist_weather = None
+    weather_mark_freq = None
+    if weather_store is not None:
+        weather_freq = getattr(args, "weather_step_freq", None)
+        if weather_freq is None and getattr(weather_store, "native_freq", None) is not None:
+            weather_freq = weather_store.native_freq
+        weather_seq_len = int(getattr(args, "weather_seq_len", args.seq_len + args.pred_len))
+        weather_history_len = int(getattr(args, "weather_history_len", args.seq_len))
+        weather_mark_freq = (
+            getattr(args, "weather_mark_freq", None)
+            or getattr(args, "weather_step_freq", None)
+            or args.freq
+        )
+        reference_weather_timestamps_ns = None
+        if hasattr(weather_store, "sources"):
+            candidate_timestamps = [
+                np.asarray(source.get("timestamps_ns"), dtype=np.int64)
+                for source in getattr(weather_store, "sources", [])
+                if source.get("timestamps_ns") is not None
+            ]
+            if candidate_timestamps:
+                reference_weather_timestamps_ns = np.concatenate(candidate_timestamps, axis=0)
+
+        weather_dates = build_weather_sequence_timestamps(
+            target_start=pd.Timestamp(future_dates[0]),
+            weather_seq_len=weather_seq_len,
+            weather_history_len=weather_history_len,
+            weather_freq=weather_freq,
+            reference_timestamps_ns=reference_weather_timestamps_ns,
+        )
+        hist_weather = weather_store.fetch_frames_by_dates(weather_dates)
+
+    similar_day_prior_tensor = None
+    if bool(getattr(model, "use_similar_day_prior", False)) and similar_day_result is not None:
+        similar_day_prior_tensor = _build_future_similar_day_prior_tensor(
+            similar_day_result=similar_day_result,
+            ref_data=ref_data,
+            pred_len=args.pred_len,
+            top_k=int(getattr(model, "similar_day_top_k", getattr(args, "similar_day_top_k", 3))),
+            device=device,
+        )
+
+    x_mark_np = time_features(pd.to_datetime(hist_dates), freq=args.freq).transpose(1, 0).astype(np.float32)
+    exo_mark_np = None
+    if weather_dates is not None:
+        exo_mark_np = time_features(
+            pd.to_datetime(weather_dates.values),
+            freq=weather_mark_freq,
+        ).transpose(1, 0).astype(np.float32)
+
+    model.eval()
+    with torch.inference_mode():
+        batch_x = torch.as_tensor(hist_load_scaled, dtype=torch.float32, device=device).unsqueeze(0)
+        batch_x_mark = torch.as_tensor(x_mark_np, dtype=torch.float32, device=device).unsqueeze(0)
+
+        if weather_store is None:
+            dec_len = args.label_len + args.pred_len
+            dec_inp = torch.zeros((1, dec_len, batch_x.shape[-1]), dtype=torch.float32, device=device)
+            batch_y_mark = torch.zeros((1, dec_len, batch_x_mark.shape[-1]), dtype=torch.float32, device=device)
+            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        else:
+            batch_exo_mark = torch.as_tensor(exo_mark_np, dtype=torch.float32, device=device).unsqueeze(0)
+            batch_weather_x = torch.as_tensor(hist_weather, dtype=torch.float32, device=device).unsqueeze(0)
+            model_kwargs = {
+                "load_x": batch_x,
+                "x_mark_enc": batch_x_mark,
+                "x_exo_mark": batch_exo_mark,
+                "weather_x": batch_weather_x,
+            }
+            forward_params = inspect.signature(model.forward).parameters
+            if (
+                similar_day_prior_tensor is not None
+                and "similar_day_prior" in forward_params
+            ):
+                model_kwargs["similar_day_prior"] = similar_day_prior_tensor
+            outputs = model(**model_kwargs)
+
+    quantile_scaled = outputs[0, : args.pred_len, :].detach().cpu().numpy()
+    p50_scaled = quantile_scaled[:, p50_idx]
+
+    if use_inverse:
+        preds_p50 = _inverse_transform_target_generic(ref_data, p50_scaled.reshape(-1, 1)).reshape(-1)
+        history_target = history_df[args.target].values
+        preds_p10 = (
+            _inverse_transform_target_generic(ref_data, quantile_scaled[:, p10_idx].reshape(-1, 1)).reshape(-1)
+            if p10_idx is not None
+            else None
+        )
+        preds_p90 = (
+            _inverse_transform_target_generic(ref_data, quantile_scaled[:, p90_idx].reshape(-1, 1)).reshape(-1)
+            if p90_idx is not None
+            else None
+        )
+    else:
+        preds_p50 = p50_scaled
+        history_target = hist_load_scaled.reshape(-1)
+        preds_p10 = quantile_scaled[:, p10_idx] if p10_idx is not None else None
+        preds_p90 = quantile_scaled[:, p90_idx] if p90_idx is not None else None
+
+    effective_future_dates = pd.Series(future_dates[:predict_steps])
+    preds_p50 = preds_p50[:predict_steps]
+    if preds_p10 is not None:
+        preds_p10 = preds_p10[:predict_steps]
+    if preds_p90 is not None:
+        preds_p90 = preds_p90[:predict_steps]
+
+    os.makedirs(results_dir, exist_ok=True)
+    out_csv = os.path.join(results_dir, "future_load_prediction.csv")
+    output_payload = {
+        "date": effective_future_dates,
+        f"{args.target}_pred_P50": preds_p50,
+    }
+    if preds_p10 is not None:
+        output_payload[f"{args.target}_pred_P10"] = preds_p10
+    if preds_p90 is not None:
+        output_payload[f"{args.target}_pred_P90"] = preds_p90
+    pd.DataFrame(output_payload).to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    print(f"\nFuture {predict_steps}-step {args.target} predictions:")
+    if preds_p10 is not None and preds_p90 is not None:
+        print(f"{'Time':<25} {'P10':<12} {'P50':<12} {'P90':<12}")
+        print("-" * 65)
+        for i in range(predict_steps):
+            print(
+                f"  {effective_future_dates.iloc[i]}: "
+                f"{preds_p10[i]:<12.4f} {preds_p50[i]:<12.4f} {preds_p90[i]:<12.4f}"
+            )
+    else:
+        print(f"{'Time':<25} {'P50':<12}")
+        print("-" * 40)
+        for i in range(predict_steps):
+            print(f"  {effective_future_dates.iloc[i]}: {preds_p50[i]:<12.4f}")
+
+    n_history = min(args.seq_len, len(history_target))
+    history_tail = history_target[-n_history:]
+    future_x = range(n_history, n_history + predict_steps)
+
+    plt.figure(figsize=(15, 6), facecolor="white")
+    plt.plot(range(n_history), history_tail, label="Historical Load", color="tab:blue", alpha=0.8)
+    plt.plot(
+        future_x,
+        preds_p50,
+        label=f"{model_label} P50 Prediction",
+        color="tab:orange",
+        linewidth=2,
+        marker="o",
+        markersize=2,
+    )
+    if preds_p10 is not None and preds_p90 is not None:
+        plt.fill_between(
+            future_x,
+            preds_p10,
+            preds_p90,
+            alpha=0.25,
+            color="tab:orange",
+            label="P10-P90 Confidence Interval",
+        )
+
+    if similar_day_result is not None:
+        similar_curves = np.asarray(getattr(similar_day_result, "load_curves", []), dtype=np.float32)
+        similar_times = list(getattr(similar_day_result, "historical_timestamps", []))
+        similar_scores = list(getattr(similar_day_result, "similarity_scores", []))
+        if similar_curves.ndim == 1:
+            similar_curves = similar_curves.reshape(1, -1)
+        if similar_curves.ndim == 2 and similar_curves.size > 0:
+            similar_colors = ["tab:red", "tab:green", "tab:purple", "tab:brown", "tab:pink"]
+            for idx, curve in enumerate(similar_curves):
+                curve_steps = min(len(curve), predict_steps)
+                source_time = (
+                    similar_times[idx]
+                    if idx < len(similar_times)
+                    else f"Historical Match #{idx + 1}"
+                )
+                score_text = ""
+                if idx < len(similar_scores):
+                    score_text = f" | sim={float(similar_scores[idx]):.4f}"
+                plt.plot(
+                    range(n_history, n_history + curve_steps),
+                    curve[:curve_steps],
+                    label=f"Similar Day Top {idx + 1} | {source_time}{score_text}",
+                    color=similar_colors[idx % len(similar_colors)],
+                    linewidth=1.8,
+                    linestyle="--",
+                    alpha=0.9,
+                )
+
+    plt.axvline(x=n_history - 0.5, color="gray", linestyle="--", alpha=0.6, label="Prediction Start")
+    plt.legend(loc="upper left")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.title(f"{model_label} Future {predict_steps}-Step Load Prediction")
+    plt.xlabel("Time Step (15min)")
+    plt.ylabel(y_label)
+    plt.tight_layout()
+
+    out_fig = os.path.join(results_dir, "future_load_prediction.png")
+    plt.savefig(out_fig, dpi=600, bbox_inches="tight")
+    plt.show()
+
+    print(f"Saved future prediction csv: {out_csv}")
+    print(f"Saved future prediction figure: {out_fig}")
 
 
 __all__ = [
