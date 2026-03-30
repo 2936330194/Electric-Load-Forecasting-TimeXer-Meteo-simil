@@ -4,7 +4,6 @@ from sklearn.metrics import (
     r2_score,
     mean_squared_error,
     mean_absolute_error,
-    mean_absolute_percentage_error,
 )
 
 
@@ -30,12 +29,30 @@ def RMSE(pred, true):
     return np.sqrt(MSE(pred, true))
 
 
+def _safe_percentage_denominator(true, eps=1e-8):
+    true = np.asarray(true, dtype=np.float64)
+    abs_true = np.abs(true)
+    valid_mask = abs_true > float(eps)
+    safe_denominator = np.where(valid_mask, abs_true, float(eps))
+    return true, valid_mask, safe_denominator
+
+
 def MAPE(pred, true):
-    return np.mean(np.abs((true - pred) / true))
+    pred = np.asarray(pred, dtype=np.float64)
+    true, valid_mask, safe_denominator = _safe_percentage_denominator(true)
+    percentage_error = np.abs(true - pred) / safe_denominator
+    if np.any(valid_mask):
+        return float(np.mean(percentage_error[valid_mask]))
+    return float(np.mean(percentage_error))
 
 
 def MSPE(pred, true):
-    return np.mean(np.square((true - pred) / true))
+    pred = np.asarray(pred, dtype=np.float64)
+    true, valid_mask, safe_denominator = _safe_percentage_denominator(true)
+    squared_percentage_error = np.square((true - pred) / safe_denominator)
+    if np.any(valid_mask):
+        return float(np.mean(squared_percentage_error[valid_mask]))
+    return float(np.mean(squared_percentage_error))
 
 
 def R2(pred, true):
@@ -61,7 +78,7 @@ def cal_eval(y_real: np.ndarray, y_pred: np.ndarray) -> pd.DataFrame:
     mse = mean_squared_error(y_real, y_pred)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(y_real, y_pred)
-    mape = mean_absolute_percentage_error(y_real, y_pred)
+    mape = MAPE(y_pred, y_real)
 
     return pd.DataFrame(
         {"R2": [r2], "MSE": [mse], "RMSE": [rmse], "MAE": [mae], "MAPE": [mape]},

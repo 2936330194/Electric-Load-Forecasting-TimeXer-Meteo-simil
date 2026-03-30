@@ -37,6 +37,17 @@ class EarlyStopping:
         self.delta = delta
 
     def __call__(self, val_loss, model, path):
+        if not np.isfinite(val_loss):
+            self.counter += 1
+            print(
+                f"EarlyStopping received non-finite val_loss={val_loss}; "
+                "skip checkpoint save."
+            )
+            print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return
+
         score = -val_loss
         if self.best_score is None:
             self.best_score = score

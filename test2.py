@@ -48,7 +48,7 @@ P90_IDX = QUANTILES.index(0.9)  # P90 在分位点列表中的位置
 TASK_NAME = "long_term_forecast"  # 任务类型：长时序预测
 MODEL = "TimeXer"  # 主体时序模型名称
 MODEL_ID_PREFIX = "HunanLoad_2024_672"  # 实验标识名前缀，实际会根据天气分辨率动态拼接
-CHECKPOINTS_DIR = "./checkpoints_test2/"
+CHECKPOINTS_DIR = "./checkpoints_test2/" # checkpoints文件夹
 
 
 # ==================== 数据配置 ====================
@@ -584,8 +584,12 @@ def main():
     # 统一初始化随机种子以确保实验结果的可复现性
     fix_seed = 2026
     random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
+    torch.manual_seed(fix_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(fix_seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     cli_args = _parse_cli_args()
     selected_weather_source = cli_args.weather_source

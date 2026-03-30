@@ -78,7 +78,7 @@ WEATHER_SOURCE_CONFIGS = {
         ("./data/hunan_grid_2024_2025_filtered.h5", "2024-01-01 00:00:00", "1h"),
     ],
 }  # (气象HDF5路径, 文件起始时间, 时间分辨率)
-DEFAULT_WEATHER_SOURCE = "1h"     # "15min"
+DEFAULT_WEATHER_SOURCE = "15min"     # "15min"
 WEATHER_IN_CHANNELS = 5  # 气象变量通道数
 WEATHER_GRID_HEIGHT = 62  # 气象网格高度
 WEATHER_GRID_WIDTH = 61  # 气象网格宽度

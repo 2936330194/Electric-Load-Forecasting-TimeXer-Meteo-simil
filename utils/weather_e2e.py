@@ -217,6 +217,19 @@ def _ensure_timedelta(freq: Any) -> pd.Timedelta:
     return pd.Timedelta(freq)
 
 
+def _normalize_reference_timestamps_ns(reference_timestamps_ns: np.ndarray) -> np.ndarray:
+    """
+    Normalize concatenated weather timestamps into a sorted unique 1D array.
+    This keeps searchsorted-based alignment stable when multiple HDF5 files
+    overlap in time.
+    """
+    reference_timestamps_ns = np.asarray(reference_timestamps_ns, dtype=np.int64)
+    reference_timestamps_ns = reference_timestamps_ns.reshape(-1)
+    if reference_timestamps_ns.size == 0:
+        raise ValueError("reference_timestamps_ns must not be empty.")
+    return np.unique(np.sort(reference_timestamps_ns))
+
+
 def _timedelta_to_freq_str(freq: Any) -> str:
     """
     将 pandas.Timedelta 转换为精简的频率字符串格式（如 '1h', '30min', '24d'）。
@@ -282,8 +295,14 @@ def infer_weather_history_len(seq_len: int, load_freq: Any, weather_freq: Any) -
     load_freq = _ensure_timedelta(load_freq)
     weather_freq = _ensure_timedelta(weather_freq)
     
+    seq_len = int(seq_len)
+    if seq_len < 0:
+        raise ValueError(f"seq_len must be non-negative, got {seq_len}.")
+    if seq_len == 0:
+        return 0
+
     # 转换为纳秒进行精确计算
-    load_history_ns = int(seq_len) * int(load_freq.value)
+    load_history_ns = seq_len * int(load_freq.value)
     weather_step_ns = int(weather_freq.value)
     
     history_len, remainder = divmod(load_history_ns, weather_step_ns)
@@ -347,7 +366,7 @@ def build_weather_sequence_timestamps(
 
     # 4. 分支逻辑 B：基于物理时间轴 (HDF5 索引模式)
     # 这种模式下会尽量保证生成的时间戳是 HDF5 文件中真实存在的点，适用于非严格等间隔的观测数据。
-    reference_timestamps_ns = np.asarray(reference_timestamps_ns, dtype=np.int64).reshape(-1)
+    reference_timestamps_ns = _normalize_reference_timestamps_ns(reference_timestamps_ns)
     if reference_timestamps_ns.size == 0:
         raise ValueError("reference_timestamps_ns 不能为空。")
 
@@ -458,7 +477,7 @@ def _build_weather_window_schedule(
         return timeline_ns, window_positions
 
     # 4. 分支分支 B：参考索引对齐模式 (基于 HDF5 时间轴)
-    reference_timestamps_ns = np.asarray(reference_timestamps_ns, dtype=np.int64).reshape(-1)
+    reference_timestamps_ns = _normalize_reference_timestamps_ns(reference_timestamps_ns)
     if reference_timestamps_ns.size == 0:
         raise ValueError("reference_timestamps_ns 不能为空。")
 
