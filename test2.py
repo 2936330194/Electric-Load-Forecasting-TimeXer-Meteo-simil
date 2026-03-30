@@ -107,6 +107,7 @@ BATCH_SIZE = 32  # 训练批大小
 LEARNING_RATE = 1e-4  # 学习率
 PATIENCE = 5  # 早停容忍轮数
 NUM_WORKERS = 0  # DataLoader 进程数
+USE_AMP = False  # 是否开启自动混合精度训练 (AMP)
 
 
 # ==================== 硬件配置 ====================
@@ -118,7 +119,7 @@ GPU = 0  # 使用的 GPU 编号
 DES = "Exp"  # 实验描述后缀
 ITR = 1  # 实验重复次数
 INVERSE_EVAL = True  # 评估时是否反标准化
-TRAIN_MODE = False  # True 为训练+测试，False 为仅加载测试
+TRAIN_MODE = True  # True 为训练+测试，False 为仅加载测试
 
 
 # ==================== 数据通路配置 ====================
@@ -659,7 +660,7 @@ def main():
         lradj="cosine",                   # 学习率调整策略 cosine
 
         # ---------- 硬件加速与 GPU 配置 ----------
-        use_amp=True,                    # 是否开启自动混合精度训练 (AMP)
+        use_amp=USE_AMP,                    # 是否开启自动混合精度训练 (AMP)
         inverse_eval=INVERSE_EVAL,       # 评估指标计算前是否执行反标准化
         use_gpu=USE_GPU,                 # 是否启用 GPU
         gpu=GPU,                         # 使用第几个 GPU 编号

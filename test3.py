@@ -99,6 +99,7 @@ DROPOUT = 0.1  # dropout 比例
 ACTIVATION = "gelu"  # 激活函数
 PATCH_LEN = 96  # TimeXer patch 长度
 USE_NORM = 1  # 是否启用归一化
+USE_AMP = False  # 是否开启自动混合精度训练 (AMP)
 
 
 # ==================== 训练配置 ====================
@@ -666,7 +667,7 @@ def main():
         lradj="cosine",                   # 学习率调整策略 cosine
 
         # ---------- 硬件加速与 GPU 配置 ----------
-        use_amp=True,                    # 是否开启自动混合精度训练 (AMP)
+        use_amp=USE_AMP,                    # 是否开启自动混合精度训练 (AMP)
         inverse_eval=INVERSE_EVAL,       # 评估指标计算前是否执行反标准化
         use_gpu=USE_GPU,                 # 是否启用 GPU
         gpu=GPU,                         # 使用第几个 GPU 编号
