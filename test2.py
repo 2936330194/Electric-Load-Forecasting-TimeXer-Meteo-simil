@@ -30,7 +30,7 @@ from utils.quantile import QuantileLoss
 from utils.weather_e2e import (
     FullMapConvTimeXerQuantile as ExogenousFullMapConvTimeXerQuantile,
     WeatherGridStore,
-     infer_weather_history_len,
+    infer_weather_history_len,
     weather_data_provider,
 )
 from utils.tools import EarlyStopping, adjust_learning_rate
@@ -48,6 +48,7 @@ P90_IDX = QUANTILES.index(0.9)  # P90 在分位点列表中的位置
 TASK_NAME = "long_term_forecast"  # 任务类型：长时序预测
 MODEL = "TimeXer"  # 主体时序模型名称
 MODEL_ID_PREFIX = "HunanLoad_2024_672"  # 实验标识名前缀，实际会根据天气分辨率动态拼接
+CHECKPOINTS_DIR = "./checkpoints_test2/"
 
 
 # ==================== 数据配置 ====================
@@ -74,7 +75,7 @@ WEATHER_SOURCE_CONFIGS = {
         ("./data/hunan_grid_2024_2025_filtered.h5", "2024-01-01 00:00:00", "1h"),
     ],
 }  # (气象HDF5路径, 文件起始时间, 时间分辨率)
-DEFAULT_WEATHER_SOURCE = "15min"
+DEFAULT_WEATHER_SOURCE = "15min"  # 气象变量采样频率
 WEATHER_IN_CHANNELS = 5  # 气象变量通道数
 WEATHER_GRID_HEIGHT = 62  # 气象网格高度
 WEATHER_GRID_WIDTH = 61  # 气象网格宽度
@@ -91,7 +92,7 @@ ENC_IN = 1  # 外生模式下内生输入仅包含负荷
 C_OUT = 1  # 输出通道数
 D_MODEL = 256  # 隐藏层特征维度
 N_HEADS = 4  # 多头注意力头数
-E_LAYERS = 2  # 编码器层数
+E_LAYERS = 3  # 编码器层数
 D_FF = 1024  # 前馈网络维度
 FACTOR = 3  # 注意力因子
 DROPOUT = 0.1  # dropout 比例
@@ -117,7 +118,7 @@ GPU = 0  # 使用的 GPU 编号
 DES = "Exp"  # 实验描述后缀
 ITR = 1  # 实验重复次数
 INVERSE_EVAL = True  # 评估时是否反标准化
-TRAIN_MODE = True  # True 为训练+测试，False 为仅加载测试
+TRAIN_MODE = False  # True 为训练+测试，False 为仅加载测试
 
 
 # ==================== 数据通路配置 ====================
@@ -400,7 +401,7 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
             scaler.update()
 
             # 每隔 50 个迭代打印一次进度
-            if (i + 1) % 50 == 0:
+            if (i + 1) % 100 == 0:
                 print(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f}")
 
         # 完成一个 Epoch 训练后，在验证集上评估当前模型性能
@@ -610,7 +611,7 @@ def main():
         target_channel_idx=0,            # 目标列在多变量矩阵中的索引位置
         freq=LOAD_FREQ,                  # 数据采样频率 (15分钟一个点)
         embed="timeF",                   # 时间编码方式 (TimeFeature)
-        checkpoints="./checkpoints_quantile/", # 权重保存基目录
+        checkpoints=CHECKPOINTS_DIR, # 权重保存基目录
 
         # ---------- 时序长度配置 (负荷端) ----------
         seq_len=SEQ_LEN,                 # 历史负荷回顾窗口长度
