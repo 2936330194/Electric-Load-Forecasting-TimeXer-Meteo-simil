@@ -15,6 +15,7 @@ test4_smp.py - Simple Full-Map Conv + TimeXer end-to-end training
 
 import argparse
 import hashlib
+import json
 import os
 import random
 import time
@@ -84,7 +85,7 @@ WEATHER_KERNEL_WIDTH = 61  # 全图卷积核宽度
 WEATHER_FEATURE_DIM = 3  # 每个时刻输出的气象特征维度
 WEATHER_ENCODE_CHUNK_SIZE = 2048  # 气象帧分块编码大小
 WEATHER_FILL_VALUE = 0.0  # 气象缺失时的填充值
-WEATHER_FUTURE_DAYS = 0  # 额外拼接未来 1 天气象；具体对应 24 还是 96 个点由气象频率自动决定
+WEATHER_FUTURE_DAYS = 1  # 额外拼接未来 1 天气象；具体对应 24 还是 96 个点由气象频率自动决定
 
 
 # ==================== TimeXer 模型配置 ====================
@@ -129,6 +130,25 @@ CONTIGUOUS_TRAIN_BATCHES = True  # 训练阶段按连续窗口分块组 batch，
 # 说明：
 # - 当 FEATURES="MS" 时，TimeXer 的输入会被组织成“气象特征 + 历史负荷”，输出只预测目标负荷。
 
+LOAD_FROM_OPTUNA = False
+OPTUNA_DIR = "./optuna"
+OPTUNA_BEST_PARAMS_FILE = "best_params3.json"
+OPTUNA_BEST_CONFIG_FILE = "best_config3.json"
+OPTUNA_BEST_WEIGHT_FILE = "best_model3.pth"
+OPTUNA_BEST_TRIAL_FILE = "best_trial_result3.json"
+
+TUNABLE_PARAM_MAP = {
+    "WEATHER_FEATURE_DIM": "weather_feature_dim",
+    "D_MODEL": "d_model",
+    "N_HEADS": "n_heads",
+    "E_LAYERS": "e_layers",
+    "D_FF": "d_ff",
+    "DROPOUT": "dropout",
+    "PATCH_LEN": "patch_len",
+    "BATCH_SIZE": "batch_size",
+    "LEARNING_RATE": "learning_rate",
+}
+
 def _use_non_blocking_transfer(args, device: torch.device) -> bool:
     return (
         device.type == "cuda"
@@ -150,6 +170,46 @@ def extract_target(batch_y: torch.Tensor) -> torch.Tensor:
     # 当前数据集只有一个监督目标“负荷”。
     # 保留最后一维是为了与 [B, pred_len, 1] 的模型输出保持一致。
     return batch_y[:, :, -1:]
+
+
+def _load_json_file(json_path: str):
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _apply_optuna_artifacts(args: argparse.Namespace) -> argparse.Namespace:
+    optuna_dir = os.path.abspath(OPTUNA_DIR)
+    config_path = os.path.join(optuna_dir, OPTUNA_BEST_CONFIG_FILE)
+    params_path = os.path.join(optuna_dir, OPTUNA_BEST_PARAMS_FILE)
+    weight_path = os.path.join(optuna_dir, OPTUNA_BEST_WEIGHT_FILE)
+
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(f"./optuna model weight file not found: {weight_path}")
+
+    if os.path.exists(config_path):
+        payload = _load_json_file(config_path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"./optuna config file must be a JSON object: {config_path}")
+        for key, value in payload.items():
+            setattr(args, key, value)
+    elif os.path.exists(params_path):
+        payload = _load_json_file(params_path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"./optuna params file must be a JSON object: {params_path}")
+        for raw_key, value in payload.items():
+            key = TUNABLE_PARAM_MAP.get(str(raw_key), str(raw_key))
+            setattr(args, key, value)
+    else:
+        raise FileNotFoundError(
+            f"./optuna missing both {OPTUNA_BEST_CONFIG_FILE} and {OPTUNA_BEST_PARAMS_FILE}"
+        )
+
+    args.is_training = 0
+    args.load_weight_path = weight_path
+    args.quantiles = list(args.quantiles)
+    args.n_quantiles = len(args.quantiles)
+    print(f"Loaded saved artifacts from ./optuna: {weight_path}")
+    return args
 
 
 def _parse_cli_args() -> argparse.Namespace:
@@ -461,7 +521,7 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore):
 
     # 按照实验设置生成唯一的文件夹名，用于隔离不同实验的结果
     setting = _get_setting(args)
-    folder_path = os.path.join("./results/", setting)
+    folder_path = os.path.join(getattr(args, "results_root", "./results/"), setting)
     os.makedirs(folder_path, exist_ok=True)
 
     # 初始化存储预测值的容器
@@ -680,6 +740,14 @@ def main():
     )
 
     # 计算设备选择：优先使用 CUDA，否则回退到 CPU
+    args.results_root = "./results/"
+    args.load_weight_path = None
+
+    if not args.is_training and LOAD_FROM_OPTUNA:
+        args = _apply_optuna_artifacts(args)
+        selected_weather_source = getattr(args, "weather_source", selected_weather_source)
+        selected_weather_h5_specs = getattr(args, "weather_h5_specs", selected_weather_h5_specs)
+
     if torch.cuda.is_available() and args.use_gpu:
         device = torch.device(f"cuda:{args.gpu}")
         print(f"Using GPU: cuda:{args.gpu}")
@@ -712,7 +780,7 @@ def main():
             )
 
         # 实例化端到端模型，并将参数转移至目标设备
-        model = ExogenousFullMapConvTimeXerQuantile(args, quantiles=QUANTILES).float().to(device)
+        model = ExogenousFullMapConvTimeXerQuantile(args, quantiles=args.quantiles).float().to(device)
         
         # 统计并展示模型的总参数量和可训练参数量，这有助于评估服务器显存开销
         total_params = sum(p.numel() for p in model.parameters())
@@ -723,7 +791,7 @@ def main():
         # 获取实验唯一标识名
         setting = _get_setting(args)
 
-        if TRAIN_MODE:
+        if args.is_training:
             # ==================== 训练模式分支 ====================
             # 流程：模型训练 -> 最佳权重加载 -> 测试集泛化性评估 -> 可视化 -> 未来负荷外推
             
@@ -738,7 +806,7 @@ def main():
             # 绘制测试集真实值与 P50 预测及其置信区间 (P10-P90) 的对比图
             plot_pred_vs_true(
                 results_dir,
-                use_inverse=INVERSE_EVAL,
+                use_inverse=args.inverse_eval,
                 quantiles=args.quantiles,
                 title_prefix="Full-Map Conv + TimeXer Prediction",
                 y_label="Load (MW)",
@@ -751,9 +819,9 @@ def main():
                 device=device,
                 weather_store=weather_store,
                 results_dir=results_dir,
-                future_path=FUTURE_PATH,
-                steps=PRED_LEN,
-                use_inverse=INVERSE_EVAL,
+                future_path=getattr(args, "future_path", FUTURE_PATH),
+                steps=args.pred_len,
+                use_inverse=args.inverse_eval,
                 quantiles=args.quantiles,
                 data_provider_fn=weather_data_provider,
                 model_label="Full-Map Conv + TimeXer",
@@ -762,7 +830,9 @@ def main():
         else:
             # ==================== 仅推理/测试模式分支 ====================
             # 用于加载已训练好的成品模型，直接进行测试或部署应用
-            ckpt_path = os.path.join(args.checkpoints, setting, "checkpoint.pth")
+            ckpt_path = getattr(args, "load_weight_path", None)
+            if ckpt_path is None:
+                ckpt_path = os.path.join(args.checkpoints, setting, "checkpoint.pth")
             if os.path.exists(ckpt_path):
                 model.load_state_dict(torch.load(ckpt_path, map_location=device))
                 print(f"Loaded model: {ckpt_path}")
@@ -777,7 +847,7 @@ def main():
             # 同样生成可视化图表
             plot_pred_vs_true(
                 results_dir,
-                use_inverse=INVERSE_EVAL,
+                use_inverse=args.inverse_eval,
                 quantiles=args.quantiles,
                 title_prefix="Full-Map Conv + TimeXer Prediction",
                 y_label="Load (MW)",
@@ -790,9 +860,9 @@ def main():
                 device=device,
                 weather_store=weather_store,
                 results_dir=results_dir,
-                future_path=FUTURE_PATH,
-                steps=PRED_LEN,
-                use_inverse=INVERSE_EVAL,
+                future_path=getattr(args, "future_path", FUTURE_PATH),
+                steps=args.pred_len,
+                use_inverse=args.inverse_eval,
                 quantiles=args.quantiles,
                 data_provider_fn=weather_data_provider,
                 model_label="Full-Map Conv + TimeXer",
