@@ -1,35 +1,39 @@
 """
-test5_smp.py - Retrieval-augmented Full-Map Conv + TimeXer quantile forecast
+test5_smpv2.py - Similar-day baseline + residual TimeXer + sigmoid gate
 
-基于新版 test4_smp.py 的 1h/15min 自适应天气流程，增加“相似日先验残差修正”：
-1. 训练/验证/测试阶段由数据集自动检索相似日负荷曲线，并整理为 similar_day_prior。
-2. 模型先输出常规 point_pred，再与 similar_day_prior 拼接后经小型 MLP 做残差修正。
-3. 相似日检索库会按当前天气 H5 自动切换到对应的 1h / 15min artifact。
+Compared with test5_smp.py:
+1. The weighted similar-day prior is used as the direct baseline forecast.
+2. TimeXer predicts residuals relative to that baseline.
+3. A sigmoid gate alpha mixes prior and model branch:
+   y_hat = (1 - alpha) * prior_mean + alpha * (prior_mean + residual_pred)
 """
 
 import argparse
 import hashlib
 import os
-import random 
+import random
 import time
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch import optim
 
+from models.TimeXer import Model as TimeXer
 import test4_smp as base
 from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
 from utils.metrics import metric
 from utils.quantile import QuantileLoss
 from utils.tools import EarlyStopping, adjust_learning_rate
-from utils.weather_e2e import FullMapConvTimeXerQuantile, WeatherGridStore, weather_data_provider
+from utils.weather_e2e import FullMapWeatherConvExtractor, WeatherGridStore, weather_data_provider
 
 
 SIMILAR_DAY_ARTIFACT_DIR: Optional[str] = None
 SIMILAR_DAY_TOP_K = 3
 USE_SIMILAR_DAY_PRIOR = True
-SIMILAR_DAY_FUSION_HIDDEN_DIM = 128
+SIMILAR_DAY_GATE_HIDDEN_DIM = 128
+SIMILAR_DAY_GATE_INIT_ALPHA = 0.2
 
 
 _use_non_blocking_transfer = base._use_non_blocking_transfer
@@ -84,6 +88,148 @@ def _unpack_weather_batch(
             similar_day_prior,
         )
     raise ValueError(f"Unexpected batch size: expected 6 or 7 tensors, got {len(batch)}")
+
+
+class FullMapConvTimeXerResidualGateQuantile(nn.Module):
+    def __init__(self, configs, quantiles: Sequence[float]):
+        super().__init__()
+        self.quantiles = list(quantiles)
+        self.n_quantiles = len(self.quantiles)
+        self.weather_feature_dim = int(configs.weather_feature_dim)
+        self.encode_chunk_size = int(getattr(configs, "weather_encode_chunk_size", 512))
+        self.use_similar_day_prior = bool(getattr(configs, "use_similar_day_prior", False))
+        self.similar_day_top_k = int(getattr(configs, "similar_day_top_k", 3))
+        self.similar_day_prior_dim = self.similar_day_top_k + 1 if self.use_similar_day_prior else 0
+
+        self.weather_backbone = FullMapWeatherConvExtractor(
+            in_channels=int(getattr(configs, "weather_in_channels")),
+            out_channels=self.weather_feature_dim,
+            kernel_height=int(getattr(configs, "weather_kernel_height")),
+            kernel_width=int(getattr(configs, "weather_kernel_width")),
+            dropout=float(getattr(configs, "dropout", 0.1)),
+        )
+
+        self.weather_seq_len = int(getattr(configs, "weather_seq_len", configs.seq_len))
+        configs.exo_seq_len = self.weather_seq_len
+        configs.enc_in = 1
+        self.timexer = TimeXer(configs)
+
+        if self.use_similar_day_prior:
+            gate_hidden_dim = int(
+                getattr(
+                    configs,
+                    "similar_day_gate_hidden_dim",
+                    max(16, int(getattr(configs, "d_model", 128)) // 4),
+                )
+            )
+            gate_init_alpha = float(getattr(configs, "similar_day_gate_init_alpha", 0.2))
+            gate_init_alpha = min(max(gate_init_alpha, 1e-3), 1.0 - 1e-3)
+            gate_bias = float(np.log(gate_init_alpha / (1.0 - gate_init_alpha)))
+            self.similar_day_gate = nn.Sequential(
+                nn.Linear(1 + self.similar_day_prior_dim, gate_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(float(getattr(configs, "dropout", 0.1))),
+                nn.Linear(gate_hidden_dim, 1),
+                nn.Sigmoid(),
+            )
+            with torch.no_grad():
+                nn.init.zeros_(self.similar_day_gate[-2].weight)
+                nn.init.constant_(self.similar_day_gate[-2].bias, gate_bias)
+        else:
+            self.similar_day_gate = None
+
+        self.quantile_head = nn.Linear(1, self.n_quantiles)
+        with torch.no_grad():
+            self.quantile_head.weight.fill_(1.0)
+            self.quantile_head.bias.copy_(torch.tensor([q - 0.5 for q in self.quantiles]) * 0.1)
+
+    def _encode_weather_frames(self, weather_frames: torch.Tensor) -> torch.Tensor:
+        if weather_frames.ndim != 4:
+            raise ValueError(
+                f"Weather frames should have shape [N, C, H, W], got {tuple(weather_frames.shape)}"
+            )
+
+        encoded_chunks: List[torch.Tensor] = []
+        for start in range(0, weather_frames.shape[0], self.encode_chunk_size):
+            end = min(start + self.encode_chunk_size, weather_frames.shape[0])
+            encoded_chunks.append(self.weather_backbone(weather_frames[start:end].float()))
+        return torch.cat(encoded_chunks, dim=0)
+
+    def _encode_weather_sequence(
+        self,
+        weather_seq: Optional[torch.Tensor],
+        weather_index: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if weather_seq is None:
+            return None
+
+        if weather_index is not None:
+            if weather_seq.ndim != 4 or weather_index.ndim != 2:
+                raise ValueError(
+                    "Indexed weather mode expects weather_seq [U, C, H, W] and weather_index [B, T]."
+                )
+            batch_size, time_len = weather_index.shape
+            encoded_frames = self._encode_weather_frames(weather_seq)
+            gathered = encoded_frames.index_select(0, weather_index.reshape(-1))
+            return gathered.reshape(batch_size, time_len, self.weather_feature_dim)
+
+        if weather_seq.ndim != 5:
+            raise ValueError(
+                f"Sequential weather mode expects [B, T, C, H, W], got {tuple(weather_seq.shape)}"
+            )
+        batch_size, time_len, channels, height, width = weather_seq.shape
+        flat = weather_seq.reshape(batch_size * time_len, channels, height, width)
+        encoded = self._encode_weather_frames(flat)
+        return encoded.reshape(batch_size, time_len, self.weather_feature_dim)
+
+    def forward(
+        self,
+        load_x: torch.Tensor,
+        x_mark_enc: torch.Tensor,
+        x_exo_mark: torch.Tensor,
+        weather_x: torch.Tensor,
+        weather_x_index: Optional[torch.Tensor] = None,
+        similar_day_prior: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        weather_feature = self._encode_weather_sequence(weather_x, weather_x_index)
+
+        residual_pred = self.timexer(
+            load_x,
+            x_mark_enc,
+            None,
+            None,
+            mask=mask,
+            x_exo=weather_feature,
+            x_exo_mark=x_exo_mark,
+        )
+        residual_pred = residual_pred[:, -self.timexer.pred_len :, :]
+
+        point_pred = residual_pred
+        if self.use_similar_day_prior and similar_day_prior is not None:
+            if similar_day_prior.ndim != 3:
+                raise ValueError(
+                    f"similar_day_prior should be [B, pred_len, {self.similar_day_prior_dim}], "
+                    f"got {tuple(similar_day_prior.shape)}"
+                )
+            if similar_day_prior.shape[1] != self.timexer.pred_len:
+                raise ValueError(
+                    "similar_day_prior time dimension does not match pred_len: "
+                    f"{similar_day_prior.shape[1]} vs {self.timexer.pred_len}"
+                )
+            if similar_day_prior.shape[2] != self.similar_day_prior_dim:
+                raise ValueError(
+                    "similar_day_prior feature dimension does not match configuration: "
+                    f"{similar_day_prior.shape[2]} vs {self.similar_day_prior_dim}"
+                )
+            similar_day_prior = similar_day_prior.float()
+            prior_mean = similar_day_prior[:, :, :1]
+            gate_input = torch.cat([residual_pred, similar_day_prior], dim=-1)
+            alpha = self.similar_day_gate(gate_input)
+            model_branch = prior_mean + residual_pred
+            point_pred = (1.0 - alpha) * prior_mean + alpha * model_branch
+
+        return self.quantile_head(point_pred)
 
 
 def validate_quantile(model, data_loader, criterion, args, device, use_amp: bool = False) -> float:
@@ -149,7 +295,7 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
     use_non_blocking = _use_non_blocking_transfer(args, device)
 
     print("\n" + "=" * 72)
-    print("Start training Retrieval-Augmented Full-Map Conv + TimeXer quantile model")
+    print("Start training similar-day baseline + residual TimeXer quantile model")
     print(f"setting: {setting}")
     print(f"quantiles: {args.quantiles}")
     print(f"weather_feature_dim: {args.weather_feature_dim}")
@@ -162,9 +308,10 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
     print(f"use_similar_day_prior: {bool(getattr(args, 'use_similar_day_prior', False))}")
     if bool(getattr(args, "use_similar_day_prior", False)):
         print(
-            "similar_day_prior_config: "
+            "similar_day_gate_config: "
             f"top_k={getattr(args, 'similar_day_top_k', 0)}, "
-            f"fusion_hidden_dim={getattr(args, 'similar_day_fusion_hidden_dim', 0)}, "
+            f"gate_hidden_dim={getattr(args, 'similar_day_gate_hidden_dim', 0)}, "
+            f"gate_init_alpha={getattr(args, 'similar_day_gate_init_alpha', 0.0):.3f}, "
             f"artifact_dir={getattr(args, 'similar_day_artifact_dir', None)}"
         )
     print(f"batch_size: {args.batch_size}")
@@ -340,23 +487,25 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore) ->
 
 def _get_setting(args, itr: int = 0) -> str:
     signature = (
-        f"{args.task_name}_{args.model_id}_{args.model}_e2e_"
+        f"{args.task_name}_{args.model_id}_{args.model}_e2e_sdv2_"
         f"sl{args.seq_len}_pl{args.pred_len}_dm{args.d_model}_"
         f"el{args.e_layers}_wd{args.weather_feature_dim}_"
         f"wsl{args.weather_seq_len}_wh{args.weather_history_len}_"
         f"wk{args.weather_kernel_height}x{args.weather_kernel_width}_"
         f"sdp{int(bool(getattr(args, 'use_similar_day_prior', False)))}_"
         f"sdk{int(getattr(args, 'similar_day_top_k', 0))}_"
-        f"sdfh{int(getattr(args, 'similar_day_fusion_hidden_dim', 0))}_"
+        f"sdgh{int(getattr(args, 'similar_day_gate_hidden_dim', 0))}_"
+        f"sdga{int(round(1000.0 * float(getattr(args, 'similar_day_gate_init_alpha', 0.0))))}_"
         f"lr{args.learning_rate}_bs{args.batch_size}_{args.des}_{itr}"
     )
     digest = hashlib.md5(signature.encode("utf-8")).hexdigest()[:8]
     return (
-        f"TimeXerE2E_sl{args.seq_len}_pl{args.pred_len}_"
+        f"TimeXerE2E_SDV2_sl{args.seq_len}_pl{args.pred_len}_"
         f"wd{args.weather_feature_dim}_"
         f"wsl{args.weather_seq_len}_wh{args.weather_history_len}_"
         f"sdp{int(bool(getattr(args, 'use_similar_day_prior', False)))}_"
         f"sdk{int(getattr(args, 'similar_day_top_k', 0))}_"
+        f"sdgh{int(getattr(args, 'similar_day_gate_hidden_dim', 0))}_"
         f"wk{args.weather_kernel_height}x{args.weather_kernel_width}_"
         f"bs{args.batch_size}_{args.des}_{itr}_{digest}"
     )
@@ -375,7 +524,7 @@ def main() -> None:
     args = argparse.Namespace(
         task_name=base.TASK_NAME,
         is_training=1 if base.TRAIN_MODE else 0,
-        model_id=base.MODEL_ID_PREFIX,
+        model_id=f"{base.MODEL_ID_PREFIX}_sdv2",
         model=base.MODEL,
         des=base.DES,
         itr=base.ITR,
@@ -387,7 +536,7 @@ def main() -> None:
         target_channel_idx=0,
         freq=base.LOAD_FREQ,
         embed="timeF",
-        checkpoints="./checkpoints_test5/",
+        checkpoints="./checkpoints_test5_v2/",
         seq_len=base.SEQ_LEN,
         label_len=base.LABEL_LEN,
         pred_len=base.PRED_LEN,
@@ -432,7 +581,8 @@ def main() -> None:
         use_similar_day_prior=USE_SIMILAR_DAY_PRIOR,
         similar_day_top_k=SIMILAR_DAY_TOP_K,
         similar_day_artifact_dir=SIMILAR_DAY_ARTIFACT_DIR,
-        similar_day_fusion_hidden_dim=SIMILAR_DAY_FUSION_HIDDEN_DIM,
+        similar_day_gate_hidden_dim=SIMILAR_DAY_GATE_HIDDEN_DIM,
+        similar_day_gate_init_alpha=SIMILAR_DAY_GATE_INIT_ALPHA,
     )
 
     if torch.cuda.is_available() and args.use_gpu:
@@ -461,11 +611,11 @@ def main() -> None:
                 f"kernel=({args.weather_kernel_height}, {args.weather_kernel_width})"
             )
 
-        model = FullMapConvTimeXerQuantile(args, quantiles=base.QUANTILES).float().to(device)
+        model = FullMapConvTimeXerResidualGateQuantile(args, quantiles=base.QUANTILES).float().to(device)
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Retrieval-Augmented Full-Map Conv + TimeXer total params: {total_params:,}")
-        print(f"Retrieval-Augmented Full-Map Conv + TimeXer trainable params: {trainable_params:,}")
+        print(f"Similar-day baseline + residual TimeXer total params: {total_params:,}")
+        print(f"Similar-day baseline + residual TimeXer trainable params: {trainable_params:,}")
 
         setting = _get_setting(args)
         if base.TRAIN_MODE:
@@ -491,7 +641,7 @@ def main() -> None:
             results_dir,
             use_inverse=base.INVERSE_EVAL,
             quantiles=args.quantiles,
-            title_prefix="Retrieval-Augmented Full-Map Conv + TimeXer Prediction",
+            title_prefix="Similar-Day Baseline + Residual TimeXer Prediction",
             y_label="Load (MW)",
         )
 
@@ -513,7 +663,7 @@ def main() -> None:
             use_inverse=base.INVERSE_EVAL,
             quantiles=args.quantiles,
             data_provider_fn=weather_data_provider,
-            model_label="Retrieval-Augmented Full-Map Conv + TimeXer",
+            model_label="Similar-Day Baseline + Residual TimeXer",
             y_label="Load (MW)",
             similar_day_result=similar_day_result,
         )
