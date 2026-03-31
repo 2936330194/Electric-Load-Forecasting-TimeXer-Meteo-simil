@@ -124,6 +124,13 @@ USE_BEST_CONFIG_FILE = "best_config.json" # 最佳完整配置文件名（包含
 USE_BEST_WEIGHT_FILE = "best_model.pth" # 最佳模型权重文件名（PyTorch state_dict 格式）
 
 # 可调参数名称映射表：将 best_params.json 中的大写键名映射为 args 中对应的小写属性名。
+LOAD_FROM_OPTUNA = False
+OPTUNA_DIR = "./optuna"
+OPTUNA_BEST_PARAMS_FILE = "best_params1.json"
+OPTUNA_BEST_CONFIG_FILE = "best_config1.json"
+OPTUNA_BEST_WEIGHT_FILE = "best_model1.pth"
+OPTUNA_BEST_TRIAL_FILE = "best_trial_result1.json"
+
 TUNABLE_PARAM_MAP = {
     "D_MODEL": "d_model",       # Transformer 隐含层维度
     "N_HEADS": "n_heads",       # 多头注意力头数
@@ -222,6 +229,41 @@ def _apply_use_artifacts(args: argparse.Namespace) -> argparse.Namespace:
 # =============================================================================
 # TimeXer 分位数包装模型
 # =============================================================================
+def _apply_optuna_artifacts(args: argparse.Namespace) -> argparse.Namespace:
+    optuna_dir = os.path.abspath(OPTUNA_DIR)
+    config_path = os.path.join(optuna_dir, OPTUNA_BEST_CONFIG_FILE)
+    params_path = os.path.join(optuna_dir, OPTUNA_BEST_PARAMS_FILE)
+    weight_path = os.path.join(optuna_dir, OPTUNA_BEST_WEIGHT_FILE)
+
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(f"./optuna model weight file not found: {weight_path}")
+
+    if os.path.exists(config_path):
+        payload = _load_json_file(config_path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"./optuna config file must be a JSON object: {config_path}")
+        for key, value in payload.items():
+            setattr(args, key, value)
+    elif os.path.exists(params_path):
+        payload = _load_json_file(params_path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"./optuna params file must be a JSON object: {params_path}")
+        for raw_key, value in payload.items():
+            key = TUNABLE_PARAM_MAP.get(str(raw_key), str(raw_key))
+            setattr(args, key, value)
+    else:
+        raise FileNotFoundError(
+            f"./optuna missing both {OPTUNA_BEST_CONFIG_FILE} and {OPTUNA_BEST_PARAMS_FILE}"
+        )
+
+    args.is_training = 0
+    args.load_weight_path = weight_path
+    args.quantiles = list(args.quantiles)
+    args.n_quantiles = len(args.quantiles)
+    print(f"Loaded saved artifacts from ./optuna: {weight_path}")
+    return args
+
+
 class TimeXerQuantile(nn.Module):
     """
     TimeXer 分位数包装模型。
@@ -426,7 +468,7 @@ def train_quantile_model(model, args, device):
     # ==================== 7. 加载并返回最佳模型 ====================
     # 无论是正常跑完所有 epoch，还是中途触发早停，最终都需要回退到验证集性能最好的那组参数
     best_model_path = os.path.join(path, 'checkpoint.pth')
-    model.load_state_dict(torch.load(best_model_path))
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
     print(f"已加载最佳模型: {best_model_path}")
 
     return model
@@ -502,7 +544,7 @@ def test_quantile_model(model, args, device):
 
     # 生成本次实验的唯一标识目录，确保不同超参数组合的输出隔离
     setting = _get_setting(args)
-    folder_path = os.path.join('./results/', setting)
+    folder_path = os.path.join(getattr(args, "results_root", "./results/"), setting)
     os.makedirs(folder_path, exist_ok=True)
 
     # 预先分配列表，用于收集各个批次的预测和真实值
@@ -675,9 +717,14 @@ def main():
     )
 
     args.checkpoints = CHECKPOINTS_DIR
+    args.results_root = "./results/"
+    args.load_weight_path = None
 
-    if not TRAIN_MODE and LOAD_FROM_USE:
-        args = _apply_use_artifacts(args)
+    if not args.is_training:
+        if LOAD_FROM_OPTUNA:
+            args = _apply_optuna_artifacts(args)
+        elif LOAD_FROM_USE:
+            args = _apply_use_artifacts(args)
 
     # ==================== 配置计算设备 ====================
     if torch.cuda.is_available() and args.use_gpu:
@@ -688,14 +735,14 @@ def main():
         print("Using CPU")
 
     # ==================== 构建模型 ====================
-    model = TimeXerQuantile(args, quantiles=QUANTILES).float().to(device)
+    model = TimeXerQuantile(args, quantiles=args.quantiles).float().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"TimeXerQuantile 模型参数量: {total_params:,}")
 
     setting = _get_setting(args)
 
     # ==================== 训练或加载模型 ====================
-    if TRAIN_MODE:
+    if args.is_training:
         print(f"\n>>> 开始训练: {setting}")
         model = train_quantile_model(model, args, device)
 
@@ -704,16 +751,16 @@ def main():
 
         shared_plot_pred_vs_true(
             results_dir,
-            use_inverse=INVERSE_EVAL,
-            quantiles=QUANTILES,
+            use_inverse=args.inverse_eval,
+            quantiles=args.quantiles,
             title_prefix="TimeXer Quantile Prediction",
         )
         shared_predict_future_load_from_csv(
             model=model, args=args, device=device,
             weather_store=None,
             results_dir=results_dir, future_path=FUTURE_PATH,
-            steps=PRED_LEN, use_inverse=INVERSE_EVAL,
-            quantiles=QUANTILES,
+            steps=PRED_LEN, use_inverse=args.inverse_eval,
+            quantiles=args.quantiles,
             data_provider_fn=data_provider,
             model_label="TimeXer",
         )
@@ -724,7 +771,7 @@ def main():
             ckpt_path = os.path.join(args.checkpoints, setting, 'checkpoint.pth')
         
         if os.path.exists(ckpt_path):
-            model.load_state_dict(torch.load(ckpt_path))
+            model.load_state_dict(torch.load(ckpt_path, map_location=device))
             print(f"成功加载模型: {ckpt_path}")
         else:
             raise FileNotFoundError(
@@ -736,16 +783,16 @@ def main():
 
         shared_plot_pred_vs_true(
             results_dir,
-            use_inverse=INVERSE_EVAL,
-            quantiles=QUANTILES,
+            use_inverse=args.inverse_eval,
+            quantiles=args.quantiles,
             title_prefix="TimeXer Quantile Prediction",
         )
         shared_predict_future_load_from_csv(
             model=model, args=args, device=device,
             weather_store=None,
             results_dir=results_dir, future_path=FUTURE_PATH,
-            steps=PRED_LEN, use_inverse=INVERSE_EVAL,
-            quantiles=QUANTILES,
+            steps=PRED_LEN, use_inverse=args.inverse_eval,
+            quantiles=args.quantiles,
             data_provider_fn=data_provider,
             model_label="TimeXer",
         )

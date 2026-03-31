@@ -107,7 +107,7 @@ BATCH_SIZE = 32  # 训练批大小
 LEARNING_RATE = 1e-4  # 学习率
 PATIENCE = 5  # 早停容忍轮数
 NUM_WORKERS = 0  # DataLoader 进程数
-USE_AMP = False  # 是否开启自动混合精度训练 (AMP)
+USE_AMP = True  # 是否开启自动混合精度训练 (AMP)
 
 
 # ==================== 硬件配置 ====================
@@ -589,8 +589,8 @@ def main():
     torch.manual_seed(fix_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(fix_seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
     cli_args = _parse_cli_args()
     selected_weather_source = cli_args.weather_source

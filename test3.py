@@ -99,7 +99,7 @@ DROPOUT = 0.1  # dropout 比例
 ACTIVATION = "gelu"  # 激活函数
 PATCH_LEN = 96  # TimeXer patch 长度
 USE_NORM = 1  # 是否启用归一化
-USE_AMP = False  # 是否开启自动混合精度训练 (AMP)
+USE_AMP = True  # 是否开启自动混合精度训练 (AMP)
 
 
 # ==================== 训练配置 ====================
@@ -596,8 +596,8 @@ def main():
     torch.manual_seed(fix_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(fix_seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
     cli_args = _parse_cli_args()
     selected_weather_source = cli_args.weather_source
