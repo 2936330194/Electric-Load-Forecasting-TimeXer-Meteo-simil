@@ -1369,11 +1369,11 @@ class SimilarDayRetriever:
         Returns:
             np.ndarray: 包含所有合法起始索引的 int64 数组。
         """
-        train_row_count = int(train_row_count)
-        max_start = train_row_count - self.pred_len
+        total_row_count = len(load_dates)
+        max_start = total_row_count - self.pred_len
         if max_start < 0:
             raise ValueError(
-                f"训练样本不足以形成长度为 {self.pred_len} 的完整窗口: train_row_count={train_row_count}"
+                f"负荷样本不足以形成长度为 {self.pred_len} 的完整窗口: total_row_count={total_row_count}"
             )
 
         dates = pd.DatetimeIndex(pd.to_datetime(load_dates))
@@ -1384,7 +1384,7 @@ class SimilarDayRetriever:
             dtype=np.int64,
         )
         if start_indices.size == 0:
-            raise ValueError("当前 build_stride 设置下无法生成任何训练窗口。")
+            raise ValueError("当前 build_stride 设置下无法生成任何建库窗口。")
 
         valid_mask = np.array(
             [self._is_load_aligned_timestamp(dates[int(idx)]) for idx in start_indices],
@@ -1402,7 +1402,7 @@ class SimilarDayRetriever:
             start_indices = start_indices[: int(max_train_windows)]
 
         if start_indices.size == 0:
-            raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
+            raise ValueError("max_train_windows 设置后建库窗口数不大于 0。")
 
         return start_indices
 
@@ -1683,24 +1683,23 @@ class SimilarDayRetriever:
             self.weather_step_desc = _step_desc_from_timedelta(weather_store.freq)
 
         total_rows = len(load_df)
-        default_train_rows = int(total_rows * self.train_ratio)
         load_dates = pd.DatetimeIndex(load_df["date"])
         window_start_indices = self._build_train_window_starts(
             load_dates=load_dates,
-            train_row_count=default_train_rows,
+            train_row_count=total_rows,
             max_train_windows=max_train_windows,
         )
         # 根据给定的预测长度推算可以产生的监督滑动窗口总数
         n_windows = int(len(window_start_indices))
         if n_windows <= 0:
             raise ValueError(
-                f"训练窗口数无效: total_rows={total_rows}, pred_len={self.pred_len}, train_ratio={self.train_ratio}"
+                f"建库窗口数无效: total_rows={total_rows}, pred_len={self.pred_len}"
             )
         # 在 Smoke Test 或 DEBUG 下可能会强行截断部分不训练
         if max_train_windows is not None:
             n_windows = min(int(max_train_windows), n_windows)
         if n_windows <= 0:
-            raise ValueError("max_train_windows 设置后训练窗口数不大于 0。")
+            raise ValueError("max_train_windows 设置后建库窗口数不大于 0。")
 
         required_exact_timestamps = self._collect_required_build_timestamps(
             load_dates=load_dates,
@@ -1713,7 +1712,7 @@ class SimilarDayRetriever:
             context="建库阶段",
         )
 
-        train_frame_count = int(window_start_indices[-1] + self.pred_len)
+        build_frame_count = total_rows
         # 准备对应标签侧的负荷滑动窗口、起始时间戳列表
         start_timestamps = pd.DatetimeIndex(load_dates[window_start_indices])
         start_time_keys = self._time_slot_keys_from_timestamps(start_timestamps)
@@ -1734,9 +1733,9 @@ class SimilarDayRetriever:
         print("开始构建时空相似日检索库 (ConvLSTM-AE)")
         print(f"负荷数据: {Path(load_csv_path).resolve()}")
         print(f"气象数据: {Path(weather_h5_path).resolve()}")
-        print(f"训练比例: {self.train_ratio:.6f}")
-        print(f"训练帧数: {train_frame_count}")
-        print(f"训练窗口数: {n_windows}")
+        print("建库范围: full history")
+        print(f"建库帧数: {build_frame_count}")
+        print(f"建库窗口数: {n_windows}")
         print(f"负荷窗口长度: {self.pred_len}")
         print(
             f"负荷滑窗步长: {self.build_stride} "
@@ -1811,7 +1810,7 @@ class SimilarDayRetriever:
         self.start_timestamps = start_timestamps
         self.load_csv_path = str(Path(load_csv_path).resolve())
         self.weather_h5_path = str(Path(weather_h5_path).resolve())
-        self.train_frame_count = int(train_frame_count)
+        self.train_frame_count = int(build_frame_count)
         self.train_window_count = int(n_windows)
         self.fused_dim = int(fused_vectors.shape[1])
         self.start_time_keys = start_time_keys
@@ -1873,9 +1872,10 @@ class SimilarDayRetriever:
             self.start_time_keys = self._time_slot_keys_from_timestamps(self.start_timestamps)
         query_time_key = self._time_slot_keys_from_timestamps([query_timestamp])[0]
         valid_mask = self.start_time_keys == query_time_key
+        cutoff_ts = pd.Timestamp(query_timestamp)
         if history_end_timestamp_exclusive is not None:
-            cutoff_ts = pd.Timestamp(history_end_timestamp_exclusive)
-            valid_mask &= self.start_timestamps < cutoff_ts
+            cutoff_ts = min(cutoff_ts, pd.Timestamp(history_end_timestamp_exclusive))
+        valid_mask &= self.start_timestamps < cutoff_ts
         valid_indices = np.flatnonzero(valid_mask)
 
         if valid_indices.size == 0:
@@ -2200,7 +2200,12 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--weather-dim", type=int, default=AE_LATENT_DIM, help="目标潜向量维度")
     parser.add_argument("--time-weight", type=float, default=1.22, help="时间特征权重 (alpha)")
     parser.add_argument("--pred-len", type=int, default=96, help="预测步长/窗口长度")
-    parser.add_argument("--train-ratio", type=float, default=2.0 / 3.0, help="前多少比例的数据用于建库")
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=2.0 / 3.0,
+        help="兼容保留参数；当前版本默认使用全量历史数据建库",
+    )
     parser.add_argument(
         "--build-stride",
         type=int,
