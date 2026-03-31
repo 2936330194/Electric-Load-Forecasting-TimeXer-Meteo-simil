@@ -491,7 +491,7 @@ class Model(nn.Module):
         self.head = FlattenHead(configs.enc_in, self.head_nf, configs.pred_len,
                                 head_dropout=configs.dropout)
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, x_exo=None, x_exo_mark=None):
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, x_exo=None, x_exo_mark=None, x_exo_extra_tokens=None):
         """
         MS 模式预测：多变量输入，单变量输出
         
@@ -538,6 +538,29 @@ class Model(nn.Module):
             en_embed, n_vars = self.en_embedding(x_enc[:, :, -1].unsqueeze(-1).permute(0, 2, 1))
             # 外生变量嵌入
             ex_embed = self.ex_embedding(x_enc[:, :, :-1], x_mark_enc)
+
+        if x_exo_extra_tokens is not None:
+            if x_exo_extra_tokens.ndim != 3:
+                raise ValueError(
+                    f"x_exo_extra_tokens should be [B, N_extra, d_model], got {tuple(x_exo_extra_tokens.shape)}"
+                )
+            if x_exo_extra_tokens.shape[0] != ex_embed.shape[0]:
+                raise ValueError(
+                    "x_exo_extra_tokens batch dimension does not match exogenous embeddings: "
+                    f"{x_exo_extra_tokens.shape[0]} vs {ex_embed.shape[0]}"
+                )
+            if x_exo_extra_tokens.shape[2] != ex_embed.shape[2]:
+                raise ValueError(
+                    "x_exo_extra_tokens feature dimension does not match d_model: "
+                    f"{x_exo_extra_tokens.shape[2]} vs {ex_embed.shape[2]}"
+                )
+            ex_embed = torch.cat(
+                [
+                    ex_embed,
+                    x_exo_extra_tokens.to(device=ex_embed.device, dtype=ex_embed.dtype),
+                ],
+                dim=1,
+            )
 
         # ==================== 3. 编码器 ====================
         enc_out = self.encoder(en_embed, ex_embed)
@@ -609,7 +632,7 @@ class Model(nn.Module):
 
         return dec_out
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, x_exo=None, x_exo_mark=None):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, x_exo=None, x_exo_mark=None, x_exo_extra_tokens=None):
         """
         模型前向传播（统一入口）
         
@@ -636,8 +659,15 @@ class Model(nn.Module):
                 return dec_out[:, -self.pred_len:, :]  # [B, pred_len, C]
             else:
                 # MS 模式：多变量输入，单变量输出（支持分离外生变量）
-                dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec,
-                                        x_exo=x_exo, x_exo_mark=x_exo_mark)
+                dec_out = self.forecast(
+                    x_enc,
+                    x_mark_enc,
+                    x_dec,
+                    x_mark_dec,
+                    x_exo=x_exo,
+                    x_exo_mark=x_exo_mark,
+                    x_exo_extra_tokens=x_exo_extra_tokens,
+                )
                 return dec_out[:, -self.pred_len:, :]  # [B, pred_len, 1]
         else:
             return None
