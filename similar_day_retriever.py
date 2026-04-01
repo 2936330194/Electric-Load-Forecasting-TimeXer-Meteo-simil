@@ -113,6 +113,82 @@ def _resolve_loaded_weather_h5_path(weather_h5_path: Optional[Union[str, Path]])
     return str(saved_path)
 
 
+def _resolve_existing_project_path(path_value: Optional[Union[str, Path]]) -> Optional[Path]:
+    if path_value in (None, ""):
+        return None
+    candidate = Path(str(path_value))
+    if not candidate.is_absolute():
+        candidate = ROOT_DIR / candidate
+    candidate = candidate.resolve()
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _resolve_loaded_ae_checkpoint_path(
+    checkpoint_path: Optional[Union[str, Path]],
+    weather_h5_path: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    resolved_saved = _resolve_existing_project_path(checkpoint_path)
+    if resolved_saved is not None:
+        return str(resolved_saved)
+
+    if weather_h5_path not in (None, ""):
+        dataset_checkpoint = _default_ae_checkpoint_for_weather(weather_h5_path)
+        if dataset_checkpoint.exists():
+            print(
+                "[load] saved AE checkpoint not found on this device; "
+                f"fallback to dataset checkpoint: {dataset_checkpoint}"
+            )
+            return str(dataset_checkpoint)
+
+    legacy_dir = _resolve_project_path(AE_CHECKPOINT_DIR)
+    for candidate in (
+        legacy_dir / AE_BEST_MODEL_FILE,
+        legacy_dir / DEFAULT_AE_FALLBACK_MODEL_FILE,
+    ):
+        if candidate.exists():
+            print(
+                "[load] saved AE checkpoint not found on this device; "
+                f"fallback to legacy checkpoint: {candidate}"
+            )
+            return str(candidate.resolve())
+
+    if checkpoint_path in (None, ""):
+        return None
+    return str(_resolve_project_path(checkpoint_path))
+
+
+def _resolve_loaded_ae_norm_stats_path(
+    norm_stats_path: Optional[Union[str, Path]],
+    weather_h5_path: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    resolved_saved = _resolve_existing_project_path(norm_stats_path)
+    if resolved_saved is not None:
+        return str(resolved_saved)
+
+    if weather_h5_path not in (None, ""):
+        dataset_stats = _default_ae_norm_stats_for_weather(weather_h5_path)
+        if dataset_stats.exists():
+            print(
+                "[load] saved AE norm stats not found on this device; "
+                f"fallback to dataset stats: {dataset_stats}"
+            )
+            return str(dataset_stats)
+
+    legacy_stats = _resolve_project_path(AE_CHECKPOINT_DIR) / AE_NORM_STATS_FILE
+    if legacy_stats.exists():
+        print(
+            "[load] saved AE norm stats not found on this device; "
+            f"fallback to legacy stats: {legacy_stats}"
+        )
+        return str(legacy_stats.resolve())
+
+    if norm_stats_path in (None, ""):
+        return None
+    return str(_resolve_project_path(norm_stats_path))
+
+
 # 相似日检索库（Artifacts）的默认保存目录
 DEFAULT_ARTIFACT_DIR = _default_artifact_dir_for_weather(DEFAULT_WEATHER_H5)
 # 默认的 AE 模型权重路径
@@ -2154,6 +2230,19 @@ class SimilarDayRetriever:
         # 6. 回填运行状态元数据
         retriever.load_csv_path = metadata.get("load_csv_path")
         retriever.weather_h5_path = _resolve_loaded_weather_h5_path(metadata.get("weather_h5_path"))
+        retriever.ae_checkpoint_path = _resolve_loaded_ae_checkpoint_path(
+            metadata.get("ae_checkpoint_path", retriever.ae_checkpoint_path),
+            weather_h5_path=retriever.weather_h5_path,
+        )
+        retriever.ae_norm_stats_path = _resolve_loaded_ae_norm_stats_path(
+            metadata.get("ae_norm_stats_path", retriever.ae_norm_stats_path),
+            weather_h5_path=retriever.weather_h5_path,
+        )
+        if retriever.weather_encoder is not None:
+            if retriever.ae_checkpoint_path is not None:
+                retriever.weather_encoder.checkpoint_path = retriever.ae_checkpoint_path
+            if retriever.ae_norm_stats_path is not None:
+                retriever.weather_encoder.norm_stats_path = retriever.ae_norm_stats_path
         retriever.train_frame_count = metadata.get("train_frame_count")
         retriever.train_window_count = metadata.get("train_window_count")
         retriever.fused_dim = metadata.get("fused_dim")
