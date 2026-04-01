@@ -1,11 +1,13 @@
 """
-test5_smpv2.py - Similar-day baseline + residual TimeXer + sigmoid gate
+test5_smpv2.py - TimeXer primary forecast + similar-day prior correction gate
 
 Compared with test5_smp.py:
-1. The weighted similar-day prior is used as the direct baseline forecast.
-2. TimeXer predicts residuals relative to that baseline.
-3. A sigmoid gate alpha mixes prior and model branch:
-   y_hat = (1 - alpha) * prior_mean + alpha * (prior_mean + residual_pred)
+1. TimeXer predicts the absolute load directly.
+2. The weighted similar-day prior is converted into a bounded correction direction:
+   gap = prior_mean - timexer_pred
+3. A sigmoid gate beta uses model/prior agreement and prior spread to decide
+   how much prior correction to accept:
+   y_hat = timexer_pred + beta * gap
 """
 
 import argparse
@@ -29,7 +31,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.weather_e2e import FullMapWeatherConvExtractor, WeatherGridStore, weather_data_provider
 
 
-# ================= 相似日检索模块与方案 B (门控) 的专属参数配置 =================
+# ================= 相似日检索模块与 TimeXer 主体纠偏门控方案的专属参数配置 =================
 # 指定相似日检索模型的缓存目录（包含离线训练好的 PCA 分解器和 Faiss 向量索引库）。
 SIMILAR_DAY_ARTIFACT_DIR: Optional[str] = None
 
@@ -40,13 +42,14 @@ SIMILAR_DAY_TOP_K = 3
 # 这是一个总开关，决定接下来的测试或训练环节中，是否要启用并组装这条相似日先验特征进入端到端模型。
 USE_SIMILAR_DAY_PRIOR = True
 
-# 针对方案 B (动态门控/Dynamic Gating) 的隐藏门控尺寸参数。
-# 控制 Sigmoid 门控机内部运算多大的非线性宽度，越大则门控决策越复杂。
+# 针对先验纠偏门控 (Dynamic Prior-Correction Gating) 的隐藏层尺寸参数。
+# 控制 Sigmoid 门控网络的非线性宽度，越大则门控决策越复杂。
 SIMILAR_DAY_GATE_HIDDEN_DIM = 128
 
-# 网络初始化时给先验经验曲线的权重锚点。
-# 0.2 表示初始时先验只作 20% 的决策参考，让主网络（TimeXer 大脑）在最初主导预测，随后网络再通过反向传播自动调节信赖比例。
-SIMILAR_DAY_GATE_INIT_ALPHA = 0.2
+# 网络初始化时给先验纠偏比例的权重锚点。
+# 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，
+# 随后网络再通过反向传播自动调节先验的介入比例。
+SIMILAR_DAY_GATE_INIT_BETA = 0.1
 
 
 # ================= 从基础实验模块导入常用工具函数 =================
@@ -115,13 +118,14 @@ def _unpack_weather_batch(
     raise ValueError(f"Unexpected batch size: expected 6 or 7 tensors, got {len(batch)} (未预料的数据集解包维数！)")
 
 
-class FullMapConvTimeXerResidualGateQuantile(nn.Module):
+class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
     """
-    端到端架构类：包含动态门控（Dynamic Gating - 方案B）机制的综合概率预测神经网络。
+    端到端架构类：包含“TimeXer 主预测 + 相似日先验纠偏门控”机制的概率预测网络。
     核心思想：
-    1. 不再简单粗暴地将“基线”和“预测主干”相加，而是单独挂载一个小型神经网络(门控器 Gate)。
-    2. 这个门控器会根据网络输出和基线情况实时动态地运算出一个权重 α ∈ (0, 1)。
-    3. 最终预测结果 = (1-α)*基线先验 + α*(基线先验 + 核心误差计算)，也就是网络自身决定在什么气象/基线下更值得信赖谁。
+    1. TimeXer 直接预测绝对负荷值，始终作为主预测分支。
+    2. 相似日先验不再充当硬基线，而是提供纠偏方向 gap = prior_mean - timexer_pred。
+    3. 门控器会结合模型输出、先验差异、差异幅度、Top-K 离散度等证据，生成 β ∈ (0, 1)，
+       决定要吸收多少先验修正：y = timexer_pred + β * gap。
     """
     def __init__(self, configs, quantiles: Sequence[float]):
         super().__init__()
@@ -160,23 +164,24 @@ class FullMapConvTimeXerResidualGateQuantile(nn.Module):
                     max(16, int(getattr(configs, "d_model", 128)) // 4),
                 )
             )
-            # 【重要技巧】利用反解偏置使得初始化时网络倾向于特定的初设锚点权重：
-            # 如果初始 alpha 为 0.2，表示训练伊始阶段 80% 会强制听信先验经验，仅留 20% 防线更新深层神经网络内部。
-            gate_init_alpha = float(getattr(configs, "similar_day_gate_init_alpha", 0.2))
-            gate_init_alpha = min(max(gate_init_alpha, 1e-3), 1.0 - 1e-3) # 对数防御限制边缘边界，防除零错误
-            gate_bias = float(np.log(gate_init_alpha / (1.0 - gate_init_alpha))) # 反向推理 sigmoid 的原生偏置大小
-            
-            # 使用一个迷你纯 MLP 创建并负责生成混合信赖系数 Alpha 的软阀门
-            # 输入跨度: residual_pred 标量(长1) + 相似日多条曲线的记录(长 similar_day_prior_dim)
+            # 【重要技巧】利用反解偏置使得初始化时网络倾向于较低的先验采纳比例：
+            # 默认 beta=0.1，表示训练初期先让 TimeXer 以主体身份起步，仅温和引入相似日纠偏。
+            gate_init_beta = float(getattr(configs, "similar_day_gate_init_beta", 0.1))
+            gate_init_beta = min(max(gate_init_beta, 1e-3), 1.0 - 1e-3)
+            gate_bias = float(np.log(gate_init_beta / (1.0 - gate_init_beta)))
+
+            # 门控输入:
+            #   timexer_pred(1) + prior_mean(1) + gap(1) + abs_gap(1) + prior_spread(1)
+            #   + similar_day_prior(TopK+1)
             self.similar_day_gate = nn.Sequential(
-                nn.Linear(1 + self.similar_day_prior_dim, gate_hidden_dim),
+                nn.Linear(5 + self.similar_day_prior_dim, gate_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(float(getattr(configs, "dropout", 0.1))),
                 nn.Linear(gate_hidden_dim, 1),
-                nn.Sigmoid(), # 最后挤压强制规约至 (0, 1) 的混合数
+                nn.Sigmoid(), # 最后挤压强制规约至 (0, 1) 的先验采纳比例
             )
-            # 通过取消上一排网络计算权重影响，并强行加载我们刚刚算出来的固定偏置 Gate Bias，
-            # 迫使初等训练强行偏倚制定的 Alpha 安全起跑区，避免初期大幅神经震荡。
+            # 将最后一层初始化为常数门控，先用 bias 锁定 beta 的起跑区间，
+            # 再在训练中逐步学习何时更依赖历史经验。
             with torch.no_grad():
                 nn.init.zeros_(self.similar_day_gate[-2].weight)
                 nn.init.constant_(self.similar_day_gate[-2].bias, gate_bias)
@@ -237,28 +242,26 @@ class FullMapConvTimeXerResidualGateQuantile(nn.Module):
         similar_day_prior: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """端到端动态门控的前向路由主体路线"""
+        """端到端先验纠偏门控的前向路由。"""
         # --- 正常提纯出长周期的气象 Token ---
         weather_feature = self._encode_weather_sequence(weather_x, weather_x_index)
 
-        # --- 正常运行基础级 TimeXer 评估机制 ---
-        residual_pred = self.timexer(
+        # --- TimeXer 主分支：直接预测绝对负荷 ---
+        timexer_pred = self.timexer(
             load_x,                     # 截断过去的历史负荷时点
             x_mark_enc,                 # 时间标记（大背景锚点如星期、节假日）
             None,
             None,
             mask=mask,
-            x_exo=weather_feature,      # 纯粹只以外生气象环境纠偏误差
+            x_exo=weather_feature,      # 外生气象环境特征
             x_exo_mark=x_exo_mark,
         )
-        # 获取针对未来段预测的那 96 长度误差张量
-        residual_pred = residual_pred[:, -self.timexer.pred_len :, :]
+        timexer_pred = timexer_pred[:, -self.timexer.pred_len :, :]
 
-        point_pred = residual_pred # 托底降级选项：如果禁用先验，则默认输出 TimeXer 直推网络
+        point_pred = timexer_pred # 托底降级选项：如果禁用先验，则直接输出 TimeXer 主预测
         
-        # --- 发动核心决策（主网络 与 先验门控交锋场） ---
+        # --- 发动核心决策（TimeXer 主预测 与 相似日先验纠偏的交锋场） ---
         if self.use_similar_day_prior and similar_day_prior is not None:
-            # 严格防线，如果维数不匹配或者把老旧尾巴 672 给带过来了，强制报红防隐式溃坝！
             if similar_day_prior.ndim != 3:
                 raise ValueError(
                     f"similar_day_prior should be [B, pred_len, {self.similar_day_prior_dim}], "
@@ -276,27 +279,29 @@ class FullMapConvTimeXerResidualGateQuantile(nn.Module):
                 )
                 
             similar_day_prior = similar_day_prior.float()
-            # 提取其中具有基线航向指导标的的那唯一主合成平滑均线：[Batch, pred_len, 1]
             prior_mean = similar_day_prior[:, :, :1]
-            
-            # 【门控审判核心】：把预测网残差模型产生的点结果，和一众相似日先验大杂烩记录，打包去过堂做鉴定
-            # 形状：[Batch, pred_len, 1（残差维） + TopK+1（先验记录宽） ] 
-            gate_input = torch.cat([residual_pred, similar_day_prior], dim=-1)
-            
-            # 门卫执行独立推论生成系数 α，输出尺度刚好完全匹配预测长度上的逐点修正域 [Batch, pred_len, 1]。
-            alpha = self.similar_day_gate(gate_input)
-            
-            # 【平滑加成混合式流推演】：
-            # 对于 TimeXer 所做的预测来说，它是附着先验均值上产生的动态修正气突段
-            model_branch = prior_mean + residual_pred
-            
-            # 在预测区间内的每一个单独时点上，它都会灵活判断：
-            # 到底信不沾气象的单纯相似法均值 (1-α占比)，还是信根据复杂天气和深度误差推断出的修剪升级版均值 (α占比)？
-            point_pred = (1.0 - alpha) * prior_mean + alpha * model_branch
+            topk_curves = similar_day_prior[:, :, 1:]
+            if topk_curves.shape[-1] > 0:
+                prior_spread = torch.std(topk_curves, dim=-1, keepdim=True, unbiased=False)
+            else:
+                prior_spread = torch.zeros_like(prior_mean)
 
-        # 最后套一次给不确定性下界的兜底发散图包络，走人
+            gap = prior_mean - timexer_pred
+            gate_input = torch.cat(
+                [
+                    timexer_pred,
+                    prior_mean,
+                    gap,
+                    gap.abs(),
+                    prior_spread,
+                    similar_day_prior,
+                ],
+                dim=-1,
+            )
+            beta = self.similar_day_gate(gate_input)
+            point_pred = timexer_pred + beta * gap
+
         return self.quantile_head(point_pred)
-
 
 def validate_quantile(model, data_loader, criterion, args, device, use_amp: bool = False) -> float:
     model.eval()
@@ -361,7 +366,7 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
     use_non_blocking = _use_non_blocking_transfer(args, device)
 
     print("\n" + "=" * 72)
-    print("Start training similar-day baseline + residual TimeXer quantile model")
+    print("Start training TimeXer-primary + similar-day prior-correction quantile model")
     print(f"setting: {setting}")
     print(f"quantiles: {args.quantiles}")
     print(f"weather_feature_dim: {args.weather_feature_dim}")
@@ -377,7 +382,7 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
             "similar_day_gate_config: "
             f"top_k={getattr(args, 'similar_day_top_k', 0)}, "
             f"gate_hidden_dim={getattr(args, 'similar_day_gate_hidden_dim', 0)}, "
-            f"gate_init_alpha={getattr(args, 'similar_day_gate_init_alpha', 0.0):.3f}, "
+            f"gate_init_beta={float(getattr(args, 'similar_day_gate_init_beta', 0.0)):.3f}, "
             f"artifact_dir={getattr(args, 'similar_day_artifact_dir', None)}"
         )
     print(f"batch_size: {args.batch_size}")
@@ -561,7 +566,7 @@ def _get_setting(args, itr: int = 0) -> str:
         f"sdp{int(bool(getattr(args, 'use_similar_day_prior', False)))}_"
         f"sdk{int(getattr(args, 'similar_day_top_k', 0))}_"
         f"sdgh{int(getattr(args, 'similar_day_gate_hidden_dim', 0))}_"
-        f"sdga{int(round(1000.0 * float(getattr(args, 'similar_day_gate_init_alpha', 0.0))))}_"
+        f"sdga{int(round(1000.0 * float(getattr(args, 'similar_day_gate_init_beta', 0.0))))}_"
         f"lr{args.learning_rate}_bs{args.batch_size}_{args.des}_{itr}"
     )
     digest = hashlib.md5(signature.encode("utf-8")).hexdigest()[:8]
@@ -648,7 +653,7 @@ def main() -> None:
         similar_day_top_k=SIMILAR_DAY_TOP_K,
         similar_day_artifact_dir=SIMILAR_DAY_ARTIFACT_DIR,
         similar_day_gate_hidden_dim=SIMILAR_DAY_GATE_HIDDEN_DIM,
-        similar_day_gate_init_alpha=SIMILAR_DAY_GATE_INIT_ALPHA,
+        similar_day_gate_init_beta=SIMILAR_DAY_GATE_INIT_BETA,
     )
 
     if torch.cuda.is_available() and args.use_gpu:
@@ -677,11 +682,11 @@ def main() -> None:
                 f"kernel=({args.weather_kernel_height}, {args.weather_kernel_width})"
             )
 
-        model = FullMapConvTimeXerResidualGateQuantile(args, quantiles=base.QUANTILES).float().to(device)
+        model = FullMapConvTimeXerPriorCorrectionGateQuantile(args, quantiles=base.QUANTILES).float().to(device)
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Similar-day baseline + residual TimeXer total params: {total_params:,}")
-        print(f"Similar-day baseline + residual TimeXer trainable params: {trainable_params:,}")
+        print(f"TimeXer-primary + prior-correction total params: {total_params:,}")
+        print(f"TimeXer-primary + prior-correction trainable params: {trainable_params:,}")
 
         setting = _get_setting(args)
         if base.TRAIN_MODE:
@@ -707,7 +712,7 @@ def main() -> None:
             results_dir,
             use_inverse=base.INVERSE_EVAL,
             quantiles=args.quantiles,
-            title_prefix="Similar-Day Baseline + Residual TimeXer Prediction",
+            title_prefix="TimeXer-Primary + Similar-Day Prior-Correction Prediction",
             y_label="Load (MW)",
         )
 
@@ -729,7 +734,7 @@ def main() -> None:
             use_inverse=base.INVERSE_EVAL,
             quantiles=args.quantiles,
             data_provider_fn=weather_data_provider,
-            model_label="Similar-Day Baseline + Residual TimeXer",
+            model_label="TimeXer-Primary + Similar-Day Prior-Correction",
             y_label="Load (MW)",
             similar_day_result=similar_day_result,
         )

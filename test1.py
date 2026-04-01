@@ -88,10 +88,10 @@ PRED_LEN = 96        # 96 个 15min = 1 天
 # ==================== 模型架构参数 ====================
 ENC_IN = 1 # 编码器输入特征维度：单变量模式下为 1（仅负荷值）
 C_OUT = 1 # 输出特征维度：预测单一目标变量，维度为 1
-D_MODEL = 256 # Transformer 隐含层维度（d_model）：每个 token/patch 的嵌入向量维度
-N_HEADS = 4 # 多头注意力的头数：将 d_model=256 均分为 4 个子空间，每个头处理 64 维
+D_MODEL = 512 # Transformer 隐含层维度（d_model）：每个 token/patch 的嵌入向量维度
+N_HEADS = 4 # 多头注意力的头数：将 d_model=512 均分为 4 个子空间，每个头处理 128 维
 E_LAYERS = 3 # 编码器 Transformer 层数：3 层堆叠的自注意力+前馈网络块
-D_FF = 1024 # 前馈网络隐含层维度：通常为 d_model 的 4 倍（256 × 4 = 1024）
+D_FF = 2048 # 前馈网络隐含层维度：通常为 d_model 的 4 倍（512 × 4 = 2048）
 FACTOR = 3 # 注意力机制中的缩放因子（ProbSparse Attention 中控制 top-k 采样的参数）
 DROPOUT = 0.1 # Dropout 比率：训练时随机丢弃 10% 的神经元，防止过拟合
 ACTIVATION = "gelu" # 激活函数类型："gelu"（高斯误差线性单元），比 ReLU 更平滑，在 Transformer 架构中广泛使用
@@ -114,15 +114,9 @@ GPU = 0 # 指定使用的 GPU 设备编号（cuda:0 为第一块显卡）
 DES = "Exp" # 实验描述标签，用于生成检查点/结果目录名中的描述字段
 ITR = 1 # 实验重复次数：当 ITR > 1 时可评估模型的训练稳定性和结果方差
 INVERSE_EVAL = True # 是否在评估时对预测值和真实值做反标准化
-TRAIN_MODE = True    # 训练模式开关
+TRAIN_MODE = False    # 训练模式开关
 
-# ==================== /use 导入配置 ====================
-LOAD_FROM_USE = False  # 是否从 /use 导入最优参数和权重（仅测试模式有效）
-USE_DIR = "./use" # /use 目录的路径，存放调优后的最佳参数和模型权重
-USE_BEST_PARAMS_FILE = "best_params.json" # 最佳超参数文件名（仅含可调参数，如 d_model、learning_rate 等）
-USE_BEST_CONFIG_FILE = "best_config.json" # 最佳完整配置文件名（包含所有 args 属性，可直接覆盖整个配置）
-USE_BEST_WEIGHT_FILE = "best_model.pth" # 最佳模型权重文件名（PyTorch state_dict 格式）
-
+# ==================== /optuna 导入配置 ====================
 # 可调参数名称映射表：将 best_params.json 中的大写键名映射为 args 中对应的小写属性名。
 LOAD_FROM_OPTUNA = False
 OPTUNA_DIR = "./optuna"
@@ -155,75 +149,6 @@ def _load_json_file(json_path: str):
     """
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def _apply_use_artifacts(args: argparse.Namespace) -> argparse.Namespace:
-    """
-    从 /use 目录导入最优超参数和模型权重，覆盖当前实验配置。
-
-    加载逻辑优先级：
-        1. 优先加载 best_config.json（完整配置），直接覆盖所有 args 属性
-        2. 若不存在，则尝试加载 best_params.json（仅可调超参数），
-           通过 TUNABLE_PARAM_MAP 映射后覆盖对应属性
-        3. 两者都不存在则抛出 FileNotFoundError
-
-    加载完成后自动设置：
-        - args.is_training = 0（强制切换为测试模式）
-        - args.load_weight_path = 权重文件路径
-        - args.n_quantiles 重新根据 args.quantiles 计算
-
-    Args:
-        args: 当前实验的 argparse.Namespace 配置对象
-
-    Returns:
-        更新后的 args 配置对象
-
-    Raises:
-        FileNotFoundError: 权重文件不存在，或参数/配置文件均不存在
-        ValueError: JSON 文件内容不是字典格式
-    """
-    # 构建 /use 目录下各文件的绝对路径
-    use_dir = os.path.abspath(USE_DIR)
-    config_path = os.path.join(use_dir, USE_BEST_CONFIG_FILE)   # 完整配置文件路径
-    params_path = os.path.join(use_dir, USE_BEST_PARAMS_FILE)   # 可调参数文件路径
-    weight_path = os.path.join(use_dir, USE_BEST_WEIGHT_FILE)   # 模型权重文件路径
-
-    # 前置检查：权重文件是必须存在的，否则无法进行推理
-    if not os.path.exists(weight_path):
-        raise FileNotFoundError(f"/use 权重文件不存在: {weight_path}")
-
-    # 优先尝试加载完整配置文件（best_config.json）
-    if os.path.exists(config_path):
-        payload = _load_json_file(config_path)
-        if not isinstance(payload, dict):
-            raise ValueError(f"/use 配置文件内容不是 JSON 对象: {config_path}")
-        # 完整配置：直接用键值对覆盖 args 的所有对应属性
-        for key, value in payload.items():
-            setattr(args, key, value)
-    # 退而求其次，加载可调参数文件（best_params.json）
-    elif os.path.exists(params_path):
-        payload = _load_json_file(params_path)
-        if not isinstance(payload, dict):
-            raise ValueError(f"/use 超参数文件内容不是 JSON 对象: {params_path}")
-        # 可调参数：通过 TUNABLE_PARAM_MAP 将大写键名映射为小写属性名后设置
-        # 若键名不在映射表中，则直接使用原始键名（兼容未预定义的自定义参数）
-        for raw_key, value in payload.items():
-            key = TUNABLE_PARAM_MAP.get(str(raw_key), str(raw_key))
-            setattr(args, key, value)
-    else:
-        # 两个参数文件均不存在，抛出异常提示用户
-        raise FileNotFoundError(
-            f"/use 中未找到 {USE_BEST_CONFIG_FILE} 或 {USE_BEST_PARAMS_FILE}"
-        )
-
-    # 强制切换为测试模式（不训练，仅推理评估）
-    args.is_training = 0
-    # 记录权重文件路径，供后续模型加载时使用
-    args.load_weight_path = weight_path
-    # 重新计算分位数数量（配置文件可能修改了 quantiles 列表）
-    args.n_quantiles = len(args.quantiles)
-    print(f"已从 /use 导入参数与权重: {weight_path}")
-    return args
 
 
 # =============================================================================
@@ -723,8 +648,6 @@ def main():
     if not args.is_training:
         if LOAD_FROM_OPTUNA:
             args = _apply_optuna_artifacts(args)
-        elif LOAD_FROM_USE:
-            args = _apply_use_artifacts(args)
 
     # ==================== 配置计算设备 ====================
     if torch.cuda.is_available() and args.use_gpu:

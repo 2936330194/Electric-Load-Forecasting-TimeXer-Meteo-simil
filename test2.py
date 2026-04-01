@@ -91,10 +91,10 @@ WEATHER_FUTURE_LEN = 0  # 当前脚本仍只使用历史天气；未来天气长
 # ==================== TimeXer 模型配置 ====================
 ENC_IN = 1  # 外生模式下内生输入仅包含负荷
 C_OUT = 1  # 输出通道数
-D_MODEL = 256  # 隐藏层特征维度
+D_MODEL = 512  # 隐藏层特征维度
 N_HEADS = 4  # 多头注意力头数
 E_LAYERS = 3  # 编码器层数
-D_FF = 1024  # 前馈网络维度
+D_FF = 2048  # 前馈网络维度
 FACTOR = 3  # 注意力因子
 DROPOUT = 0.1  # dropout 比例
 ACTIVATION = "gelu"  # 激活函数
