@@ -129,34 +129,36 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
     """
     def __init__(self, configs, quantiles: Sequence[float]):
         super().__init__()
-        # ------- 参数配置与初始化 -------
-        self.quantiles = list(quantiles)                                            # 分位数列表
+        # ------- 1. 基础参数配置与初始化 -------
+        self.quantiles = list(quantiles)                                            # 概率预测的分位数列表（如 [0.1, 0.5, 0.9]）
         self.n_quantiles = len(self.quantiles)                                      # 需要预测的分位数数量
-        self.weather_feature_dim = int(configs.weather_feature_dim)                 # CNN 分片降维的向量度
-        self.encode_chunk_size = int(getattr(configs, "weather_encode_chunk_size", 512)) # 图像分块送入防 OOM
+        self.weather_feature_dim = int(configs.weather_feature_dim)                 # 气象特征经过 CNN 降维后的向量维度大小
+        self.encode_chunk_size = int(getattr(configs, "weather_encode_chunk_size", 512)) # 气象特征编码的切块大小，用于防止显存溢出 (OOM)
         
-        # ------- 相似日专属基数 -------
-        self.use_similar_day_prior = bool(getattr(configs, "use_similar_day_prior", False))
-        self.similar_day_top_k = int(getattr(configs, "similar_day_top_k", 3))
-        # 通道为 TopK 条相似日曲线 + 1 条综合权重底层锚点曲线
+        # ------- 2. 相似日先验相关配置 -------
+        self.use_similar_day_prior = bool(getattr(configs, "use_similar_day_prior", False)) # 是否启用相似日先验纠偏逻辑
+        self.similar_day_top_k = int(getattr(configs, "similar_day_top_k", 3))              # 提取的历史相似日数量 (Top-K)
+        # 相似日先验的特征维度大小：TopK 条相似日曲线 + 1 条通过加权平均得到的综合基准曲线
         self.similar_day_prior_dim = self.similar_day_top_k + 1 if self.use_similar_day_prior else 0
 
+        # ------- 3. 气象特征提取主干网络 (CNN backbone) -------
         self.weather_backbone = FullMapWeatherConvExtractor(
-            in_channels=int(getattr(configs, "weather_in_channels")),
-            out_channels=self.weather_feature_dim,
-            kernel_height=int(getattr(configs, "weather_kernel_height")),
-            kernel_width=int(getattr(configs, "weather_kernel_width")),
-            dropout=float(getattr(configs, "dropout", 0.1)),
+            in_channels=int(getattr(configs, "weather_in_channels")),               # 输入气象数据的通道数
+            out_channels=self.weather_feature_dim,                                  # CNN 提取特征后的输出通道数
+            kernel_height=int(getattr(configs, "weather_kernel_height")),           # 气象网格的高度
+            kernel_width=int(getattr(configs, "weather_kernel_width")),             # 气象网格的宽度
+            dropout=float(getattr(configs, "dropout", 0.1)),                        # CNN 模块的 Dropout 比例
         )
 
-        self.weather_seq_len = int(getattr(configs, "weather_seq_len", configs.seq_len))
-        configs.exo_seq_len = self.weather_seq_len
-        configs.enc_in = 1
-        self.timexer = TimeXer(configs)
+        # ------- 4. 核心时序预测模型 (TimeXer) 的配置 -------
+        self.weather_seq_len = int(getattr(configs, "weather_seq_len", configs.seq_len)) # 气象序列的长度
+        configs.exo_seq_len = self.weather_seq_len                                  # 设定 TimeXer 接收的外生变量序列长度
+        configs.enc_in = 1                                                          # 设定 TimeXer 编码器的输入维度（单变量负荷）
+        self.timexer = TimeXer(configs)                                             # 实例化底层 TimeXer 预测模型
 
-        # ------- 构建增强的门控子网络单元模块 -------
+        # ------- 5. 构建增强的相似日先验纠偏门控单元 (Gating Mechanism) -------
         if self.use_similar_day_prior:
-            # 门控器的隐层计算维度，如果没有给在设定里，则在 16 和 d_model/4 里取个合适的最大值
+            # 门控网络的隐藏层维度：如果未在 configs 中配置，则在 16 和 d_model/4 之间取一个合理的最大值
             gate_hidden_dim = int(
                 getattr(
                     configs,
@@ -164,31 +166,48 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
                     max(16, int(getattr(configs, "d_model", 128)) // 4),
                 )
             )
-            # 【重要技巧】利用反解偏置使得初始化时网络倾向于较低的先验采纳比例：
-            # 默认 beta=0.1，表示训练初期先让 TimeXer 以主体身份起步，仅温和引入相似日纠偏。
+            
+            # 【重要技巧：门控偏差初始化 (Bias Initialization)】
+            # 目的：通过反解 Sigmoid 函数来设置初始偏置项，使得网络在初始化时倾向于产生较低的先验采纳比例 β。
+            # 默认初始 beta (gate_init_beta) 设为 0.1，意味着在模型训练初期，模型主要依赖 TimeXer 分支的主干预测能力。
+            # 先验信息只被非常轻微（温和）地引入进行修正，以防初期先验特征带来的抖动引起模型崩溃。
             gate_init_beta = float(getattr(configs, "similar_day_gate_init_beta", 0.1))
-            gate_init_beta = min(max(gate_init_beta, 1e-3), 1.0 - 1e-3)
-            gate_bias = float(np.log(gate_init_beta / (1.0 - gate_init_beta)))
+            gate_init_beta = min(max(gate_init_beta, 1e-3), 1.0 - 1e-3)             # 截断以避免 log(0) 问题
+            gate_bias = float(np.log(gate_init_beta / (1.0 - gate_init_beta)))      # 反解 Sigmoid：bias = ln(beta / (1 - beta))
 
-            # 门控输入:
-            #   timexer_pred(1) + prior_mean(1) + gap(1) + abs_gap(1) + prior_spread(1)
-            #   + similar_day_prior(TopK+1)
+            # 构建门控多层感知机 (MLP)
+            # 门控输入的设计 (共 5 + TopK + 1 维):
+            #   1维: timexer_pred     (TimeXer 的初步预测值)
+            #   1维: prior_mean       (相似日先验曲线的平均值)
+            #   1维: gap              (先验差异：prior_mean - timexer_pred)
+            #   1维: abs_gap          (差异幅度：|gap|)
+            #   1维: prior_spread     (先验离散度：Top-K 相似日之间的标准差)
+            #   TopK+1维: similar_day_prior (TopK 序列和综合基准序列的值)
             self.similar_day_gate = nn.Sequential(
                 nn.Linear(5 + self.similar_day_prior_dim, gate_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(float(getattr(configs, "dropout", 0.1))),
                 nn.Linear(gate_hidden_dim, 1),
-                nn.Sigmoid(), # 最后挤压强制规约至 (0, 1) 的先验采纳比例
+                nn.Sigmoid(), # 最后一层使用 Sigmoid，将纠偏权重强行压缩约束到 (0, 1) 的比例区间
             )
-            # 将最后一层初始化为常数门控，先用 bias 锁定 beta 的起跑区间，
-            # 再在训练中逐步学习何时更依赖历史经验。
+            
+            # 将输出层（即 nn.Linear(gate_hidden_dim, 1)）初始化为常数门控结构：
+            # 1. 权重置为 0；
+            # 2. 偏置置为计算出的 gate_bias；
+            # 这样网络在刚开始训练时，前向推导出的 gate β 值严格等于 gate_init_beta (0.1)，后续随着梯度更新再逐步学习各个特征的权重。
             with torch.no_grad():
                 nn.init.zeros_(self.similar_day_gate[-2].weight)
                 nn.init.constant_(self.similar_day_gate[-2].bias, gate_bias)
         else:
-            self.similar_day_gate = None
+            self.similar_day_gate = None                                            # 不启用相似日先验纠偏逻辑
 
+        # ------- 6. 联合分位数回归预测头 (Quantile Regression Head) -------
+        # 负责将校正后的 1 维单点负荷预测扩展映射为多维的不同置信区间（分位数）的负荷预测
         self.quantile_head = nn.Linear(1, self.n_quantiles)
+        
+        # 分位数头初始化的先验约束：
+        # 将权重全置为 1.0：表明各分位数上的初始估计值都等同于单点绝对纠偏值 (y = x)
+        # 将偏置设为按分位数大小比例递增：如 q=0.1 偏置为负，q=0.9 偏置为正，从一开始就构造好上下分位数的自然间隔结构。
         with torch.no_grad():
             self.quantile_head.weight.fill_(1.0)
             self.quantile_head.bias.copy_(torch.tensor([q - 0.5 for q in self.quantiles]) * 0.1)
@@ -242,65 +261,102 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
         similar_day_prior: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """端到端先验纠偏门控的前向路由。"""
-        # --- 正常提纯出长周期的气象 Token ---
+        """
+        端到端先验纠偏门控的前向网络路由 (Forward Pass)
+        
+        参数:
+            load_x (Tensor): 过去一段时间的历史负荷序列，形状为 [Batch, seq_len, 1]
+            x_mark_enc (Tensor): 负荷序列对应的时间特征编码（如 星期几、小时 等），形状为 [Batch, seq_len, mark_dim]
+            x_exo_mark (Tensor): 外生气象变量的时间特征编码，形状为 [Batch, exo_seq_len, mark_dim]
+            weather_x (Tensor): 全天候多要素气象网格数据，形状为 [Batch, exo_seq_len, C, H, W]（或预计算过的气象索引池）
+            weather_x_index (Optional[Tensor]): 当采用预计算的大规模气象池时所对应的气象文件索引位置
+            similar_day_prior (Optional[Tensor]): 外挂传入的历史相似日负荷先验曲线，包含均值线及 TopK 原片，形状为 [Batch, pred_len, similar_day_prior_dim]
+            mask (Optional[Tensor]): 时序填充掩码遮罩
+        
+        返回:
+            torch.Tensor: 支持多置信区间的最终预测结果，形状为 [Batch, pred_len, n_quantiles]
+        """
+        # --- 1. 气象表征降维提取：正常提纯出长周期的气象 Token ---
         weather_feature = self._encode_weather_sequence(weather_x, weather_x_index)
 
-        # --- TimeXer 主分支：直接预测绝对负荷 ---
+        # --- 2. TimeXer 主分支推导：直接预测未来目标时段绝对负荷值 ---
         timexer_pred = self.timexer(
-            load_x,                     # 截断过去的历史负荷时点
-            x_mark_enc,                 # 时间标记（大背景锚点如星期、节假日）
+            load_x,                     # 截取过去的纯历史负荷标量序列
+            x_mark_enc,                 # 时间标记（大背景锚点：如周期节气、节假日、星期等）
             None,
             None,
             mask=mask,
-            x_exo=weather_feature,      # 外生气象环境特征
-            x_exo_mark=x_exo_mark,
+            x_exo=weather_feature,      # 灌入通过 CNN 或池化后解析出的高阶外生气象环境特征序列 [Batch, exo_seq_len, weather_feature_dim]
+            x_exo_mark=x_exo_mark,      # 气象序列的协变量编码
         )
+        
+        # 将 TimeXer 底层出来的时序拼接到需要预测的 seq 长度 (仅截取未来预测时段 pred_len 的输出部分)
         timexer_pred = timexer_pred[:, -self.timexer.pred_len :, :]
 
-        point_pred = timexer_pred # 托底降级选项：如果禁用先验，则直接输出 TimeXer 主预测
+        # 托底降级选项：如果关闭或者未传入相似日先验修正逻辑，则最终预测输出直接依赖纯净的 TimeXer 本地预测
+        point_pred = timexer_pred 
         
-        # --- 发动核心决策（TimeXer 主预测 与 相似日先验纠偏的交锋场） ---
+        # --- 3. 发动核心架构：相似日先验柔性纠偏门控 (Residual Gating Fusion) ---
         if self.use_similar_day_prior and similar_day_prior is not None:
+            # ======= 数据安全性与维度校验 =======
             if similar_day_prior.ndim != 3:
                 raise ValueError(
-                    f"similar_day_prior should be [B, pred_len, {self.similar_day_prior_dim}], "
-                    f"got {tuple(similar_day_prior.shape)}"
+                    f"传入的最邻近相似日先验数据维度错误：应为 [Batch, pred_len, 维度({self.similar_day_prior_dim})], "
+                    f"但实际得到 {tuple(similar_day_prior.shape)}"
                 )
             if similar_day_prior.shape[1] != self.timexer.pred_len:
                 raise ValueError(
-                    "similar_day_prior time dimension does not match pred_len: "
-                    f"{similar_day_prior.shape[1]} vs {self.timexer.pred_len}"
+                    f"相似日先验的时间步长与预测步长不吻合: "
+                    f"先验维度 {similar_day_prior.shape[1]} vs 模型预测域长 {self.timexer.pred_len}"
                 )
             if similar_day_prior.shape[2] != self.similar_day_prior_dim:
                 raise ValueError(
-                    "similar_day_prior feature dimension does not match configuration: "
-                    f"{similar_day_prior.shape[2]} vs {self.similar_day_prior_dim}"
+                    "相似日先验的特征通道数与初始化配置不同步: "
+                    f"当前传递的通道数 {similar_day_prior.shape[2]} vs 配置设定的通量为 {self.similar_day_prior_dim}"
                 )
                 
+            # ======= 提纯出供 Gate 推理的多维度参考物理量 =======
             similar_day_prior = similar_day_prior.float()
+            # 索引0位置：是根据某种距离策略算出的相似日加权融合后作为锚点的先验均值曲线 (综合基准基线)
             prior_mean = similar_day_prior[:, :, :1]
+            
+            # 索引1及以后：未经处理的纯正 Top-K 历史真值负荷切片（供计算内部扰动和离散边界）
             topk_curves = similar_day_prior[:, :, 1:]
+            
             if topk_curves.shape[-1] > 0:
+                # 衡量先验信息的置信度：TopK 序列自身的无偏标准差。
+                # 标准差越大，说明挑选出来的相似日彼此走势分歧强烈，先验的可信度就相对存疑。
                 prior_spread = torch.std(topk_curves, dim=-1, keepdim=True, unbiased=False)
             else:
                 prior_spread = torch.zeros_like(prior_mean)
 
+            # --- 4. 差距度量表与动态β加权融合 ---
+            # 门控网络核心物理学视角下的 "纠偏方向向量 (gap)"，目标是从 timexer_pred 出发指向 prior_mean 的修正幅度向量
             gap = prior_mean - timexer_pred
+            
+            # 聚合所有的判定线索
             gate_input = torch.cat(
                 [
-                    timexer_pred,
-                    prior_mean,
-                    gap,
-                    gap.abs(),
-                    prior_spread,
-                    similar_day_prior,
+                    timexer_pred,       # [B, L, 1] 主分支当前预估体量（负荷基数大小）
+                    prior_mean,         # [B, L, 1] 相似日先验综合均值基线
+                    gap,                # [B, L, 1] 原始差距（具有正负符号，体现高估或低估）
+                    gap.abs(),          # [B, L, 1] 绝对规模位移差（要校正的程度多猛烈）
+                    prior_spread,       # [B, L, 1] Top-K 自身的不一致性（先验信噪系数指标）
+                    similar_day_prior,  # [B, L, TopK+1] 完整的全幅先验环境分布特征
                 ],
                 dim=-1,
             )
+            
+            # 使用门控多层感知机及末端 Sigmoid 推理出动态采纳比例 beta ∈ (0, 1)
+            # β -> 0: 说明模型认定没必要大调，充分采信 TimeXer 主支结果，先验权当参考。
+            # β -> 1: 说明模型认定需要大幅度吸纳外挂库相似日经验，做强制的拉平纠正预估（多见于气候巨变或非标事件如节假日异常断层）。
             beta = self.similar_day_gate(gate_input)
+            
+            # 执行校正合成公式：最终输出 = 主线原始预测 + 修正采纳比例 * 去往先验的差距量
             point_pred = timexer_pred + beta * gap
 
+        # --- 5. 置信区间多阶段散射 ---
+        # 抛给量化回归头：根据加权校正后的中心点预估分布，分化成诸如 10%, 50%, 90% 各级不同保护圈大小的区间分布负荷
         return self.quantile_head(point_pred)
 
 def validate_quantile(model, data_loader, criterion, args, device, use_amp: bool = False) -> float:
