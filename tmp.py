@@ -419,11 +419,13 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
     best_vali_loss = float("inf")
     best_epoch = 0
     best_state_dict = None
+    patience_counter = 0
 
     print("\n" + "=" * 72)
     print("Start training TimeXer-primary + similar-day prior-correction quantile model")
     print("validation split: test")
     print(f"best model path: {model_path}")
+    print(f"early stopping patience: {args.patience}")
     print(f"quantiles: {args.quantiles}")
     print(f"weather_feature_dim: {args.weather_feature_dim}")
     print(f"weather_kernel_size: ({args.weather_kernel_height}, {args.weather_kernel_width})")
@@ -506,6 +508,7 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
         if np.isfinite(vali_loss) and vali_loss < best_vali_loss:
             best_vali_loss = float(vali_loss)
             best_epoch = epoch + 1
+            patience_counter = 0
             best_state_dict = {
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
@@ -515,6 +518,15 @@ def train_quantile_model(model, args, device, weather_store: WeatherGridStore):
                 f"Save best test-validated model at epoch {best_epoch}: "
                 f"loss={best_vali_loss:.7f}"
             )
+        else:
+            patience_counter += 1
+            print(
+                f"No improvement. Early-stop counter: "
+                f"{patience_counter}/{args.patience}"
+            )
+            if patience_counter >= args.patience:
+                print("Early stopping")
+                break
         adjust_learning_rate(optimizer, epoch + 1, args)
 
     if best_state_dict is None:
@@ -666,7 +678,7 @@ def main() -> None:
         freq=base.LOAD_FREQ,
         embed="timeF",
         output_dir="./tmp",
-        model_path="./tmp/best_test_model.pth",
+        model_path="./tmp/checkpoint.pth",
         seq_len=base.SEQ_LEN,
         label_len=base.LABEL_LEN,
         pred_len=base.PRED_LEN,
