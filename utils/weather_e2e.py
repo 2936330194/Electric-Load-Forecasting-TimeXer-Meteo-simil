@@ -1555,6 +1555,41 @@ class LoadWeatherEndToEndDataset(Dataset):
         self._resolved_similar_day_artifact_dir = artifact_dir
         return artifact_dir
 
+    def _resolve_similar_day_weather_h5_path(
+        self,
+        saved_weather_h5_path: Optional[str],
+    ) -> str:
+        runtime_weather_h5 = self._resolve_primary_weather_h5_path()
+        if saved_weather_h5_path in (None, ""):
+            print(
+                f"[dataset-{self.set_type}] similar-day retriever missing weather_h5_path; "
+                f"fallback to runtime weather H5: {runtime_weather_h5}"
+            )
+            return runtime_weather_h5
+
+        saved_weather_h5 = os.path.abspath(str(saved_weather_h5_path))
+        if os.path.exists(saved_weather_h5):
+            if os.path.normcase(saved_weather_h5) != os.path.normcase(runtime_weather_h5):
+                print(
+                    f"[dataset-{self.set_type}] similar-day retriever weather_h5 differs from "
+                    f"runtime config; keep artifact weather H5: {saved_weather_h5}"
+                )
+            return saved_weather_h5
+
+        if not os.path.exists(runtime_weather_h5):
+            raise FileNotFoundError(
+                "similar-day retriever saved weather_h5_path is missing on this device, "
+                f"and runtime weather H5 is also missing: saved={saved_weather_h5}, "
+                f"runtime={runtime_weather_h5}"
+            )
+
+        print(
+            f"[dataset-{self.set_type}] similar-day retriever weather_h5 not found locally; "
+            f"fallback to runtime weather H5: saved={saved_weather_h5}, "
+            f"runtime={runtime_weather_h5}"
+        )
+        return runtime_weather_h5
+
     def _build_similar_day_prior_cache(self) -> None:
         sample_count = len(self)
         feature_dim = self.similar_day_top_k + 1
@@ -1577,6 +1612,7 @@ class LoadWeatherEndToEndDataset(Dataset):
             raise ImportError(f"加载 similar_day_retriever 失败: {exc}") from exc
 
         retriever = SimilarDayRetriever.load(artifact_dir)
+        retriever.weather_h5_path = self._resolve_similar_day_weather_h5_path(retriever.weather_h5_path)
         if retriever.weather_h5_path is None:
             raise RuntimeError("相似日检索库中缺少 weather_h5_path 元信息。")
 

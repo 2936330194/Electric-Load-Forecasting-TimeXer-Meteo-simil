@@ -94,6 +94,25 @@ def _default_artifact_dir_for_weather(weather_h5_path: Union[str, Path]) -> Path
     return (ROOT_DIR / "artifacts" / f"similar_day_retriever_{dataset_tag}").resolve()
 
 
+def _resolve_loaded_weather_h5_path(weather_h5_path: Optional[Union[str, Path]]) -> Optional[str]:
+    if weather_h5_path in (None, ""):
+        return None
+
+    saved_path = Path(str(weather_h5_path))
+    if saved_path.exists():
+        return str(saved_path.resolve())
+
+    local_candidate = (ROOT_DIR / "data" / saved_path.name).resolve()
+    if local_candidate.exists():
+        print(
+            "[load] saved weather_h5_path not found on this device; "
+            f"fallback to local data file: {local_candidate}"
+        )
+        return str(local_candidate)
+
+    return str(saved_path)
+
+
 # 相似日检索库（Artifacts）的默认保存目录
 DEFAULT_ARTIFACT_DIR = _default_artifact_dir_for_weather(DEFAULT_WEATHER_H5)
 # 默认的 AE 模型权重路径
@@ -2134,7 +2153,7 @@ class SimilarDayRetriever:
 
         # 6. 回填运行状态元数据
         retriever.load_csv_path = metadata.get("load_csv_path")
-        retriever.weather_h5_path = metadata.get("weather_h5_path")
+        retriever.weather_h5_path = _resolve_loaded_weather_h5_path(metadata.get("weather_h5_path"))
         retriever.train_frame_count = metadata.get("train_frame_count")
         retriever.train_window_count = metadata.get("train_window_count")
         retriever.fused_dim = metadata.get("fused_dim")
