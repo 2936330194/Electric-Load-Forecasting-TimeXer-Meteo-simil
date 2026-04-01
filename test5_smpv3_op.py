@@ -36,6 +36,7 @@ DEFAULT_OPTUNA_STUDY_NAME = "t5v3"
 DEFAULT_OPTUNA_N_TRIALS = 100
 DEFAULT_OPTUNA_TIMEOUT = 0
 DEFAULT_OPTUNA_DIRECTION = "minimize"
+DEFAULT_MAX_CONSECUTIVE_NONFINITE_VALI_EPOCHS = 2
 
 DEFAULT_USE_DIR = "./optuna"
 USE_BEST_PARAMS_FILE = "best_params5.json"
@@ -163,6 +164,7 @@ def _base_args_dict(weather_source: Optional[str] = None) -> Dict[str, Any]:
         "train_epochs": core.TRAIN_EPOCHS,
         "batch_size": core.BATCH_SIZE,
         "patience": core.PATIENCE,
+        "max_consecutive_nonfinite_vali_epochs": DEFAULT_MAX_CONSECUTIVE_NONFINITE_VALI_EPOCHS,
         "learning_rate": core.LEARNING_RATE,
         "loss": "Quantile",
         "lradj": "cosine",
@@ -217,6 +219,7 @@ def _build_args(
         "train_epochs",
         "batch_size",
         "patience",
+        "max_consecutive_nonfinite_vali_epochs",
         "gpu",
         "n_quantiles",
         "similar_day_top_k",
@@ -373,6 +376,11 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     use_non_blocking = task._use_non_blocking_transfer(args, device)
     best_vali_loss = float("inf")
+    consecutive_nonfinite_vali_epochs = 0
+    max_consecutive_nonfinite_vali_epochs = max(
+        1,
+        int(getattr(args, "max_consecutive_nonfinite_vali_epochs", DEFAULT_MAX_CONSECUTIVE_NONFINITE_VALI_EPOCHS)),
+    )
 
     print("\n" + "=" * 72)
     print("Start Optuna trial training: weather-token + similar-day-token early-fusion")
@@ -393,6 +401,7 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
         )
     print(f"batch_size: {args.batch_size}")
     print(f"use_amp: {use_amp}")
+    print(f"max_consecutive_nonfinite_vali_epochs: {max_consecutive_nonfinite_vali_epochs}")
     print("=" * 72)
 
     for epoch in range(args.train_epochs):
@@ -452,12 +461,29 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
         )
 
         if np.isfinite(vali_loss):
+            consecutive_nonfinite_vali_epochs = 0
             best_vali_loss = min(best_vali_loss, float(vali_loss))
+        else:
+            consecutive_nonfinite_vali_epochs += 1
+            print(
+                f"Non-finite vali_loss detected at epoch {epoch + 1}: {vali_loss} "
+                f"(consecutive={consecutive_nonfinite_vali_epochs}/"
+                f"{max_consecutive_nonfinite_vali_epochs})"
+            )
+            if consecutive_nonfinite_vali_epochs >= max_consecutive_nonfinite_vali_epochs:
+                message = (
+                    f"Pruned trial due to {consecutive_nonfinite_vali_epochs} consecutive "
+                    f"non-finite vali_loss values; latest={vali_loss}"
+                )
+                if trial is not None:
+                    raise TrialPruned(message)
+                raise RuntimeError(message)
 
         if trial is not None:
-            trial.report(float(vali_loss), step=epoch)
-            if trial.should_prune():
-                raise TrialPruned(f"Trial pruned at epoch {epoch + 1} with vali_loss={float(vali_loss):.7f}")
+            if np.isfinite(vali_loss):
+                trial.report(float(vali_loss), step=epoch)
+                if trial.should_prune():
+                    raise TrialPruned(f"Trial pruned at epoch {epoch + 1} with vali_loss={float(vali_loss):.7f}")
 
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:
@@ -466,6 +492,14 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
         task.adjust_learning_rate(optimizer, epoch + 1, args)
 
     best_model_path = os.path.join(path, "checkpoint.pth")
+    if not os.path.exists(best_model_path):
+        message = (
+            f"No checkpoint was saved for trial setting={setting}. "
+            "This usually means validation loss stayed non-finite for the whole trial."
+        )
+        if trial is not None:
+            raise TrialPruned(message)
+        raise FileNotFoundError(message)
     model.load_state_dict(torch.load(best_model_path, map_location=device))
     print(f"Loaded best model weights: {best_model_path}")
     return model, best_vali_loss
@@ -780,6 +814,7 @@ def run_optuna_study(cli_args) -> Dict[str, Any]:
         "results_root": str(results_root),
         "train_epochs": int(cli_args.train_epochs),
         "patience": int(cli_args.patience),
+        "max_consecutive_nonfinite_vali_epochs": int(cli_args.max_consecutive_nonfinite_vali_epochs),
         "use_gpu": not bool(cli_args.use_cpu),
         "gpu": int(cli_args.gpu),
         "use_amp": not bool(cli_args.no_amp),
@@ -920,6 +955,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=FIX_SEED)
     parser.add_argument("--train-epochs", type=int, default=core.TRAIN_EPOCHS)
     parser.add_argument("--patience", type=int, default=core.PATIENCE)
+    parser.add_argument(
+        "--max-consecutive-nonfinite-vali-epochs",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_NONFINITE_VALI_EPOCHS,
+    )
     parser.add_argument("--gpu", type=int, default=core.GPU)
     parser.add_argument("--use-cpu", action="store_true", default=False)
     parser.add_argument("--no-amp", action="store_true", default=False)
@@ -944,6 +984,7 @@ def _build_runtime_namespace(config: Dict[str, Any]) -> argparse.Namespace:
         "seed": FIX_SEED,
         "train_epochs": core.TRAIN_EPOCHS,
         "patience": core.PATIENCE,
+        "max_consecutive_nonfinite_vali_epochs": DEFAULT_MAX_CONSECUTIVE_NONFINITE_VALI_EPOCHS,
         "gpu": core.GPU,
         "use_cpu": False,
         "no_amp": False,
