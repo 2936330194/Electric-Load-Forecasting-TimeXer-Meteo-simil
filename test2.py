@@ -120,7 +120,7 @@ GPU = 0  # 使用的 GPU 编号
 DES = "Exp"  # 实验描述后缀
 ITR = 1  # 实验重复次数
 INVERSE_EVAL = True  # 评估时是否反标准化
-TRAIN_MODE = False  # True 为训练+测试，False 为仅加载测试
+TRAIN_MODE = True  # True 为训练+测试，False 为仅加载测试
 
 
 # ==================== 数据通路配置 ====================

@@ -12,6 +12,7 @@ Compared with test5_smp.py:
 
 import argparse
 import hashlib
+import json
 import os
 import random
 import time
@@ -62,6 +63,68 @@ _parse_cli_args = base._parse_cli_args                        # 用于解析用�
 _resolve_weather_h5_specs = base._resolve_weather_h5_specs    # 读取不同区域的气象变量对应说明书 (告诉网络通道有多少个气象因数)
 _configure_runtime_weather_args = base._configure_runtime_weather_args # 动态初始化网络时，根据实际气象包尺寸微调部分配置
 export_similar_day_baseline = base.export_similar_day_baseline# 一键在训练结束后将单纯依靠该先验所生成的对比结果图表保存
+
+
+TRAIN_MODE = base.TRAIN_MODE
+LOAD_FROM_OPTUNA = False
+OPTUNA_DIR = "./optuna"
+OPTUNA_BEST_PARAMS_FILE = "best_params5.json"
+OPTUNA_BEST_CONFIG_FILE = "best_config5.json"
+OPTUNA_BEST_WEIGHT_FILE = "best_model5.pth"
+OPTUNA_BEST_TRIAL_FILE = "best_trial_result5.json"
+
+TUNABLE_PARAM_MAP = {
+    "SIMILAR_DAY_TOP_K": "similar_day_top_k",
+    "WEATHER_FEATURE_DIM": "weather_feature_dim",
+    "D_MODEL": "d_model",
+    "N_HEADS": "n_heads",
+    "E_LAYERS": "e_layers",
+    "D_FF": "d_ff",
+    "DROPOUT": "dropout",
+    "PATCH_LEN": "patch_len",
+    "BATCH_SIZE": "batch_size",
+    "LEARNING_RATE": "learning_rate",
+}
+
+
+def _load_json_file(json_path: str):
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _apply_optuna_artifacts(args: argparse.Namespace) -> argparse.Namespace:
+    optuna_dir = os.path.abspath(OPTUNA_DIR)
+    config_path = os.path.join(optuna_dir, OPTUNA_BEST_CONFIG_FILE)
+    params_path = os.path.join(optuna_dir, OPTUNA_BEST_PARAMS_FILE)
+    weight_path = os.path.join(optuna_dir, OPTUNA_BEST_WEIGHT_FILE)
+
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(f"./optuna model weight file not found: {weight_path}")
+
+    if os.path.exists(config_path):
+        payload = _load_json_file(config_path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"./optuna config file must be a JSON object: {config_path}")
+        for key, value in payload.items():
+            setattr(args, key, value)
+    elif os.path.exists(params_path):
+        payload = _load_json_file(params_path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"./optuna params file must be a JSON object: {params_path}")
+        for raw_key, value in payload.items():
+            key = TUNABLE_PARAM_MAP.get(str(raw_key), str(raw_key))
+            setattr(args, key, value)
+    else:
+        raise FileNotFoundError(
+            f"./optuna missing both {OPTUNA_BEST_CONFIG_FILE} and {OPTUNA_BEST_PARAMS_FILE}"
+        )
+
+    args.is_training = 0
+    args.load_weight_path = weight_path
+    args.quantiles = list(args.quantiles)
+    args.n_quantiles = len(args.quantiles)
+    print(f"Loaded saved artifacts from ./optuna: {weight_path}")
+    return args
 
 
 def _unpack_weather_batch(
@@ -520,7 +583,7 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore) ->
     test_data, test_loader = weather_data_provider(args, "test", weather_store)
 
     setting = _get_setting(args)
-    folder_path = os.path.join("./results/", setting)
+    folder_path = os.path.join(getattr(args, "results_root", "./results/"), setting)
     os.makedirs(folder_path, exist_ok=True)
 
     preds_p50 = []
@@ -591,7 +654,7 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore) ->
 
         q_shape = quantile_preds_all.shape
         quantile_inv = np.zeros_like(quantile_preds_all)
-        for qi in range(base.N_QUANTILES):
+        for qi in range(args.n_quantiles):
             q_slice = quantile_preds_all[:, :, qi : qi + 1]
             q_inv = test_data.inverse_transform_target(
                 q_slice.reshape(q_shape[0] * q_shape[1], -1)
@@ -613,6 +676,9 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore) ->
 
 
 def _get_setting(args, itr: int = 0) -> str:
+    des_raw = str(getattr(args, "des", "exp"))
+    des_norm = "".join(ch for ch in des_raw.lower() if ch.isalnum()) or "exp"
+    des_short = "op" if des_norm.startswith("optuna") else des_norm[:6]
     signature = (
         f"{args.task_name}_{args.model_id}_{args.model}_e2e_sdv2_"
         f"sl{args.seq_len}_pl{args.pred_len}_dm{args.d_model}_"
@@ -627,14 +693,9 @@ def _get_setting(args, itr: int = 0) -> str:
     )
     digest = hashlib.md5(signature.encode("utf-8")).hexdigest()[:8]
     return (
-        f"TimeXerE2E_SDV2_sl{args.seq_len}_pl{args.pred_len}_"
-        f"wd{args.weather_feature_dim}_"
-        f"wsl{args.weather_seq_len}_wh{args.weather_history_len}_"
-        f"sdp{int(bool(getattr(args, 'use_similar_day_prior', False)))}_"
-        f"sdk{int(getattr(args, 'similar_day_top_k', 0))}_"
-        f"sdgh{int(getattr(args, 'similar_day_gate_hidden_dim', 0))}_"
-        f"wk{args.weather_kernel_height}x{args.weather_kernel_width}_"
-        f"bs{args.batch_size}_{args.des}_{itr}_{digest}"
+        f"sdv2_sl{args.seq_len}_pl{args.pred_len}_"
+        f"wd{args.weather_feature_dim}_sdk{int(getattr(args, 'similar_day_top_k', 0))}_"
+        f"bs{args.batch_size}_{des_short}{int(itr):03d}_{digest}"
     )
 
 
@@ -650,7 +711,7 @@ def main() -> None:
 
     args = argparse.Namespace(
         task_name=base.TASK_NAME,
-        is_training=1 if base.TRAIN_MODE else 0,
+        is_training=1 if TRAIN_MODE else 0,
         model_id=f"{base.MODEL_ID_PREFIX}_sdv2",
         model=base.MODEL,
         des=base.DES,
@@ -658,6 +719,7 @@ def main() -> None:
         data="custom",
         root_path=base.ROOT_PATH,
         data_path=base.DATA_PATH,
+        future_path=base.FUTURE_PATH,
         features=base.FEATURES,
         target=base.TARGET,
         target_channel_idx=0,
@@ -712,6 +774,14 @@ def main() -> None:
         similar_day_gate_init_beta=SIMILAR_DAY_GATE_INIT_BETA,
     )
 
+    args.results_root = "./results/"
+    args.load_weight_path = None
+
+    if not args.is_training and LOAD_FROM_OPTUNA:
+        args = _apply_optuna_artifacts(args)
+        selected_weather_source = getattr(args, "weather_source", selected_weather_source)
+        selected_weather_h5_specs = getattr(args, "weather_h5_specs", selected_weather_h5_specs)
+
     if torch.cuda.is_available() and args.use_gpu:
         device = torch.device(f"cuda:{args.gpu}")
         print(f"Using GPU: cuda:{args.gpu}")
@@ -738,21 +808,23 @@ def main() -> None:
                 f"kernel=({args.weather_kernel_height}, {args.weather_kernel_width})"
             )
 
-        model = FullMapConvTimeXerPriorCorrectionGateQuantile(args, quantiles=base.QUANTILES).float().to(device)
+        model = FullMapConvTimeXerPriorCorrectionGateQuantile(args, quantiles=args.quantiles).float().to(device)
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"TimeXer-primary + prior-correction total params: {total_params:,}")
         print(f"TimeXer-primary + prior-correction trainable params: {trainable_params:,}")
 
         setting = _get_setting(args)
-        if base.TRAIN_MODE:
+        if args.is_training:
             print(f"\n>>> Start training {setting}")
             model = train_quantile_model(model, args, device, weather_store)
 
             print(f"\n>>> Start testing {setting}")
             results_dir = test_quantile_model(model, args, device, weather_store)
         else:
-            ckpt_path = os.path.join(args.checkpoints, setting, "checkpoint.pth")
+            ckpt_path = getattr(args, "load_weight_path", None)
+            if ckpt_path is None:
+                ckpt_path = os.path.join(args.checkpoints, setting, "checkpoint.pth")
             if os.path.exists(ckpt_path):
                 model.load_state_dict(torch.load(ckpt_path, map_location=device))
                 print(f"Loaded model: {ckpt_path}")
@@ -766,7 +838,7 @@ def main() -> None:
 
         plot_pred_vs_true(
             results_dir,
-            use_inverse=base.INVERSE_EVAL,
+            use_inverse=args.inverse_eval,
             quantiles=args.quantiles,
             title_prefix="TimeXer-Primary + Similar-Day Prior-Correction Prediction",
             y_label="Load (MW)",
@@ -774,10 +846,10 @@ def main() -> None:
 
         similar_day_result = export_similar_day_baseline(
             results_dir=results_dir,
-            future_path=base.FUTURE_PATH,
+            future_path=getattr(args, "future_path", base.FUTURE_PATH),
             args=args,
-            artifact_dir=SIMILAR_DAY_ARTIFACT_DIR,
-            top_k=SIMILAR_DAY_TOP_K,
+            artifact_dir=getattr(args, "similar_day_artifact_dir", SIMILAR_DAY_ARTIFACT_DIR),
+            top_k=int(getattr(args, "similar_day_top_k", SIMILAR_DAY_TOP_K)),
         )
         predict_future_load_from_csv(
             model=model,
@@ -785,9 +857,9 @@ def main() -> None:
             device=device,
             weather_store=weather_store,
             results_dir=results_dir,
-            future_path=base.FUTURE_PATH,
-            steps=base.PRED_LEN,
-            use_inverse=base.INVERSE_EVAL,
+            future_path=getattr(args, "future_path", base.FUTURE_PATH),
+            steps=args.pred_len,
+            use_inverse=args.inverse_eval,
             quantiles=args.quantiles,
             data_provider_fn=weather_data_provider,
             model_label="TimeXer-Primary + Similar-Day Prior-Correction",
