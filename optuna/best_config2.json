@@ -33,7 +33,7 @@
   "weather_source": "15min",
   "weather_h5_specs": [
     [
-      "./data/hunan_grid_2024_filtered_15min.h5",
+      "./data/hunan_grid_2024_2025_filtered_15min.h5",
       "2024-01-01 00:00:00",
       "15min"
     ]
