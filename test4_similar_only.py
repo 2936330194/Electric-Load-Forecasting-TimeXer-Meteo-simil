@@ -21,7 +21,7 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
-import test4_smp as base
+import test4_base as base
 from similar_day_retriever import HDF5WeatherSequenceStore, SimilarDayRetriever
 from utils.forecast_visualization import plot_pred_vs_true
 from utils.metrics import R2, cal_eval

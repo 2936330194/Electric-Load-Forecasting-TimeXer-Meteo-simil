@@ -31,7 +31,7 @@ import torch.nn as nn
 from torch import optim
 
 from models.TimeXer import Model as TimeXer
-import test4_smp as base
+import test4_base as base
 from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
 from utils.metrics import metric
 from utils.quantile import QuantileLoss
