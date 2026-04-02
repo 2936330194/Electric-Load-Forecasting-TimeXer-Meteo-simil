@@ -44,8 +44,8 @@ SIMILAR_DAY_TOP_K = 3
 USE_SIMILAR_DAY_PRIOR = True
 
 # 针对先验纠偏门控 (Dynamic Prior-Correction Gating) 的隐藏层尺寸参数。
-# 控制 Sigmoid 门控网络的非线性宽度，越大则门控决策越复杂。
-SIMILAR_DAY_GATE_HIDDEN_DIM = 128
+# 门控决策本质上是简单的标量回归，不需要大容量网络，过大容易过拟合。
+SIMILAR_DAY_GATE_HIDDEN_DIM = 32
 
 # 网络初始化时给先验纠偏比例的权重锚点。
 # 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，
@@ -239,19 +239,18 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
             gate_bias = float(np.log(gate_init_beta / (1.0 - gate_init_beta)))      # 反解 Sigmoid：bias = ln(beta / (1 - beta))
 
             # 构建门控多层感知机 (MLP)
-            # 门控输入的设计 (共 5 + TopK + 1 维):
-            #   1维: timexer_pred     (TimeXer 的初步预测值)
+            # 门控输入精简为 3 维（去除冗余特征，避免梯度竞争）:
             #   1维: prior_mean       (相似日先验曲线的平均值)
-            #   1维: gap              (先验差异：prior_mean - timexer_pred)
-            #   1维: abs_gap          (差异幅度：|gap|)
+            #   1维: gap              (先验差异，必须 detach 切断梯度回流)
             #   1维: prior_spread     (先验离散度：Top-K 相似日之间的标准差)
-            #   TopK+1维: similar_day_prior (TopK 序列和综合基准序列的值)
+            # 说明：timexer_pred 与 gap 线性相关无需重复；abs(gap) 信息已隐含在 gap 中；
+            #       similar_day_prior[:,0] 就是 prior_mean。
             self.similar_day_gate = nn.Sequential(
-                nn.Linear(5 + self.similar_day_prior_dim, gate_hidden_dim),
+                nn.Linear(3, gate_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(float(getattr(configs, "dropout", 0.1))),
                 nn.Linear(gate_hidden_dim, 1),
-                nn.Sigmoid(), # 最后一层使用 Sigmoid，将纠偏权重强行压缩约束到 (0, 1) 的比例区间
+                nn.Sigmoid(),
             )
             
             # 将输出层（即 nn.Linear(gate_hidden_dim, 1)）初始化为常数门控结构：
@@ -393,19 +392,19 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
             else:
                 prior_spread = torch.zeros_like(prior_mean)
 
-            # --- 4. 差距度量表与动态β加权融合 ---
+            # --- 4. 差距度量表与动态beta加权融合 ---
             # 门控网络核心物理学视角下的 "纠偏方向向量 (gap)"，目标是从 timexer_pred 出发指向 prior_mean 的修正幅度向量
             gap = prior_mean - timexer_pred
             
-            # 聚合所有的判定线索
+            # 聚合门控判定线索（精简为 3 维，全部对 TimeXer 主干切断梯度）
+            # 核心原则：门控是"旁观者"，它根据先验值、gap 大小和先验自信度来决定采纳比例，
+            #           但不允许通过门控反向传播去修改 TimeXer 主干的预测输出。
+            #           否则 TimeXer 会收到"竞争性梯度"信号，导致 loss 居高不下。
             gate_input = torch.cat(
                 [
-                    timexer_pred,       # [B, L, 1] 主分支当前预估体量（负荷基数大小）
-                    prior_mean,         # [B, L, 1] 相似日先验综合均值基线
-                    gap,                # [B, L, 1] 原始差距（具有正负符号，体现高估或低估）
-                    gap.abs(),          # [B, L, 1] 绝对规模位移差（要校正的程度多猛烈）
+                    prior_mean,         # [B, L, 1] 相似日先验综合均值基线（来自外部数据，无梯度问题）
+                    gap.detach(),       # [B, L, 1] 纠偏方向（必须 detach！切断门控到 TimeXer 的梯度回流）
                     prior_spread,       # [B, L, 1] Top-K 自身的不一致性（先验信噪系数指标）
-                    similar_day_prior,  # [B, L, TopK+1] 完整的全幅先验环境分布特征
                 ],
                 dim=-1,
             )
