@@ -1,4 +1,5 @@
 import os
+import hashlib
 import re
 import time
 import h5py
@@ -1589,6 +1590,33 @@ class LoadWeatherEndToEndDataset(Dataset):
             f"runtime={runtime_weather_h5}"
         )
         return runtime_weather_h5
+
+    def _get_similar_day_prior_cache_path(self, artifact_dir: str) -> str:
+        split_name = {0: "train", 1: "val", 2: "test"}.get(self.set_type, str(self.set_type))
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cache_dir = os.path.join(repo_root, "cache", "similar_day_prior")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        artifact_hash = hashlib.md5(os.path.normcase(artifact_dir).encode("utf-8")).hexdigest()[:12]
+        signature = "|".join(
+            [
+                split_name,
+                str(self.pred_len),
+                str(self.similar_day_top_k),
+                artifact_hash,
+                str(self.seq_len),
+                str(self.label_len),
+                str(self.weather_seq_len),
+                str(self.weather_history_len),
+                str(getattr(self.args, "data_path", "")),
+                str(len(self)),
+            ]
+        )
+        cache_key = hashlib.md5(signature.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(
+            cache_dir,
+            f"sd_prior_{split_name}_pl{self.pred_len}_topk{self.similar_day_top_k}_{artifact_hash}_{cache_key}.npy",
+        )
 
     def _build_similar_day_prior_cache(self) -> None:
         sample_count = len(self)

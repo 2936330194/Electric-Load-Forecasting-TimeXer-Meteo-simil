@@ -17,6 +17,7 @@ from torch import optim
 
 import test5_smpv2 as task
 import test5_smpv3_op as shared
+from utils.weather_e2e import LoadWeatherEndToEndDataset
 
 core = task.base
 
@@ -69,6 +70,48 @@ _suggest_from_spec = shared._suggest_from_spec
 _load_search_space = shared._load_search_space
 _default_storage_uri = shared._default_storage_uri
 _build_best_trial_payload = shared._build_best_trial_payload
+
+_ORIGINAL_BUILD_SIMILAR_DAY_PRIOR_CACHE = LoadWeatherEndToEndDataset._build_similar_day_prior_cache
+
+
+def _cached_build_similar_day_prior_cache(self) -> None:
+    artifact_dir = self._resolve_similar_day_artifact_dir()
+    cache_path = Path(self._get_similar_day_prior_cache_path(artifact_dir))
+    expected_shape = (len(self), self.pred_len, self.similar_day_top_k + 1)
+
+    if cache_path.exists():
+        try:
+            cached_prior = np.load(cache_path, allow_pickle=False)
+            cached_prior = np.asarray(cached_prior, dtype=np.float32)
+            if cached_prior.shape == expected_shape:
+                self.similar_day_prior_cache = np.ascontiguousarray(cached_prior)
+                mem_mb = self.similar_day_prior_cache.nbytes / (1024 ** 2)
+                print(
+                    f"[dataset-{self.set_type}] loaded similar-day prior cache from disk: "
+                    f"{cache_path} | shape={self.similar_day_prior_cache.shape}, mem={mem_mb:.1f} MB"
+                )
+                return
+            print(
+                f"[dataset-{self.set_type}] ignore stale similar-day prior cache: "
+                f"{cache_path} | cached_shape={cached_prior.shape}, expected={expected_shape}"
+            )
+        except Exception as exc:
+            print(f"[dataset-{self.set_type}] failed to load similar-day prior cache {cache_path}: {exc}")
+
+    _ORIGINAL_BUILD_SIMILAR_DAY_PRIOR_CACHE(self)
+
+    if self.similar_day_prior_cache is None:
+        return
+    try:
+        np.save(cache_path, np.ascontiguousarray(self.similar_day_prior_cache), allow_pickle=False)
+        print(f"[dataset-{self.set_type}] saved similar-day prior cache to disk: {cache_path}")
+    except Exception as exc:
+        print(f"[dataset-{self.set_type}] failed to save similar-day prior cache {cache_path}: {exc}")
+
+
+if not getattr(LoadWeatherEndToEndDataset._build_similar_day_prior_cache, "_op_cache_patched", False):
+    _cached_build_similar_day_prior_cache._op_cache_patched = True
+    LoadWeatherEndToEndDataset._build_similar_day_prior_cache = _cached_build_similar_day_prior_cache
 
 
 def _normalize_param_overrides(overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -241,11 +284,65 @@ def _build_args(
 
 def _select_device(args) -> torch.device:
     if torch.cuda.is_available() and args.use_gpu:
+        torch.backends.cudnn.benchmark = True
         device = torch.device(f"cuda:{args.gpu}")
         print(f"Using GPU: cuda:{args.gpu}")
+        print("cuDNN benchmark: on")
         return device
     print("Using CPU")
     return torch.device("cpu")
+
+
+def _slice_batch_y_target_cpu(batch_y: torch.Tensor, pred_len: int) -> torch.Tensor:
+    return task.extract_target(batch_y[:, -pred_len:, :]).contiguous()
+
+
+def validate_quantile(model, data_loader, criterion, args, device, use_amp: bool = False) -> float:
+    model.eval()
+    total_loss = []
+    use_non_blocking = task._use_non_blocking_transfer(args, device)
+
+    with torch.inference_mode():
+        for batch in data_loader:
+            (
+                batch_x,
+                batch_y,
+                batch_x_mark,
+                batch_exo_mark,
+                batch_weather_frames,
+                batch_weather_index,
+                similar_day_prior,
+            ) = task._unpack_weather_batch(batch)
+
+            batch_y_target = task._to_float_device(
+                _slice_batch_y_target_cpu(batch_y, args.pred_len),
+                device,
+                non_blocking=use_non_blocking,
+            )
+            batch_x = task._to_float_device(batch_x, device, non_blocking=use_non_blocking)
+            batch_x_mark = task._to_float_device(batch_x_mark, device, non_blocking=use_non_blocking)
+            batch_exo_mark = task._to_float_device(batch_exo_mark, device, non_blocking=use_non_blocking)
+            batch_weather_frames = task._to_float_device(batch_weather_frames, device, non_blocking=use_non_blocking)
+            batch_weather_index = task._to_long_device(batch_weather_index, device, non_blocking=use_non_blocking)
+            if similar_day_prior is not None:
+                similar_day_prior = task._to_float_device(similar_day_prior, device, non_blocking=use_non_blocking)
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                model_kwargs = {
+                    "load_x": batch_x,
+                    "x_mark_enc": batch_x_mark,
+                    "x_exo_mark": batch_exo_mark,
+                    "weather_x": batch_weather_frames,
+                    "weather_x_index": batch_weather_index,
+                }
+                if similar_day_prior is not None:
+                    model_kwargs["similar_day_prior"] = similar_day_prior
+                outputs = model(**model_kwargs)
+                loss = criterion(outputs, batch_y_target)
+            total_loss.append(loss.item())
+
+    model.train()
+    return float(np.average(total_loss)) if total_loss else np.nan
 
 
 def _sample_trial_params(trial, search_space: Dict[str, Any], base_args: argparse.Namespace) -> Dict[str, Any]:
@@ -295,7 +392,6 @@ def _sample_trial_params(trial, search_space: Dict[str, Any], base_args: argpars
 def train_quantile_model(model, args, device, weather_store: task.WeatherGridStore, trial=None):
     _, train_loader = task.weather_data_provider(args, "train", weather_store)
     _, vali_loader = task.weather_data_provider(args, "val", weather_store)
-    _, test_loader = task.weather_data_provider(args, "test", weather_store)
 
     setting = task._get_setting(args)
     path = os.path.join(args.checkpoints, setting)
@@ -357,8 +453,12 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
             ) = task._unpack_weather_batch(batch)
 
             optimizer.zero_grad(set_to_none=True)
+            batch_y_target = task._to_float_device(
+                _slice_batch_y_target_cpu(batch_y, args.pred_len),
+                device,
+                non_blocking=use_non_blocking,
+            )
             batch_x = task._to_float_device(batch_x, device, non_blocking=use_non_blocking)
-            batch_y = task._to_float_device(batch_y, device, non_blocking=use_non_blocking)
             batch_x_mark = task._to_float_device(batch_x_mark, device, non_blocking=use_non_blocking)
             batch_exo_mark = task._to_float_device(batch_exo_mark, device, non_blocking=use_non_blocking)
             batch_weather_frames = task._to_float_device(batch_weather_frames, device, non_blocking=use_non_blocking)
@@ -377,7 +477,6 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
                 if similar_day_prior is not None:
                     model_kwargs["similar_day_prior"] = similar_day_prior
                 outputs = model(**model_kwargs)
-                batch_y_target = task.extract_target(batch_y[:, -args.pred_len :, :])
                 loss = criterion(outputs, batch_y_target)
 
             train_loss.append(loss.item())
@@ -388,12 +487,11 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
             if (i + 1) % 50 == 0:
                 print(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f}")
 
-        vali_loss = task.validate_quantile(model, vali_loader, criterion, args, device, use_amp=use_amp)
-        test_loss = task.validate_quantile(model, test_loader, criterion, args, device, use_amp=use_amp)
+        vali_loss = validate_quantile(model, vali_loader, criterion, args, device, use_amp=use_amp)
         train_loss_avg = float(np.average(train_loss)) if train_loss else np.nan
         print(
             f"Epoch: {epoch + 1} cost time: {time.time() - epoch_time:.1f}s | "
-            f"Train: {train_loss_avg:.7f} Vali: {vali_loss:.7f} Test: {test_loss:.7f}"
+            f"Train: {train_loss_avg:.7f} Vali: {vali_loss:.7f}"
         )
 
         if np.isfinite(vali_loss):
@@ -440,9 +538,7 @@ def train_quantile_model(model, args, device, weather_store: task.WeatherGridSto
     return model, best_vali_loss
 
 
-def test_quantile_model(model, args, device, weather_store: task.WeatherGridStore) -> Dict[str, Any]:
-    test_data, test_loader = task.weather_data_provider(args, "test", weather_store)
-
+def test_quantile_model(model, args, device, test_data, test_loader) -> Dict[str, Any]:
     setting = task._get_setting(args)
     folder_path = os.path.join(getattr(args, "results_root", DEFAULT_RESULTS_ROOT), setting)
     os.makedirs(folder_path, exist_ok=True)
@@ -467,8 +563,8 @@ def test_quantile_model(model, args, device, weather_store: task.WeatherGridStor
                 similar_day_prior,
             ) = task._unpack_weather_batch(batch)
 
+            batch_y_target = _slice_batch_y_target_cpu(batch_y, args.pred_len)
             batch_x = task._to_float_device(batch_x, device, non_blocking=use_non_blocking)
-            batch_y = task._to_float_device(batch_y, device, non_blocking=use_non_blocking)
             batch_x_mark = task._to_float_device(batch_x_mark, device, non_blocking=use_non_blocking)
             batch_exo_mark = task._to_float_device(batch_exo_mark, device, non_blocking=use_non_blocking)
             batch_weather_frames = task._to_float_device(batch_weather_frames, device, non_blocking=use_non_blocking)
@@ -488,12 +584,12 @@ def test_quantile_model(model, args, device, weather_store: task.WeatherGridStor
                     model_kwargs["similar_day_prior"] = similar_day_prior
                 outputs = model(**model_kwargs)
 
-            batch_y_target = task.extract_target(batch_y[:, -args.pred_len :, :])
-            p50_pred = outputs.float()[:, :, core.P50_IDX : core.P50_IDX + 1]
+            outputs_fp32 = outputs.float()
+            p50_pred = outputs_fp32[:, :, core.P50_IDX : core.P50_IDX + 1]
 
-            quantile_preds_all.append(outputs.float().detach().cpu().numpy())
+            quantile_preds_all.append(outputs_fp32.detach().cpu().numpy())
             preds_p50.append(p50_pred.detach().cpu().numpy())
-            trues.append(batch_y_target.detach().cpu().numpy())
+            trues.append(batch_y_target.numpy())
 
     preds_p50 = np.concatenate(preds_p50, axis=0)
     trues = np.concatenate(trues, axis=0)
@@ -549,18 +645,20 @@ def run_experiment(
     run_test: bool,
     plot_results: bool,
     predict_future: bool,
+    weather_store: Optional[task.WeatherGridStore] = None,
     trial=None,
 ) -> Dict[str, Any]:
     device = _select_device(args)
     selected_weather_source = getattr(args, "weather_source", core.DEFAULT_WEATHER_SOURCE)
     result: Dict[str, Any] = {}
-
-    weather_store = task.WeatherGridStore(
-        args.weather_h5_specs,
-        expected_in_channels=args.weather_in_channels,
-        fill_value=core.WEATHER_FILL_VALUE,
-        use_channel_normalization=True,
-    )
+    owns_weather_store = weather_store is None
+    if weather_store is None:
+        weather_store = task.WeatherGridStore(
+            args.weather_h5_specs,
+            expected_in_channels=args.weather_in_channels,
+            fill_value=core.WEATHER_FILL_VALUE,
+            use_channel_normalization=True,
+        )
 
     try:
         args = task._configure_runtime_weather_args(args, weather_store, selected_weather_source)
@@ -603,8 +701,9 @@ def run_experiment(
         result["checkpoint_path"] = checkpoint_path
 
         if run_test:
+            test_data, test_loader = task.weather_data_provider(args, "test", weather_store)
             print(f"\n>>> Start testing {setting}")
-            eval_result = test_quantile_model(model, args, device, weather_store)
+            eval_result = test_quantile_model(model, args, device, test_data, test_loader)
             result.update(eval_result)
             results_dir = eval_result["results_dir"]
 
@@ -643,7 +742,8 @@ def run_experiment(
 
         return result
     finally:
-        weather_store.close()
+        if owns_weather_store:
+            weather_store.close()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -724,121 +824,134 @@ def run_optuna_study(cli_args) -> Dict[str, Any]:
         "use_amp": not bool(cli_args.no_amp),
     }
     base_args = _build_args(train_mode=True, overrides=runtime_overrides, weather_source=cli_args.weather_source)
-
-    storage = cli_args.storage or _default_storage_uri(study_dir)
-    sampler = optuna.samplers.TPESampler(seed=int(cli_args.seed))
-    pruner = optuna.pruners.HyperbandPruner(
-        min_resource=1,
-        max_resource=int(cli_args.train_epochs),
-        reduction_factor=3,
-    )
-    study = optuna.create_study(
-        study_name=cli_args.study_name,
-        storage=storage,
-        load_if_exists=True,
-        direction=cli_args.direction,
-        sampler=sampler,
-        pruner=pruner,
+    global_weather_store = task.WeatherGridStore(
+        base_args.weather_h5_specs,
+        expected_in_channels=base_args.weather_in_channels,
+        fill_value=core.WEATHER_FILL_VALUE,
+        use_channel_normalization=True,
     )
 
-    def objective(trial) -> float:
-        sampled_params = _sample_trial_params(trial, search_space, base_args)
-        trial_overrides = dict(runtime_overrides)
-        trial_overrides.update(_normalize_param_overrides(sampled_params))
-        trial_overrides["des"] = f"op{trial.number:03d}"
-        trial_overrides["itr"] = int(trial.number)
+    try:
+        storage = cli_args.storage or _default_storage_uri(study_dir)
+        sampler = optuna.samplers.TPESampler(seed=int(cli_args.seed))
+        pruner = optuna.pruners.HyperbandPruner(
+            min_resource=1,
+            max_resource=int(cli_args.train_epochs),
+            reduction_factor=3,
+        )
+        study = optuna.create_study(
+            study_name=cli_args.study_name,
+            storage=storage,
+            load_if_exists=True,
+            direction=cli_args.direction,
+            sampler=sampler,
+            pruner=pruner,
+        )
+
+        def objective(trial) -> float:
+            sampled_params = _sample_trial_params(trial, search_space, base_args)
+            trial_overrides = dict(runtime_overrides)
+            trial_overrides.update(_normalize_param_overrides(sampled_params))
+            trial_overrides["des"] = f"op{trial.number:03d}"
+            trial_overrides["itr"] = int(trial.number)
+
+            try:
+                args = _build_args(
+                    train_mode=True,
+                    overrides=trial_overrides,
+                    weather_source=cli_args.weather_source,
+                )
+            except ValueError as exc:
+                raise TrialPruned(str(exc)) from exc
+
+            experiment_result = run_experiment(
+                args,
+                run_test=False,
+                plot_results=False,
+                predict_future=False,
+                weather_store=global_weather_store,
+                trial=trial,
+            )
+            trial.set_user_attr("setting", experiment_result["setting"])
+            trial.set_user_attr("checkpoint_path", experiment_result["checkpoint_path"])
+            best_vali_loss = float(experiment_result["best_vali_loss"])
+            trial.set_user_attr("best_vali_loss", best_vali_loss)
+            return best_vali_loss
+
+        print("\n" + "=" * 72)
+        print(f"Optuna study: {cli_args.study_name}")
+        print(f"storage: {storage}")
+        print(f"n_trials: {cli_args.n_trials}")
+        print(f"timeout: {cli_args.timeout}")
+        print(f"output_dir: {study_dir}")
+        print(f"weather_source: {cli_args.weather_source}")
+        print("=" * 72)
+        study.optimize(
+            objective,
+            n_trials=int(cli_args.n_trials),
+            timeout=None if int(cli_args.timeout) <= 0 else int(cli_args.timeout),
+            gc_after_trial=True,
+            show_progress_bar=False,
+        )
 
         try:
-            args = _build_args(
-                train_mode=True,
-                overrides=trial_overrides,
-                weather_source=cli_args.weather_source,
-            )
+            best_trial = study.best_trial
         except ValueError as exc:
-            raise TrialPruned(str(exc)) from exc
+            raise RuntimeError("No completed Optuna trial is available.") from exc
 
-        experiment_result = run_experiment(
-            args,
-            run_test=False,
-            plot_results=False,
-            predict_future=False,
-            trial=trial,
-        )
-        trial.set_user_attr("setting", experiment_result["setting"])
-        trial.set_user_attr("checkpoint_path", experiment_result["checkpoint_path"])
-        best_vali_loss = float(experiment_result["best_vali_loss"])
-        trial.set_user_attr("best_vali_loss", best_vali_loss)
-        return best_vali_loss
+        best_params_path = cli_args.best_params_path or str(study_dir / USE_BEST_PARAMS_FILE)
+        _save_json_file(best_params_path, best_trial.params)
 
-    print("\n" + "=" * 72)
-    print(f"Optuna study: {cli_args.study_name}")
-    print(f"storage: {storage}")
-    print(f"n_trials: {cli_args.n_trials}")
-    print(f"timeout: {cli_args.timeout}")
-    print(f"output_dir: {study_dir}")
-    print(f"weather_source: {cli_args.weather_source}")
-    print("=" * 72)
-    study.optimize(
-        objective,
-        n_trials=int(cli_args.n_trials),
-        timeout=None if int(cli_args.timeout) <= 0 else int(cli_args.timeout),
-        gc_after_trial=True,
-        show_progress_bar=False,
-    )
-
-    try:
-        best_trial = study.best_trial
-    except ValueError as exc:
-        raise RuntimeError("No completed Optuna trial is available.") from exc
-
-    best_params_path = cli_args.best_params_path or str(study_dir / USE_BEST_PARAMS_FILE)
-    _save_json_file(best_params_path, best_trial.params)
-
-    best_overrides = dict(runtime_overrides)
-    best_overrides.update(_normalize_param_overrides(best_trial.params))
-    best_overrides["des"] = f"op{best_trial.number:03d}"
-    best_overrides["itr"] = int(best_trial.number)
-    best_overrides["load_weight_path"] = best_trial.user_attrs.get("checkpoint_path")
-    best_args = _build_args(
-        train_mode=False,
-        overrides=best_overrides,
-        weather_source=cli_args.weather_source,
-    )
-
-    best_eval = None
-    if not cli_args.skip_best_eval:
-        best_eval = run_experiment(
-            best_args,
-            run_test=True,
-            plot_results=True,
-            predict_future=True,
-            trial=None,
+        best_overrides = dict(runtime_overrides)
+        best_overrides.update(_normalize_param_overrides(best_trial.params))
+        best_overrides["des"] = f"op{best_trial.number:03d}"
+        best_overrides["itr"] = int(best_trial.number)
+        best_overrides["load_weight_path"] = best_trial.user_attrs.get("checkpoint_path")
+        best_args = _build_args(
+            train_mode=False,
+            overrides=best_overrides,
+            weather_source=cli_args.weather_source,
         )
 
-    best_payload = _build_best_trial_payload(study, best_eval=best_eval)
-    best_trial_path = cli_args.best_trial_path or str(study_dir / USE_BEST_TRIAL_FILE)
-    _save_json_file(best_trial_path, best_payload)
-    _export_best_trial_to_use(cli_args.use_dir, best_trial, best_args, best_payload)
+        best_eval = None
+        if not cli_args.skip_best_eval:
+            best_eval = run_experiment(
+                best_args,
+                run_test=True,
+                plot_results=True,
+                predict_future=True,
+                weather_store=global_weather_store,
+                trial=None,
+            )
 
-    trials_csv_path = study_dir / "trials.csv"
-    try:
-        trials_df = study.trials_dataframe()
-        trials_df.to_csv(trials_csv_path, index=False, encoding="utf-8-sig")
-    except Exception as exc:
-        print(f"Skip saving trials.csv: {exc}")
+        best_payload = _build_best_trial_payload(study, best_eval=best_eval)
+        best_trial_path = cli_args.best_trial_path or str(study_dir / USE_BEST_TRIAL_FILE)
+        _save_json_file(best_trial_path, best_payload)
+        _export_best_trial_to_use(cli_args.use_dir, best_trial, best_args, best_payload)
 
-    print("\nBest trial summary:")
-    print(f"trial_number: {best_trial.number}")
-    print(f"best_value: {float(best_trial.value):.7f}")
-    print(f"best_params: {best_trial.params}")
+        trials_csv_path = study_dir / "trials.csv"
+        try:
+            trials_df = study.trials_dataframe()
+            trials_df.to_csv(trials_csv_path, index=False, encoding="utf-8-sig")
+        except Exception as exc:
+            print(f"Skip saving trials.csv: {exc}")
 
-    return {
-        "study_dir": str(study_dir),
-        "best_params_path": best_params_path,
-        "best_trial_path": best_trial_path,
-        "best_value": float(best_trial.value),
-        "best_params": dict(best_trial.params),
-    }
+        print("\nBest trial summary:")
+        print(f"trial_number: {best_trial.number}")
+        print(f"best_value: {float(best_trial.value):.7f}")
+        print(f"best_params: {best_trial.params}")
+
+        return {
+            "study_dir": str(study_dir),
+            "best_params_path": best_params_path,
+            "best_trial_path": best_trial_path,
+            "best_value": float(best_trial.value),
+            "best_params": dict(best_trial.params),
+        }
+    finally:
+        global_weather_store.close()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def build_cli_parser() -> argparse.ArgumentParser:
