@@ -1,0 +1,47 @@
+{
+  "study_name": "test1_optuna_v1",
+  "direction": [
+    "minimize"
+  ],
+  "n_trials_total": 129,
+  "n_trials_completed": 45,
+  "n_trials_pruned": 83,
+  "n_trials_failed": 1,
+  "best_trial": {
+    "number": 82,
+    "value": 0.041062895496741185,
+    "params": {
+      "D_MODEL": 512,
+      "N_HEADS": 4,
+      "E_LAYERS": 1,
+      "D_FF": 256,
+      "DROPOUT": 0.1,
+      "PATCH_LEN": 96,
+      "BATCH_SIZE": 32,
+      "LEARNING_RATE": 0.0007133798946557041
+    },
+    "user_attrs": {
+      "best_vali_loss": 0.041062895496741185,
+      "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna_runs\\test1_optuna_v1\\checkpoints\\test1_HunanLoad_2024_672_sl672_pl96_dm512_bs32_itr82_663a08bb53\\checkpoint.pth",
+      "setting": "test1_HunanLoad_2024_672_sl672_pl96_dm512_bs32_itr82_663a08bb53"
+    },
+    "state": "COMPLETE"
+  },
+  "generated_at": "2026-03-31 21:56:38",
+  "best_eval": {
+    "setting": "test1_HunanLoad_2024_672_sl672_pl96_dm512_bs32_itr82_663a08bb53",
+    "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna_runs\\test1_optuna_v1\\checkpoints\\test1_HunanLoad_2024_672_sl672_pl96_dm512_bs32_itr82_663a08bb53\\checkpoint.pth",
+    "results_dir": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna_runs\\test1_optuna_v1\\results\\test1_HunanLoad_2024_672_sl672_pl96_dm512_bs32_itr82_663a08bb53",
+    "p50_mae": 0.1568896621465683,
+    "p50_mse": 0.045437637716531754,
+    "p50_rmse": 0.21316106617450714,
+    "p50_mape": 1.035384854938995,
+    "p50_mspe": 510.06609775996594
+  },
+  "use_export": {
+    "use_dir": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna",
+    "best_weight_path": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna\\best_model1.pth",
+    "best_params_path": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna\\best_params1.json",
+    "best_config_path": "C:\\Users\\xsai\\Desktop\\code\\Electric Load Forecasting TimeXer Meteo simil\\optuna\\best_config1.json"
+  }
+}

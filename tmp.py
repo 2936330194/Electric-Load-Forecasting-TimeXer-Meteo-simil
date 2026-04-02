@@ -43,12 +43,12 @@ USE_SIMILAR_DAY_PRIOR = True
 
 # 针对先验纠偏门控 (Dynamic Prior-Correction Gating) 的隐藏层尺寸参数。
 # 控制 Sigmoid 门控网络的非线性宽度，越大则门控决策越复杂。
-SIMILAR_DAY_GATE_HIDDEN_DIM = 128
+SIMILAR_DAY_GATE_HIDDEN_DIM = 32
 
 # 网络初始化时给先验纠偏比例的权重锚点。
 # 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，
 # 随后网络再通过反向传播自动调节先验的介入比例。
-SIMILAR_DAY_GATE_INIT_BETA = 0.1
+SIMILAR_DAY_GATE_INIT_BETA = 0.05
 
 
 # ================= 从基础实验模块导入常用工具函数 =================
@@ -170,7 +170,7 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
             # 目的：通过反解 Sigmoid 函数来设置初始偏置项，使得网络在初始化时倾向于产生较低的先验采纳比例 β。
             # 默认初始 beta (gate_init_beta) 设为 0.1，意味着在模型训练初期，模型主要依赖 TimeXer 分支的主干预测能力。
             # 先验信息只被非常轻微（温和）地引入进行修正，以防初期先验特征带来的抖动引起模型崩溃。
-            gate_init_beta = float(getattr(configs, "similar_day_gate_init_beta", 0.1))
+            gate_init_beta = float(getattr(configs, "similar_day_gate_init_beta", 0.05))
             gate_init_beta = min(max(gate_init_beta, 1e-3), 1.0 - 1e-3)             # 截断以避免 log(0) 问题
             gate_bias = float(np.log(gate_init_beta / (1.0 - gate_init_beta)))      # 反解 Sigmoid：bias = ln(beta / (1 - beta))
 
@@ -183,7 +183,7 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
             #   1维: prior_spread     (先验离散度：Top-K 相似日之间的标准差)
             #   TopK+1维: similar_day_prior (TopK 序列和综合基准序列的值)
             self.similar_day_gate = nn.Sequential(
-                nn.Linear(5 + self.similar_day_prior_dim, gate_hidden_dim),
+                nn.Linear(3, gate_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(float(getattr(configs, "dropout", 0.1))),
                 nn.Linear(gate_hidden_dim, 1),
@@ -349,6 +349,14 @@ class FullMapConvTimeXerPriorCorrectionGateQuantile(nn.Module):
             # 使用门控多层感知机及末端 Sigmoid 推理出动态采纳比例 beta ∈ (0, 1)
             # β -> 0: 说明模型认定没必要大调，充分采信 TimeXer 主支结果，先验权当参考。
             # β -> 1: 说明模型认定需要大幅度吸纳外挂库相似日经验，做强制的拉平纠正预估（多见于气候巨变或非标事件如节假日异常断层）。
+            gate_input = torch.cat(
+                [
+                    prior_mean,
+                    gap.detach(),
+                    prior_spread,
+                ],
+                dim=-1,
+            )
             beta = self.similar_day_gate(gate_input)
             
             # 执行校正合成公式：最终输出 = 主线原始预测 + 修正采纳比例 * 去往先验的差距量

@@ -50,7 +50,7 @@ SIMILAR_DAY_GATE_HIDDEN_DIM = 32
 # 网络初始化时给先验纠偏比例的权重锚点。
 # 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，
 # 随后网络再通过反向传播自动调节先验的介入比例。
-SIMILAR_DAY_GATE_INIT_BETA = 0.1
+SIMILAR_DAY_GATE_INIT_BETA = 0.05
 
 
 # ================= 从基础实验模块导入常用工具函数 =================
