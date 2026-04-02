@@ -130,7 +130,7 @@ CONTIGUOUS_TRAIN_BATCHES = True  # 训练阶段按连续窗口分块组 batch，
 # 说明：
 # - 当 FEATURES="MS" 时，TimeXer 的输入会被组织成“气象特征 + 历史负荷”，输出只预测目标负荷。
 
-LOAD_FROM_OPTUNA = False
+LOAD_FROM_OPTUNA = True
 OPTUNA_DIR = "./optuna"
 OPTUNA_BEST_PARAMS_FILE = "best_params3.json"
 OPTUNA_BEST_CONFIG_FILE = "best_config3.json"
@@ -177,6 +177,14 @@ def _load_json_file(json_path: str):
         return json.load(f)
 
 
+def _local_runtime_path(saved_path: str, fallback_path: str) -> str:
+    if not saved_path:
+        return fallback_path
+    if os.path.isabs(saved_path):
+        return fallback_path
+    return saved_path
+
+
 def _apply_optuna_artifacts(args: argparse.Namespace) -> argparse.Namespace:
     optuna_dir = os.path.abspath(OPTUNA_DIR)
     config_path = os.path.join(optuna_dir, OPTUNA_BEST_CONFIG_FILE)
@@ -205,6 +213,14 @@ def _apply_optuna_artifacts(args: argparse.Namespace) -> argparse.Namespace:
         )
 
     args.is_training = 0
+    args.checkpoints = _local_runtime_path(
+        getattr(args, "checkpoints", None),
+        CHECKPOINTS_DIR,
+    )
+    args.results_root = _local_runtime_path(
+        getattr(args, "results_root", None),
+        os.path.join(optuna_dir, "results"),
+    )
     args.load_weight_path = weight_path
     args.quantiles = list(args.quantiles)
     args.n_quantiles = len(args.quantiles)
