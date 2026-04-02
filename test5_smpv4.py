@@ -15,6 +15,8 @@ Compared with test5_smp.py:
    y_hat = timexer_pred + beta * gap
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
