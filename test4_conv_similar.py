@@ -1098,7 +1098,7 @@ def main() -> None:
         target_channel_idx=0,
         freq=base.LOAD_FREQ,
         embed="timeF",
-        checkpoints="./checkpoints_test5_v4/",
+        checkpoints="./checkpoints_test4/",
         seq_len=base.SEQ_LEN,
         label_len=base.LABEL_LEN,
         pred_len=base.PRED_LEN,
