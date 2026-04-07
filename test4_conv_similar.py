@@ -1,12 +1,12 @@
 """
-test4_conv_similar.py - TimeXer 基础预测 + 相似日先验修正门控系统
+test4_conv_similar.py - Optuna超参数优化 + 外生气象变量 + TimeXer 基础预测 + 相似日先验修正门控系统
 
 此版本引入了两阶段微调（Two-stage Fine-tuning）策略：
 1. 模型加载：从 Optuna 实验记录中加载已调优的 Full-Map Conv + TimeXer 骨干网络权重。
 2. 阶段一（预热）：冻结骨干网络，优先训练新增的相似日门控单元（Gate）和量化回归输出头。
 3. 阶段二（联合微调）：解冻全模型参数，以极低的学习率进行全量联合微调，实现特征深度适配。
 
-与 test5_smp.py 版本的核心差异：
+核心思路：
 1. 预测逻辑：TimeXer 骨干网络直接预测未来的电力负荷绝对值。
 2. 纠偏机制：将加权的相似日先验转化为一个有界的修正方向（Gap）：
    gap = prior_mean (先验均值) - timexer_pred (模型原始预测)

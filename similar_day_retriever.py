@@ -1,13 +1,13 @@
 """
-similar_day_retriever_320.py
+similar_day_retriever.py
 
-1. 使用 2024 年负荷数据前 2/3 训练段构建离线检索库
+1. 使用 2024 年负荷数据构建离线检索库
 2. 将未来 5 个通道 24/96 步 的气象窗口编码为 128 维潜向量
 3. 叠加 5 维时间特征并进行时间权重提权
 4. 采用 Exact Inner Product Search 返回 Top-K 相似历史负荷曲线
 
 说明：
-- 本程序不改动 `convlstm_ae.py` 的训练流程，但在推理时依赖其定义的模型结构和训练出的权重。
+- 本程序在推理时依赖 `convlstm_ae.py` 定义的模型结构和训练出的权重。
 - 128 维气象编码通过预训练模型完成：
   原始气象帧 -> 通道级标准化 -> ConvLSTM-AE Encoder -> 128 维潜映射(Latent)
 - faiss 可用时优先使用 IndexFlatIP；不可用时自动回退到 NumPy 精确检索

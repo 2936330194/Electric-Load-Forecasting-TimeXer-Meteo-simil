@@ -1,13 +1,13 @@
 """
-test3.py - TimeXer 概率预测脚本 (分位数回归) - 湖南省电力负荷预测
+test1.py - TimeXer 概率预测脚本 (分位数回归) - 湖南省电力负荷预测
 
-基于 test2.py 升级，将 TimeXer 从点预测升级为概率预测：
+将 TimeXer 从点预测升级为概率预测：
 - 使用分位数回归 (Quantile Regression) 方法
 - 输出 7 个分位数: [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
 - P50 (中位数) 作为点预测，P10-P90 作为置信区间
 - 在预测图中绘制 P10-P90 置信区间带
 
-核心改动：
+核心结构：
 1. TimeXerQuantile 包装器：在原始 TimeXer 输出层后添加分位数映射头
 2. QuantileLoss：替代 MSE 的分位数损失函数
 3. 自定义训练/测试流程：不依赖 Exp_Long_Term_Forecast

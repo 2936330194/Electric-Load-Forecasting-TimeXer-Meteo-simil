@@ -1,7 +1,7 @@
 """
-test4_smp_old_metro_672.py - Simple Full-Map Conv + TimeXer end-to-end training
+test2.py - Simple Full-Map Conv + TimeXer 端到端训练
 
-核心改动：
+核心结构：
 1. 用单层全图卷积替换 ConvNeXt-Tiny。
 2. 每个卷积核覆盖整个 62x61 网格，等价于对全省全部格点做一组可学习的加权汇总。
 3. 气象卷积模块、TimeXer、Quantile Head 统一组成一个模型并统一保存/加载权重。

@@ -1,16 +1,5 @@
 ﻿"""
-test4_smp.py - Simple Full-Map Conv + TimeXer end-to-end training
-
-核心改动：
-1. 用单层全图卷积替换 ConvNeXt-Tiny。
-2. 每个卷积核覆盖整个 62x61 网格，等价于对全省全部格点做一组可学习的加权汇总。
-3. 气象卷积模块、TimeXer、Quantile Head 统一组成一个模型并统一保存/加载权重。
-4. 气象特征按“历史窗口 + 未来一天窗口”输入 TimeXer；预测阶段完全采用 encoder-only 路径。
-
-注意：
-- 这是端到端版本，DataLoader 仍然直接返回原始气象网格。
-- 全图卷积比 ConvNeXt 简单很多，但原始天气张量仍然较大，建议保持较小 batch_size。
-- HDF5 读取建议保持 num_workers=0。
+test4_base.py - test4_conv_similar.py 的依赖程序。
 """
 
 import argparse

@@ -1,9 +1,19 @@
 """
-ConvLSTM AutoEncoder for meteorological spatiotemporal sequence encoding.
+ConvLSTM 自动编码器 (AutoEncoder)：用于气象数据的时空序列特征编码。
 
-Usage:
+核心功能：
+1. 提取高维气象网格数据（如温度、湿度、降水等多通道 2D 场）的时空表征。
+2. 将变长的时空序列压缩为定长的低维潜向量（Latent Vector），便于后续进行相似场景检索（相似日匹配）。
+3. 通过重构损失（Reconstruction Loss）进行无监督预训练，确保潜向量保留了原始物理场的核心演变特征。
+
+用法示例:
+    # 正常模式：完整训练过程（包含预处理、训练、验证和指标评估）
     python convlstm_ae.py
+    
+    # 冒烟测试：使用极小的数据规模快速验证代码逻辑（用于 Debug）
     python convlstm_ae.py --smoke-test
+    
+    # 仅测试模式：跳过训练，直接加载 checkpoint 评估重构效果
     python convlstm_ae.py --test-only
 """
 
