@@ -61,9 +61,9 @@ FEATURES = "MS"  # 多变量输入、单变量输出
 
 
 # ==================== 时序长度配置 ====================
-SEQ_LEN = 96 * 7  # 输入历史长度：7 天
+SEQ_LEN = 96 * 30  # 输入历史长度：7 天
 LABEL_LEN = 0  # 解码端已知标签长度
-PRED_LEN = 96  # 预测长度：1 天
+PRED_LEN = 96 * 7 # 预测长度：1 天
 LOAD_FREQ = "15min"  # 负荷序列采样频率
 
 
@@ -85,7 +85,7 @@ WEATHER_KERNEL_WIDTH = 61  # 全图卷积核宽度
 WEATHER_FEATURE_DIM = 3  # 每个时刻输出的气象特征维度
 WEATHER_ENCODE_CHUNK_SIZE = 2048  # 气象帧分块编码大小
 WEATHER_FILL_VALUE = 0.0  # 气象缺失时的填充值
-WEATHER_FUTURE_DAYS = 1  # 额外拼接未来 1 天气象；具体对应 24 还是 96 个点由气象频率自动决定
+WEATHER_FUTURE_DAYS = 7  # 额外拼接未来 1 天气象；具体对应 24 还是 96 个点由气象频率自动决定
 
 
 # ==================== TimeXer 模型配置 ====================
@@ -132,10 +132,10 @@ CONTIGUOUS_TRAIN_BATCHES = True  # 训练阶段按连续窗口分块组 batch，
 
 LOAD_FROM_OPTUNA = True
 OPTUNA_DIR = "./optuna"
-OPTUNA_BEST_PARAMS_FILE = "best_params3.json"
-OPTUNA_BEST_CONFIG_FILE = "best_config3.json"
-OPTUNA_BEST_WEIGHT_FILE = "best_model3.pth"
-OPTUNA_BEST_TRIAL_FILE = "best_trial_result3.json"
+OPTUNA_BEST_PARAMS_FILE = "best_params_fullmap.json"
+OPTUNA_BEST_CONFIG_FILE = "best_config_fullmap.json"
+OPTUNA_BEST_WEIGHT_FILE = "best_model_fullmap.pth"
+OPTUNA_BEST_TRIAL_FILE = "best_trial_result_fullmap.json"
 
 TUNABLE_PARAM_MAP = {
     "WEATHER_FEATURE_DIM": "weather_feature_dim",
