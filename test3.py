@@ -70,7 +70,7 @@ LOAD_FREQ = "15min"  # 负荷序列采样频率
 # ==================== Full-Map Conv 气象配置 ====================
 WEATHER_SOURCE_CONFIGS = {
     "15min": [
-        ("./data/hunan_grid_2024_filtered_15min.h5", "2024-01-01 00:00:00", "15min"),
+        ("./data/hunan_grid_2024_2025_filtered_15min.h5", "2024-01-01 00:00:00", "15min"),
     ],
     "1h": [
         ("./data/hunan_grid_2024_2025_filtered.h5", "2024-01-01 00:00:00", "1h"),
@@ -275,7 +275,7 @@ def _configure_runtime_weather_args(
         weather_freq=weather_store.native_freq,
     )
     weather_future_len = infer_weather_history_len(
-        seq_len=args.pred_len * WEATHER_FUTURE_DAYS,
+        seq_len=args.pred_len,
         load_freq=args.freq,
         weather_freq=weather_store.native_freq,
     )

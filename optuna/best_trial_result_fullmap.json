@@ -3,41 +3,41 @@
   "direction": [
     "1"
   ],
-  "n_trials_total": 130,
-  "n_trials_completed": 34,
-  "n_trials_pruned": 94,
-  "n_trials_failed": 2,
+  "n_trials_total": 128,
+  "n_trials_completed": 25,
+  "n_trials_pruned": 103,
+  "n_trials_failed": 0,
   "best_trial": {
-    "number": 73,
-    "value": 0.08066310012569794,
+    "number": 102,
+    "value": 0.08547404225618561,
     "params": {
-      "WEATHER_FEATURE_DIM": 5,
+      "WEATHER_FEATURE_DIM": 3,
       "D_MODEL": 192,
       "N_HEADS": 8,
-      "E_LAYERS": 2,
+      "E_LAYERS": 3,
       "D_FF": 2048,
       "DROPOUT": 0.15000000000000002,
-      "PATCH_LEN": 48,
-      "BATCH_SIZE": 16,
-      "LEARNING_RATE": 0.0004298514248838813
+      "PATCH_LEN": 192,
+      "BATCH_SIZE": 32,
+      "LEARNING_RATE": 0.0006443728185846996
     },
     "user_attrs": {
-      "best_vali_loss": 0.08066310012569794,
-      "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v2\\checkpoints\\TimeXerE2E_sl2880_pl672_wd5_wsl7584_wh2880_wk62x61_bs16_Optuna_trial073_0_d9e19bcd\\checkpoint.pth",
-      "setting": "TimeXerE2E_sl2880_pl672_wd5_wsl7584_wh2880_wk62x61_bs16_Optuna_trial073_0_d9e19bcd"
+      "best_vali_loss": 0.08547404225618561,
+      "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v2\\checkpoints\\TimeXerE2E_sl2880_pl672_wd3_wsl3552_wh2880_wk62x61_bs32_Optuna_trial102_0_e7f070a4\\checkpoint.pth",
+      "setting": "TimeXerE2E_sl2880_pl672_wd3_wsl3552_wh2880_wk62x61_bs32_Optuna_trial102_0_e7f070a4"
     },
     "state": "COMPLETE"
   },
-  "generated_at": "2026-04-16T19:18:35",
+  "generated_at": "2026-04-18T11:08:58",
   "best_eval": {
-    "setting": "TimeXerE2E_sl2880_pl672_wd5_wsl7584_wh2880_wk62x61_bs16_Optuna_trial073_0_d9e19bcd",
-    "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v2\\checkpoints\\TimeXerE2E_sl2880_pl672_wd5_wsl7584_wh2880_wk62x61_bs16_Optuna_trial073_0_d9e19bcd\\checkpoint.pth",
-    "results_dir": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v2\\results\\TimeXerE2E_sl2880_pl672_wd5_wsl7584_wh2880_wk62x61_bs16_Optuna_trial073_0_d9e19bcd",
-    "mae": 0.064839668571949,
-    "mse": 0.008981632068753242,
-    "rmse": 0.09477147459983826,
-    "mape": 0.09542484565407919,
-    "mspe": 0.015512494835941906,
+    "setting": "TimeXerE2E_sl2880_pl672_wd3_wsl3552_wh2880_wk62x61_bs32_Optuna_trial102_0_e7f070a4",
+    "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v2\\checkpoints\\TimeXerE2E_sl2880_pl672_wd3_wsl3552_wh2880_wk62x61_bs32_Optuna_trial102_0_e7f070a4\\checkpoint.pth",
+    "results_dir": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v2\\results\\TimeXerE2E_sl2880_pl672_wd3_wsl3552_wh2880_wk62x61_bs32_Optuna_trial102_0_e7f070a4",
+    "mae": 0.05744053050875664,
+    "mse": 0.006784048862755299,
+    "rmse": 0.08236533403396606,
+    "mape": 0.08766582041254227,
+    "mspe": 0.013075404546901282,
     "used_inverse_arrays": true
   },
   "use_export": {
