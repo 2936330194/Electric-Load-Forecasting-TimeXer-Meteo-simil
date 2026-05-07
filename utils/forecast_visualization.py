@@ -228,6 +228,7 @@ def plot_pred_vs_true(
     quantiles: Optional[Sequence[float]] = None,
     title_prefix: str = "Prediction",
     y_label: str = "Load (MW)",
+    eval_first_n_steps: Optional[int] = None,
 ) -> None:
     """
     绘制测试集上模型预测值与真实标签的对比曲线 (支持带 P10-P90 置信区间)。
@@ -319,6 +320,16 @@ def plot_pred_vs_true(
     eval_df = cal_eval(true_series, pred_series)
     print("[Plot Eval] metrics:")
     print(eval_df)
+    if eval_first_n_steps is not None:
+        first_n_steps = int(eval_first_n_steps)
+        if preds.ndim >= 2 and trues.ndim >= 2 and first_n_steps > 0:
+            usable_steps = min(first_n_steps, preds.shape[1], trues.shape[1])
+            first_eval_df = cal_eval(
+                trues[:, :usable_steps, ...],
+                preds[:, :usable_steps, ...],
+            )
+            print(f"[Plot Eval] first {usable_steps} steps metrics (overlap included):")
+            print(first_eval_df)
 
     # 创建保存目录
     os.makedirs(results_dir, exist_ok=True)

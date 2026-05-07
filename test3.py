@@ -85,7 +85,7 @@ WEATHER_KERNEL_WIDTH = 61  # 全图卷积核宽度
 WEATHER_FEATURE_DIM = 3  # 每个时刻输出的气象特征维度
 WEATHER_ENCODE_CHUNK_SIZE = 2048  # 气象帧分块编码大小
 WEATHER_FILL_VALUE = 0.0  # 气象缺失时的填充值
-WEATHER_FUTURE_DAYS = 7  # 额外拼接未来 1 天气象；具体对应 24 还是 96 个点由气象频率自动决定
+WEATHER_FUTURE_DAYS = 3  # 额外拼接未来 1 天气象；具体对应 24 还是 96 个点由气象频率自动决定
 
 
 # ==================== TimeXer 模型配置 ====================
@@ -132,10 +132,10 @@ CONTIGUOUS_TRAIN_BATCHES = True  # 训练阶段按连续窗口分块组 batch，
 
 LOAD_FROM_OPTUNA = True
 OPTUNA_DIR = "./optuna"
-OPTUNA_BEST_PARAMS_FILE = "best_params_fullmap.json"
-OPTUNA_BEST_CONFIG_FILE = "best_config_fullmap.json"
-OPTUNA_BEST_WEIGHT_FILE = "best_model_fullmap.pth"
-OPTUNA_BEST_TRIAL_FILE = "best_trial_result_fullmap.json"
+OPTUNA_BEST_PARAMS_FILE = "best_params_fullmap307.json"
+OPTUNA_BEST_CONFIG_FILE = "best_config_fullmap307.json"
+OPTUNA_BEST_WEIGHT_FILE = "best_model_fullmap307.pth"
+OPTUNA_BEST_TRIAL_FILE = "best_trial_result_fullmap307.json"
 
 TUNABLE_PARAM_MAP = {
     "WEATHER_FEATURE_DIM": "weather_feature_dim",
@@ -826,6 +826,7 @@ def main():
                 quantiles=args.quantiles,
                 title_prefix="Full-Map Conv + TimeXer Prediction",
                 y_label="Load (MW)",
+                eval_first_n_steps=96 * 3,
             )
             
             # 使用 future.csv 指引的时间线，调取对应时刻的气象格点做未来 24-96 小时的外推预测
@@ -867,6 +868,7 @@ def main():
                 quantiles=args.quantiles,
                 title_prefix="Full-Map Conv + TimeXer Prediction",
                 y_label="Load (MW)",
+                eval_first_n_steps=96 * 3,
             )
             
             # 执行外推预测

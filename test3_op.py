@@ -42,15 +42,15 @@ USE_BEST_WEIGHT_FILE = "best_model3.pth"
 USE_BEST_TRIAL_FILE = "best_trial_result3.json"
 
 DEFAULT_OPTUNA_SEARCH_SPACE: Dict[str, Any] = {
-    "WEATHER_FEATURE_DIM": {"type": "categorical", "choices": [2, 3, 4, 5, 6, 7, 8]},
-    "D_MODEL": {"type": "categorical", "choices": [128, 256, 384, 512, 768, 1024]},
-    "N_HEADS": {"type": "categorical", "choices": [2, 4, 8, 12, 16]},
-    "E_LAYERS": {"type": "int", "low": 1, "high": 3, "step": 1},
-    "D_FF": {"type": "categorical", "choices": [256, 512, 1024, 1536, 2048, 3072, 4096]},
+    "WEATHER_FEATURE_DIM": {"type": "categorical", "choices": [2, 3, 4, 6]},
+    "D_MODEL": {"type": "categorical", "choices": [128, 192, 256, 384, 512]},
+    "N_HEADS": {"type": "categorical", "choices": [4, 8]},
+    "E_LAYERS": {"type": "int", "low": 2, "high": 3, "step": 1},
+    "D_FF": {"type": "categorical", "choices": [512, 1024, 1536, 2048, 3072]},
     "DROPOUT": {"type": "float", "low": 0.05, "high": 0.20, "step": 0.05},
-    "PATCH_LEN": {"type": "categorical", "choices": [48, 72, 96]},
-    "BATCH_SIZE": {"type": "categorical", "choices": [32, 48, 64, 72]},
-    "LEARNING_RATE": {"type": "float", "low": 1e-5, "high": 5e-3, "log": True},
+    "PATCH_LEN": {"type": "categorical", "choices": [96, 192, 288, 384]},
+    "BATCH_SIZE": {"type": "categorical", "choices": [16, 24, 32]},
+    "LEARNING_RATE": {"type": "float", "low": 5e-5, "high": 2e-3, "log": True},
 }
 
 TUNABLE_PARAM_MAP = dict(base.TUNABLE_PARAM_MAP)

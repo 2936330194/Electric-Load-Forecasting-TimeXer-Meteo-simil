@@ -1,0 +1,49 @@
+{
+  "study_name": "full_map_optuna_v3",
+  "direction": [
+    "1"
+  ],
+  "n_trials_total": 128,
+  "n_trials_completed": 46,
+  "n_trials_pruned": 82,
+  "n_trials_failed": 0,
+  "best_trial": {
+    "number": 64,
+    "value": 0.06441797091710297,
+    "params": {
+      "WEATHER_FEATURE_DIM": 2,
+      "D_MODEL": 256,
+      "N_HEADS": 8,
+      "E_LAYERS": 2,
+      "D_FF": 768,
+      "DROPOUT": 0.1,
+      "PATCH_LEN": 96,
+      "BATCH_SIZE": 64,
+      "LEARNING_RATE": 0.0005642495754952704
+    },
+    "user_attrs": {
+      "best_vali_loss": 0.06441797091710297,
+      "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v3\\checkpoints\\TimeXerE2E_sl1440_pl288_wd2_wsl1728_wh1440_wk62x61_bs64_Optuna_trial064_0_3a2bd204\\checkpoint.pth",
+      "setting": "TimeXerE2E_sl1440_pl288_wd2_wsl1728_wh1440_wk62x61_bs64_Optuna_trial064_0_3a2bd204"
+    },
+    "state": "COMPLETE"
+  },
+  "generated_at": "2026-04-22T04:44:58",
+  "best_eval": {
+    "setting": "TimeXerE2E_sl1440_pl288_wd2_wsl1728_wh1440_wk62x61_bs64_Optuna_trial064_0_3a2bd204",
+    "checkpoint_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v3\\checkpoints\\TimeXerE2E_sl1440_pl288_wd2_wsl1728_wh1440_wk62x61_bs64_Optuna_trial064_0_3a2bd204\\checkpoint.pth",
+    "results_dir": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna_runs\\full_map_optuna_v3\\results\\TimeXerE2E_sl1440_pl288_wd2_wsl1728_wh1440_wk62x61_bs64_Optuna_trial064_0_3a2bd204",
+    "mae": 0.04645707085728645,
+    "mse": 0.0045282430946826935,
+    "rmse": 0.067292220890522,
+    "mape": 0.06835634435349637,
+    "mspe": 0.007936075474844583,
+    "used_inverse_arrays": true
+  },
+  "use_export": {
+    "use_dir": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna",
+    "best_weight_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna\\best_model_fullmap.pth",
+    "best_params_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna\\best_params_fullmap.json",
+    "best_config_path": "C:\\Users\\xsai\\Desktop\\code\\Timexer-Metro-Simil\\optuna\\best_config_fullmap.json"
+  }
+}
