@@ -33,7 +33,7 @@ from torch import optim
 from models.TimeXer import Model as TimeXer
 import test4_base as base
 from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
-from utils.metrics import metric
+from utils.metrics import cal_eval, metric
 from utils.quantile import QuantileLoss
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.weather_e2e import FullMapWeatherConvExtractor, WeatherGridStore, weather_data_provider
@@ -1296,6 +1296,12 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore) ->
         np.save(os.path.join(folder_path, "pred_inv.npy"), preds_inv)
         np.save(os.path.join(folder_path, "true_inv.npy"), trues_inv)
         np.save(os.path.join(folder_path, "quantile_preds_inv.npy"), quantile_inv)
+
+    origin_pred = preds_inv if test_data.scale else preds_p50
+    origin_true = trues_inv if test_data.scale else trues
+    origin_eval_df = cal_eval(origin_true, origin_pred)
+    print("[origin Eval] metrics:")
+    print(origin_eval_df)
 
     # =============== 3. 统计误差打印 ===============
     # 通常要求在原始量纲（Inverse）空间内进行最终测绘以评判模型业务价值

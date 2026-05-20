@@ -24,19 +24,27 @@ from data_provider.data_factory import data_provider
 from utils.forecast_visualization import plot_pred_vs_true
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric, cal_eval
+from utils.quantile import QuantileLoss
 
-class LSTMBaseline(nn.Module):
-    def __init__(self, input_size=1, hidden_size=128, num_layers=2, output_len=96):
+QUANTILES = [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
+N_QUANTILES = len(QUANTILES)
+P50_IDX = QUANTILES.index(0.5)
+P10_IDX = QUANTILES.index(0.1)
+P90_IDX = QUANTILES.index(0.9)
+
+class LSTMQuantileBaseline(nn.Module):
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2, output_len=96, n_quantiles=7):
         super().__init__()
+        self.output_len = output_len
+        self.n_quantiles = n_quantiles
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_len)
+        self.fc = nn.Linear(hidden_size, output_len * n_quantiles)
         
     def forward(self, x):
         # x: [B, seq_len, input_size]
         out, _ = self.lstm(x)
-        # We take the output of the last step and project to target steps
-        out = self.fc(out[:, -1, :]) # [B, output_len]
-        return out.unsqueeze(-1) # [B, output_len, 1]
+        out = self.fc(out[:, -1, :]) # [B, output_len * n_quantiles]
+        return out.view(x.size(0), self.output_len, self.n_quantiles)
 
 def main():
     import argparse
@@ -69,7 +77,7 @@ def main():
     args.c_out = 1
     args.num_workers = 0
     args.checkpoints = os.path.dirname(__file__)
-    args.loss = "MSE"
+    args.loss = "Quantile"
     args.lradj = "cosine"
     args.inverse_eval = True
     args.des = "Exp"
@@ -90,13 +98,17 @@ def main():
         args.is_training = 0
 
     checkpoint_path = os.path.join(args.checkpoints, 'lstm_checkpoint.pth')
-    model = LSTMBaseline(input_size=1, hidden_size=128, num_layers=2, output_len=args.pred_len).to(device)
+    model = LSTMQuantileBaseline(
+        input_size=1, hidden_size=128, num_layers=2,
+        output_len=args.pred_len, n_quantiles=N_QUANTILES
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    criterion = nn.MSELoss()
+    criterion = QuantileLoss(QUANTILES)
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
     
     if args.is_training:
-        print("Training LSTM baseline...")
+        print("Training LSTM Quantile baseline...")
+        print(f"Quantiles: {QUANTILES}")
         t0 = time.time()
         for epoch in range(args.train_epochs):
             model.train()
@@ -106,8 +118,7 @@ def main():
                 batch_x = batch_x.float().to(device)
                 batch_y = batch_y.float().to(device)
                 
-                # LSTM is univariate S mode, so we use the load feature channel
-                # Shape of batch_x: [B, seq_len, 1]
+                # LSTM quantile output: [B, pred_len, n_quantiles]
                 outputs = model(batch_x)
                 batch_y_target = batch_y[:, -args.pred_len:, -1:] # [B, pred_len, 1]
                 
@@ -162,37 +173,62 @@ def main():
             
     # Evaluation on Test set
     model.eval()
-    preds = []
+    preds_p50 = []
     trues = []
+    quantile_preds_all = []
     with torch.no_grad():
         for batch_x, batch_y, batch_x_mark, batch_y_mark in test_loader:
             batch_x = batch_x.float().to(device)
-            outputs = model(batch_x)
-            preds.append(outputs.detach().cpu().numpy())
+            outputs = model(batch_x)  # [B, pred_len, n_quantiles]
+            
+            p50_pred = outputs[:, :, P50_IDX:P50_IDX+1]  # [B, pred_len, 1]
+            preds_p50.append(p50_pred.detach().cpu().numpy())
+            quantile_preds_all.append(outputs.detach().cpu().numpy())
             trues.append(batch_y[:, -args.pred_len:, -1:].detach().cpu().numpy())
             
-    preds = np.concatenate(preds, axis=0) # [N, pred_len, 1]
-    trues = np.concatenate(trues, axis=0) # [N, pred_len, 1]
+    preds_p50 = np.concatenate(preds_p50, axis=0)  # [N, pred_len, 1]
+    trues = np.concatenate(trues, axis=0)  # [N, pred_len, 1]
+    quantile_preds_all = np.concatenate(quantile_preds_all, axis=0)  # [N, pred_len, n_quantiles]
+    
+    print(f"Test shape: preds={preds_p50.shape}, trues={trues.shape}, quantiles={quantile_preds_all.shape}")
+    
+    # Save standardized results
+    np.save(os.path.join(args.checkpoints, 'pred.npy'), preds_p50)
+    np.save(os.path.join(args.checkpoints, 'true.npy'), trues)
+    np.save(os.path.join(args.checkpoints, 'quantile_preds.npy'), quantile_preds_all)
     
     # Inverse scale to physical load scale
     if args.inverse_eval and test_data.scale:
         shape = trues.shape
-        preds_inv = test_data.inverse_transform(preds.reshape(shape[0]*shape[1], -1)).reshape(shape)
+        preds_inv = test_data.inverse_transform(preds_p50.reshape(shape[0]*shape[1], -1)).reshape(shape)
         trues_inv = test_data.inverse_transform(trues.reshape(shape[0]*shape[1], -1)).reshape(shape)
-    else:
-        preds_inv = preds
-        trues_inv = trues
         
-    # Save numpy arrays
-    np.save(os.path.join(args.checkpoints, 'preds_inv.npy'), preds_inv)
-    np.save(os.path.join(args.checkpoints, 'trues_inv.npy'), trues_inv)
-    np.save(os.path.join(args.checkpoints, 'pred_inv.npy'), preds_inv)
-    np.save(os.path.join(args.checkpoints, 'true_inv.npy'), trues_inv)
+        # Inverse transform all quantiles
+        q_shape = quantile_preds_all.shape  # [N, pred_len, n_quantiles]
+        quantile_inv = np.zeros_like(quantile_preds_all)
+        for qi in range(N_QUANTILES):
+            q_slice = quantile_preds_all[:, :, qi:qi+1]
+            q_inv = test_data.inverse_transform(
+                q_slice.reshape(q_shape[0]*q_shape[1], -1)
+            ).reshape(q_shape[0], q_shape[1], 1)
+            quantile_inv[:, :, qi] = q_inv[:, :, 0]
+        
+        np.save(os.path.join(args.checkpoints, 'pred_inv.npy'), preds_inv)
+        np.save(os.path.join(args.checkpoints, 'true_inv.npy'), trues_inv)
+        np.save(os.path.join(args.checkpoints, 'quantile_preds_inv.npy'), quantile_inv)
+    else:
+        preds_inv = preds_p50
+        trues_inv = trues
+
+    origin_eval_df = cal_eval(trues_inv, preds_inv)
+    print("[origin Eval] metrics:")
+    print(origin_eval_df)
 
     plot_pred_vs_true(
         args.checkpoints,
         use_inverse=args.inverse_eval,
-        title_prefix="LSTM Prediction",
+        quantiles=QUANTILES,
+        title_prefix="LSTM Quantile Prediction",
     )
         
     # Standard 2D window-average metrics
@@ -223,29 +259,6 @@ def main():
     ss_res_1d = np.sum((true_1d - pred_1d) ** 2)
     r2_1d = float(1 - ss_res_1d / ss_tot_1d)
     
-    metrics = {
-        "model": "LSTM",
-        "mae": float(mae),
-        "mse": float(mse),
-        "rmse": float(rmse),
-        "mape": float(mape),
-        "r2": float(r2),
-        "mae_1d": mae_1d,
-        "mse_1d": mse_1d,
-        "rmse_1d": rmse_1d,
-        "mape_1d": mape_1d,
-        "r2_1d": r2_1d,
-        "shape": list(trues.shape)
-    }
-    
-    print("\nLSTM Baseline Test Metrics:")
-    print(json.dumps(metrics, indent=2))
-    
-    metrics_path = os.path.join(args.checkpoints, 'lstm_metrics.json')
-    with open(metrics_path, 'w', encoding='utf-8') as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Metrics saved to {metrics_path}")
-    
     # Generate future forecasting predictions
     print("\nGenerating future forecast predictions...")
     future_csv_path = os.path.join(args.root_path, "湖南省电力负荷2024_future.csv")
@@ -264,17 +277,21 @@ def main():
         # Make future prediction
         batch_x = torch.as_tensor(scaled_hist_load, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            outputs = model(batch_x) # [1, pred_len, 1]
-            pred_scaled = outputs[0, :, 0].cpu().numpy().reshape(-1, 1)
+            outputs = model(batch_x)  # [1, pred_len, n_quantiles]
+            quantile_scaled = outputs[0].cpu().numpy()  # [pred_len, n_quantiles]
             
-        # Inverse transform prediction
-        pred_phys = train_data.scaler.inverse_transform(pred_scaled).flatten()
+        # Inverse transform each quantile
+        future_quantile_phys = np.zeros_like(quantile_scaled)
+        for qi in range(N_QUANTILES):
+            q_col = quantile_scaled[:, qi:qi+1]
+            future_quantile_phys[:, qi] = train_data.scaler.inverse_transform(q_col).flatten()
         
-        # Save to CSV
-        output_df = pd.DataFrame({
-            "date": future_df["date"].iloc[:args.pred_len],
-            "load_pred_P50": pred_phys
-        })
+        # Save to CSV with all quantiles
+        output_df = pd.DataFrame({"date": future_df["date"].iloc[:args.pred_len]})
+        for qi, q in enumerate(QUANTILES):
+            col_name = f"load_pred_P{int(q*100)}"
+            output_df[col_name] = future_quantile_phys[:, qi]
+        
         output_csv_path = os.path.join(args.checkpoints, "future_load_prediction.csv")
         output_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
         print(f"Saved future predictions to {output_csv_path}")

@@ -24,7 +24,7 @@ import pandas as pd
 import test4_base as base
 from similar_day_retriever import HDF5WeatherSequenceStore, SimilarDayRetriever
 from utils.forecast_visualization import plot_pred_vs_true
-from utils.metrics import R2, cal_eval
+from utils.metrics import cal_eval
 
 # 预设的相似日检索库保存路径（包含之前保存的 PCA 模型、FAISS 索引库、天气降维特征等）
 ARTIFACT_DIR = "./artifacts/similar_day_retriever_hunan_grid_2024_2025_filtered_15min"
@@ -321,7 +321,8 @@ def _evaluate_weighted_prior(
 
     # 聚合得出所有评测指标对象 MSE, MAE, R2, CORR 及 MAPE
     metrics_df = cal_eval(y_real=trues.reshape(-1), y_pred=preds.reshape(-1))
-    metrics_df["R2_flat"] = float(R2(preds, trues))
+    print("[origin Eval] metrics:")
+    print(metrics_df)
     # 将记录字典转换为可方便分析的结构化 Pandas 表格
     meta_df = pd.DataFrame(meta_rows)
     return preds, trues, metrics_df, meta_df
@@ -388,9 +389,6 @@ def main() -> None:
     print(f"artifact_dir: {artifact_dir}")
     print(f"results_dir:  {os.path.abspath(results_dir)}")
     print(f"target_scale: {scale_note}")
-    if scale_note == "csv_native_likely_normalized_0_1":
-        print("[warning] current CSV target values appear to already be normalized into [0, 1]. "
-              "\n警告：当前评估似乎基于的是已被预除掉数值幅度（压缩在 0-1 的区间里）的处理后的 CSV 数据。\n请再三明确你需要的数据格式标准！")
     # 分页或排版打印所汇总评估表格的全面成果，向研究人员出示结果概览报告
     print(metrics_df.to_string())
     print("=" * 72)

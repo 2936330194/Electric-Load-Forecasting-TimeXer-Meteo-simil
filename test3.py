@@ -26,7 +26,7 @@ import torch
 from torch import optim
 
 from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
-from utils.metrics import metric
+from utils.metrics import cal_eval, metric
 from utils.quantile import QuantileLoss
 from utils.weather_e2e import (
     FullMapConvTimeXerQuantile as ExogenousFullMapConvTimeXerQuantile,
@@ -623,6 +623,12 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore):
         np.save(os.path.join(folder_path, "true_inv.npy"), trues_inv)
         np.save(os.path.join(folder_path, "quantile_preds_inv.npy"), quantile_inv)
 
+    origin_pred = preds_inv if test_data.scale else preds_p50
+    origin_true = trues_inv if test_data.scale else trues
+    origin_eval_df = cal_eval(origin_true, origin_pred)
+    print("[origin Eval] metrics:")
+    print(origin_eval_df)
+
     # 计算并打印 P50 预测的点估计评价指标 (MSE, MAE, RMSE)
     if test_data.scale and getattr(args, 'inverse_eval', False):
         mae, mse, rmse, mape, mspe = metric(preds_inv, trues_inv)
@@ -826,7 +832,7 @@ def main():
                 quantiles=args.quantiles,
                 title_prefix="Full-Map Conv + TimeXer Prediction",
                 y_label="Load (MW)",
-                eval_first_n_steps=96 * 3,
+                eval_first_n_steps=None,
             )
             
             # 使用 future.csv 指引的时间线，调取对应时刻的气象格点做未来 24-96 小时的外推预测
@@ -868,7 +874,7 @@ def main():
                 quantiles=args.quantiles,
                 title_prefix="Full-Map Conv + TimeXer Prediction",
                 y_label="Load (MW)",
-                eval_first_n_steps=96 * 3,
+                eval_first_n_steps=None,
             )
             
             # 执行外推预测

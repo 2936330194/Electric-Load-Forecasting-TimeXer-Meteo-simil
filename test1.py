@@ -553,6 +553,12 @@ def test_quantile_model(model, args, device):
         np.save(os.path.join(folder_path, 'true_inv.npy'), trues_inv)
         np.save(os.path.join(folder_path, 'quantile_preds_inv.npy'), quantile_inv)
 
+    origin_pred = preds_inv if test_data.scale else preds_p50
+    origin_true = trues_inv if test_data.scale else trues
+    origin_eval_df = cal_eval(origin_true, origin_pred)
+    print("[origin Eval] metrics:")
+    print(origin_eval_df)
+
     # ==================== 指标计算评估 ====================
     # 对 P50 点预测结果在标准化空间内执行 MSE、MAE 等经典评估指标计算并打印输出
     mae, mse, rmse, mape, mspe = metric(preds_p50, trues)

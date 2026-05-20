@@ -12,6 +12,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 sys.path.append(project_root)
 
 from utils.forecast_visualization import plot_pred_vs_true
+from utils.metrics import cal_eval
 
 def main():
     print("Loading data...")
@@ -103,6 +104,10 @@ def main():
     np.save(os.path.join(results_dir, 'pred_inv.npy'), preds_inv)
     np.save(os.path.join(results_dir, 'true_inv.npy'), trues_inv)
 
+    origin_eval_df = cal_eval(trues_inv, preds_inv)
+    print("[origin Eval] metrics:")
+    print(origin_eval_df)
+
     plot_pred_vs_true(
         results_dir,
         use_inverse=True,
@@ -129,29 +134,6 @@ def main():
     ss_tot_1d = np.sum((true_1d - target_mean_1d) ** 2)
     ss_res_1d = np.sum((true_1d - pred_1d) ** 2)
     r2_1d = float(1 - ss_res_1d / ss_tot_1d)
-    
-    metrics = {
-        "model": "ARIMA",
-        "mae": float(mae),
-        "mse": float(mse),
-        "rmse": float(rmse),
-        "mape": float(mape),
-        "r2": float(r2),
-        "mae_1d": mae_1d,
-        "mse_1d": mse_1d,
-        "rmse_1d": rmse_1d,
-        "mape_1d": mape_1d,
-        "r2_1d": r2_1d,
-        "shape": list(trues_inv.shape)
-    }
-    
-    print("\nARIMA Metrics:")
-    print(json.dumps(metrics, indent=2))
-    
-    metrics_path = os.path.join(os.path.dirname(__file__), "arima_metrics.json")
-    with open(metrics_path, 'w', encoding='utf-8') as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Metrics saved to {metrics_path}")
     
     # Generate future forecasting predictions
     print("\nGenerating future forecast predictions...")
