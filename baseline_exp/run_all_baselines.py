@@ -30,7 +30,7 @@ def main():
     arima_metrics_path = os.path.join(base_dir, "arima", "arima_metrics.json")
     if not os.path.exists(arima_metrics_path):
         arima_script = os.path.join(base_dir, "arima", "run_arima.py")
-        code_arima = run_script(arima_script, project_root)
+        run_script(arima_script, project_root)
     else:
         print("ARIMA metrics file found, skipping execution.")
     
@@ -38,23 +38,50 @@ def main():
     lstm_metrics_path = os.path.join(base_dir, "lstm", "lstm_metrics.json")
     if not os.path.exists(lstm_metrics_path):
         lstm_script = os.path.join(base_dir, "lstm", "run_lstm.py")
-        code_lstm = run_script(lstm_script, project_root)
+        run_script(lstm_script, project_root)
     else:
         print("LSTM metrics file found, skipping execution.")
+        
+    # Run Autoformer
+    autoformer_metrics_path = os.path.join(base_dir, "autoformer", "autoformer_metrics.json")
+    if not os.path.exists(autoformer_metrics_path):
+        autoformer_script = os.path.join(base_dir, "autoformer", "run_autoformer.py")
+        run_script(autoformer_script, project_root)
+    else:
+        print("Autoformer metrics file found, skipping execution.")
+
+    # Run PatchTST
+    patchtst_metrics_path = os.path.join(base_dir, "patchtst", "patchtst_metrics.json")
+    if not os.path.exists(patchtst_metrics_path):
+        patchtst_script = os.path.join(base_dir, "patchtst", "run_patchtst.py")
+        run_script(patchtst_script, project_root)
+    else:
+        print("PatchTST metrics file found, skipping execution.")
+
+    # Run DLinear
+    dlinear_metrics_path = os.path.join(base_dir, "dlinear", "dlinear_metrics.json")
+    if not os.path.exists(dlinear_metrics_path):
+        dlinear_script = os.path.join(base_dir, "dlinear", "run_dlinear.py")
+        run_script(dlinear_script, project_root)
+    else:
+        print("DLinear metrics file found, skipping execution.")
     
     # Run TimeXer (Pure)
     timexer_metrics_path = os.path.join(base_dir, "timexer", "timexer_metrics.json")
     if not os.path.exists(timexer_metrics_path):
         timexer_script = os.path.join(base_dir, "timexer", "run_timexer_baseline.py")
-        code_timexer = run_script(timexer_script, project_root)
+        run_script(timexer_script, project_root)
     else:
         print("TimeXer metrics file found, skipping execution.")
     
     # Read and aggregate metrics
-    models = ["ARIMA", "LSTM", "TimeXer"]
+    models = ["ARIMA", "LSTM", "Autoformer", "PatchTST", "DLinear", "TimeXer"]
     metrics_files = [
         os.path.join(base_dir, "arima", "arima_metrics.json"),
         os.path.join(base_dir, "lstm", "lstm_metrics.json"),
+        os.path.join(base_dir, "autoformer", "autoformer_metrics.json"),
+        os.path.join(base_dir, "patchtst", "patchtst_metrics.json"),
+        os.path.join(base_dir, "dlinear", "dlinear_metrics.json"),
         os.path.join(base_dir, "timexer", "timexer_metrics.json")
     ]
     
@@ -130,7 +157,7 @@ def main():
             f.write(md_table_2d)
             f.write("\n\n")
             f.write("## 2. 1D Contiguous Reconstructed Timeline Metrics (Non-overlapping)\n")
-            f.write("This table reconstructs a single chronological 1D time series from the overlapping windows and computes metrics on this continuous series (directly comparable to `test1.py`'s printed Plot Eval metrics).\n\n")
+            f.write("This table reconstructs a single chronological 1D time series from the overlapping windows and computes metrics on this continuous series (directly comparable to printed Plot Eval metrics).\n\n")
             f.write(md_table_1d)
             f.write("\n")
         print(f"Comparison summary saved to {summary_path}")

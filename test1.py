@@ -93,7 +93,7 @@ N_HEADS = 4  # 多头注意力头数
 E_LAYERS = 3  # 编码器层数
 D_FF = 2048  # 前馈网络维度
 FACTOR = 3  # 注意力因子
-DROPOUT = 0.15 # Dropout 比率：训练时随机丢弃 10% 的神经元，防止过拟合
+DROPOUT = 0.1 # Dropout 比率：训练时随机丢弃 10% 的神经元，防止过拟合
 ACTIVATION = "gelu" # 激活函数类型："gelu"（高斯误差线性单元），比 ReLU 更平滑，在 Transformer 架构中广泛使用
 PATCH_LEN = 96 # Patch 长度：将输入序列按 96 步（1 天）分割为多个 patch，每个 patch 作为一个 token 输入 Transformer 编码器
 USE_NORM = 1 # 是否启用实例归一化（RevIN）：1 = 启用，0 = 禁用
@@ -114,7 +114,7 @@ GPU = 0 # 指定使用的 GPU 设备编号（cuda:0 为第一块显卡）
 DES = "Exp" # 实验描述标签，用于生成检查点/结果目录名中的描述字段
 ITR = 1 # 实验重复次数：当 ITR > 1 时可评估模型的训练稳定性和结果方差
 INVERSE_EVAL = True # 是否在评估时对预测值和真实值做反标准化
-TRAIN_MODE = False    # 训练模式开关
+TRAIN_MODE = True    # 训练模式开关
 
 # ==================== /optuna 导入配置 ====================
 # 可调参数名称映射表：将 best_params.json 中的大写键名映射为 args 中对应的小写属性名。
