@@ -78,21 +78,21 @@ FUTURE_PATH = "./data/湖南省电力负荷2024_future.csv" # 未来时段数据
 # 编码器输入序列长度（回看窗口）：
 # 96 个时间步/天 × 7 天 = 672 个 15 分钟间隔 = 7 天的历史数据
 # 选择 7 天以捕获完整的周周期性模式
-SEQ_LEN = 96 * 30     # 672 个 15min = 7 天
+SEQ_LEN = 96 * 7     # 672 个 15min = 7 天
 # 解码器标签长度（label_len）：设置为 0 表示不向解码器提供已知的真实值前缀，
 # 解码器输入完全由零填充组成（纯自回归预测模式）
 LABEL_LEN = 0
 # 预测长度：96 个 15 分钟间隔 = 24 小时 = 1 天的超前预测
-PRED_LEN = 96 * 7       # 96 个 15min = 1 天
+PRED_LEN = 96 * 1       # 96 个 15min = 1 天
 
 # ==================== 模型架构参数 ====================
 ENC_IN = 1 # 编码器输入特征维度：单变量模式下为 1（仅负荷值）
 C_OUT = 1 # 输出特征维度：预测单一目标变量，维度为 1
-D_MODEL = 256 # Transformer 隐含层维度（d_model）：每个 token/patch 的嵌入向量维度
-N_HEADS = 4 # 多头注意力的头数：将 d_model=256 均分为 4 个子空间，每个头处理 64 维
-E_LAYERS = 2 # 编码器 Transformer 层数：2 层堆叠的自注意力+前馈网络块
-D_FF = 1024 # 前馈网络隐含层维度：通常为 d_model 的 4 倍（256 × 4 = 1024）
-FACTOR = 3 # 注意力机制中的缩放因子（ProbSparse Attention 中控制 top-k 采样的参数）
+D_MODEL = 512  # 隐藏层特征维度
+N_HEADS = 4  # 多头注意力头数
+E_LAYERS = 3  # 编码器层数
+D_FF = 2048  # 前馈网络维度
+FACTOR = 3  # 注意力因子
 DROPOUT = 0.15 # Dropout 比率：训练时随机丢弃 10% 的神经元，防止过拟合
 ACTIVATION = "gelu" # 激活函数类型："gelu"（高斯误差线性单元），比 ReLU 更平滑，在 Transformer 架构中广泛使用
 PATCH_LEN = 96 # Patch 长度：将输入序列按 96 步（1 天）分割为多个 patch，每个 patch 作为一个 token 输入 Transformer 编码器
@@ -101,8 +101,8 @@ USE_NORM = 1 # 是否启用实例归一化（RevIN）：1 = 启用，0 = 禁用
 # ==================== 训练超参数 ====================
 
 TRAIN_EPOCHS = 50 # 最大训练轮数：模型最多训练 50 个 epoch（若未被早停机制提前终止）
-BATCH_SIZE = 16 # 每个 mini-batch 的样本数：32 是常用的批量大小
-LEARNING_RATE = 5e-5 # 初始学习率：使用 Adam 优化器的初始步长为 1e-4
+BATCH_SIZE = 32 # 每个 mini-batch 的样本数：32 是常用的批量大小
+LEARNING_RATE = 1e-4 # 初始学习率：使用 Adam 优化器的初始步长为 1e-4
 PATIENCE = 5 # 早停耐心值：验证集损失连续 5 个 epoch 未改善时停止训练，防止过拟合
 NUM_WORKERS = 0 # 数据加载器的并行工作线程数：0 表示在主线程中同步加载数据
 
@@ -114,7 +114,7 @@ GPU = 0 # 指定使用的 GPU 设备编号（cuda:0 为第一块显卡）
 DES = "Exp" # 实验描述标签，用于生成检查点/结果目录名中的描述字段
 ITR = 1 # 实验重复次数：当 ITR > 1 时可评估模型的训练稳定性和结果方差
 INVERSE_EVAL = True # 是否在评估时对预测值和真实值做反标准化
-TRAIN_MODE = True    # 训练模式开关
+TRAIN_MODE = False    # 训练模式开关
 
 # ==================== /optuna 导入配置 ====================
 # 可调参数名称映射表：将 best_params.json 中的大写键名映射为 args 中对应的小写属性名。

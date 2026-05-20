@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "artifact_type": "forecast_checkpoint",
+  "model_family": "timexer_prior_correction_quantile",
+  "entrypoint": "python -m app.train prior-correction",
+  "setting": "sdv4_sl2880_pl672_wd3_sdk3_ts1_bs32_priorc000_f6b3ee36",
+  "logical_dataset_profile": "hunan_load:2024",
+  "dataset_id": "hunan_load",
+  "dataset_version": "2024",
+  "load_source_name": "湖南省负荷2024年",
+  "future_source_name": "未来预测窗口(2024)",
+  "weather_source_name": "15min",
+  "seq_len": 2880,
+  "pred_len": 672,
+  "weather_seq_len": 3552,
+  "quantiles": [
+    0.02,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    0.98
+  ],
+  "checkpoint_file": "checkpoint.pth",
+  "config_file": "config.json",
+  "target_scaler_file": "target_scaler.npz",
+  "required_inference_files": [
+    "checkpoint.pth",
+    "config.json",
+    "target_scaler.npz",
+    "weather_normalization.json"
+  ],
+  "created_at_utc": "2026-05-11T16:16:55.979505+00:00",
+  "weather_normalization_file": "weather_normalization.json",
+  "extra_metadata": {
+    "training_strategy": "two_stage_finetune",
+    "stage1_checkpoint_dir": "stage1",
+    "stage2_checkpoint_dir": "stage2",
+    "best_overall_val": 0.08626998010222897
+  }
+}

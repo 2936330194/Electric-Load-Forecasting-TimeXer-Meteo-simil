@@ -61,9 +61,9 @@ FEATURES = "MS"  # 多变量输入、单变量输出
 
 
 # ==================== 时序长度配置 ====================
-SEQ_LEN = 96 * 30  # 输入历史长度：7 天
+SEQ_LEN = 96 * 7  # 输入历史长度：7 天
 LABEL_LEN = 0  # 解码端已知标签长度
-PRED_LEN = 96 * 7 # 预测长度：1 天
+PRED_LEN = 96 * 1 # 预测长度：1 天
 LOAD_FREQ = "15min"  # 负荷序列采样频率
 
 
@@ -130,8 +130,8 @@ CONTIGUOUS_TRAIN_BATCHES = True  # 训练阶段按连续窗口分块组 batch，
 # 说明：
 # - 当 FEATURES="MS" 时，TimeXer 的输入会被组织成“气象特征 + 历史负荷”，输出只预测目标负荷。
 
-LOAD_FROM_OPTUNA = True
-OPTUNA_DIR = "./optuna_15min_30_7"
+LOAD_FROM_OPTUNA = True    # 是否从 ./optuna 加载最佳模型权重和配置
+OPTUNA_DIR = "./optuna_15min_7_1"
 OPTUNA_BEST_PARAMS_FILE = "best_params_fullmap.json"
 OPTUNA_BEST_CONFIG_FILE = "best_config_fullmap.json"
 OPTUNA_BEST_WEIGHT_FILE = "best_model_fullmap.pth"

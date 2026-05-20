@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "source_tag": "weather_norm_v2_hunan_grid_2024_2025_filtered_15min_ch5_2a3ed347bc708433d391",
+  "expected_in_channels": 5,
+  "log1p_channels": [],
+  "normalization_eps": 1e-06,
+  "sample_count": 23424,
+  "channel_mean": [
+    80.48542022705078,
+    19.786457061767578,
+    1013.0442504882812,
+    2.3228275775909424,
+    87.11197662353516
+  ],
+  "channel_std": [
+    13.758934020996094,
+    12.330110549926758,
+    9.29385757446289,
+    1.4838577508926392,
+    165.7809295654297
+  ]
+}
