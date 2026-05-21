@@ -463,7 +463,7 @@ def main():
     args.pred_len = 96
     args.enc_in = 1
     args.c_out = 1
-    args.moving_avg = 25
+    args.moving_avg = 97
     args.individual = False
     args.use_future_covariates = False
     args.future_cov_dim = 0

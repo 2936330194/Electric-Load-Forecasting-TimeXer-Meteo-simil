@@ -1,4 +1,4 @@
-"""
+﻿"""
 test4_conv_similar.py - Optuna超参数优化 + 外生气象变量 + TimeXer 基础预测 + 相似日先验修正门控系统
 
 此版本引入了两阶段微调（Two-stage Fine-tuning）策略：
@@ -40,61 +40,55 @@ from utils.weather_e2e import FullMapWeatherConvExtractor, WeatherGridStore, wea
 
 
 # ================= 相似日检索模块与 TimeXer 主体纠偏门控方案的专属参数配置 =================
-# 指定相似日检索模型的缓存目录（包含离线训练好的 PCA 分解器和 Faiss 向量索引库）。
 SIMILAR_DAY_ARTIFACT_DIR: Optional[str] = None
 
 # 在检索历史中最相近日期的天气时，选取前 K(这里是3) 个最相似的日期来生成先验负荷曲线。
-# 一般 K 选取 3~5 左右能起到较好的去噪及平滑效果。
 SIMILAR_DAY_TOP_K = 3
 
 # 这是一个总开关，决定接下来的测试或训练环节中，是否要启用并组装这条相似日先验特征进入端到端模型。
 USE_SIMILAR_DAY_PRIOR = True
 
 # 针对先验纠偏门控 (Dynamic Prior-Correction Gating) 的隐藏层尺寸参数。
-# 门控决策本质上是简单的标量回归，不需要大容量网络，过大容易过拟合。
-SIMILAR_DAY_GATE_HIDDEN_DIM = 32
+SIMILAR_DAY_GATE_HIDDEN_DIM = 64
 
 # 网络初始化时给先验纠偏比例的权重锚点。
-# 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，
-# 随后网络再通过反向传播自动调节先验的介入比例。
-SIMILAR_DAY_GATE_INIT_BETA = 0.05
+# 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，随后网络再通过反向传播自动调节先验的介入比例。
+SIMILAR_DAY_GATE_INIT_BETA = 0.10
 
 
 # ================= 从基础实验模块导入常用工具函数 =================
 # 为了保持代码简洁并保证逻辑与基础版本严格对齐，这里大量借用了 test4_smp.py (下称 base) 中写好的底层支持函数。
-_use_non_blocking_transfer = base._use_non_blocking_transfer  # 用于判断是否开启异步显存传输加速（non_blocking=True）
-_to_float_device = base._to_float_device                      # 将 Float 数据安全地发送给设定的硬件（CPU 或 CUDA）
-_to_long_device = base._to_long_device                        # 将 Long/Int 数据发送给特定计算硬件
-extract_target = base.extract_target                          # 用来自动抽取出用于计算 Loss (只保留真值通道) 的数据片段
-_parse_cli_args = base._parse_cli_args                        # 用于解析用户从终端传入的模型维度和训练参数等设置
-_resolve_weather_h5_specs = base._resolve_weather_h5_specs    # 读取不同区域的气象变量对应说明书 (告诉网络通道有多少个气象因数)
-_configure_runtime_weather_args = base._configure_runtime_weather_args # 动态初始化网络时，根据实际气象包尺寸微调部分配置
-export_similar_day_baseline = base.export_similar_day_baseline# 一键在训练结束后将单纯依靠该先验所生成的对比结果图表保存
+_use_non_blocking_transfer = base._use_non_blocking_transfer  
+_to_float_device = base._to_float_device                      
+_to_long_device = base._to_long_device                        
+extract_target = base.extract_target                          
+_parse_cli_args = base._parse_cli_args                        
+_resolve_weather_h5_specs = base._resolve_weather_h5_specs    
+_configure_runtime_weather_args = base._configure_runtime_weather_args 
+export_similar_day_baseline = base.export_similar_day_baseline
 
 
 # ================= 训练模式与 Optuna 预训练骨干加载配置 =================
-TRAIN_MODE = base.TRAIN_MODE                          # 从基础模块继承训练/测试模式开关
-ENABLE_TWO_STAGE_FINETUNE = True                      # 是否启用两阶段微调策略（先冻结骨干训门控，再联合微调）
-# 在 v4 版本中，此标志位仅在训练模式下控制是否从 Optuna 调优产物中加载骨干网络权重。
-# 纯测试模式下默认从本地微调后的 checkpoint 加载，不会触发 Optuna 权重初始化流程。
-LOAD_FROM_OPTUNA = True                               # 训练时是否从 Optuna 最优试验加载预训练骨干权重
-OPTUNA_DIR = "./optuna"                               # Optuna 调优产物的根目录路径
-OPTUNA_BEST_PARAMS_FILE = "best_params3.json"         # Optuna 最优超参数文件名（备选加载源）
-OPTUNA_BEST_CONFIG_FILE = "best_config3.json"         # Optuna 最优完整配置文件名（优先加载源）
-OPTUNA_BEST_WEIGHT_FILE = "best_model3.pth"           # Optuna 最优模型权重文件名
-OPTUNA_BEST_TRIAL_FILE = "best_trial_result3.json"    # Optuna 最优试验结果记录文件名（可选，用于回溯）
+TRAIN_MODE = base.TRAIN_MODE                          
+ENABLE_TWO_STAGE_FINETUNE = True                      
+LOAD_FROM_OPTUNA = True                               
+OPTUNA_DIR = "./optuna_15min_7_1"
+OPTUNA_BEST_PARAMS_FILE = "best_params_fullmap.json"
+OPTUNA_BEST_CONFIG_FILE = "best_config_fullmap.json"
+OPTUNA_BEST_WEIGHT_FILE = "best_model_fullmap.pth"
+OPTUNA_BEST_TRIAL_FILE = "best_trial_result_fullmap.json"
 
 # ================= 第一阶段微调超参数（冻结骨干，仅训练门控 + 分位数头）=================
-STAGE1_EPOCHS = 10           # 第一阶段最大训练轮数
-STAGE1_PATIENCE = 3          # 第一阶段的早停耐心值（连续3轮验证集无改善即停止）
-STAGE1_GATE_LR = 1e-3        # 第一阶段中相似日门控网络的学习率（较大，让门控快速收敛）
-STAGE1_HEAD_LR = 2e-4        # 第一阶段中分位数预测头的学习率（较小，微调即可）
+STAGE1_EPOCHS = 15           # 第一阶段最大训练轮数
+STAGE1_PATIENCE = 4          # 第一阶段的早停耐心值（连续4轮验证集无改善即停止）
+STAGE1_GATE_LR = 7e-4        # 第一阶段中相似日门控网络的学习率（稍低，减少门控震荡）
+STAGE1_HEAD_LR = 1e-4        # 第一阶段中分位数预测头的学习率（更保守地校准预测头）
 
 # ================= 第二阶段微调超参数（解冻全部参数，低学习率联合精调）=================
-STAGE2_EPOCHS = 15           # 第二阶段最大训练轮数
-STAGE2_PATIENCE = 5          # 第二阶段的早停耐心值（略宽松，允许更充分的联合收敛）
-STAGE2_BACKBONE_LR = 2e-5    # 第二阶段中骨干网络（CNN + TimeXer）的基础学习率（极低，防止破坏预训练特征）
-STAGE2_GATE_LR_SCALE = 5.0   # 第二阶段中门控/预测头的学习率倍率（相对于骨干 LR 的 5 倍加速）
+STAGE2_EPOCHS = 20           # 第二阶段最大训练轮数
+STAGE2_PATIENCE = 6          # 第二阶段的早停耐心值（略宽松，允许更充分的联合收敛）
+STAGE2_BACKBONE_LR = 1e-5    # 第二阶段中骨干网络（CNN + TimeXer）的基础学习率（更低，降低破坏预训练特征的风险）
+STAGE2_GATE_LR_SCALE = 10.0  # 第二阶段中门控/预测头的学习率倍率（保持门控/预测头约 1e-4 的有效学习率）
 STAGE2_USE_COSINE_LR = True  # 第二阶段是否启用余弦退火学习率调度（平滑衰减，避免末期震荡）
 
 # ================= Optuna 超参数键名映射表 =================

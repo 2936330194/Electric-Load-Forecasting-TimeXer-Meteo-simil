@@ -487,7 +487,7 @@ def main():
     args.factor = 3
     args.dropout = 0.1
     args.activation = "gelu"
-    args.moving_avg = 25
+    args.moving_avg = 97
     args.num_workers = 0
     args.checkpoints = os.path.dirname(__file__)
     args.loss = "Quantile"
