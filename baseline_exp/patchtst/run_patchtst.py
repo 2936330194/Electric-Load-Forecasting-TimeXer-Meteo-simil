@@ -467,7 +467,7 @@ def main():
     args.n_heads = 4
     args.e_layers = 3
     args.d_ff = 2048
-    args.factor = 1
+    args.factor = 3
     args.dropout = 0.1
     args.activation = "gelu"
     args.patch_len = 96
@@ -499,6 +499,10 @@ def main():
         args.is_training = 0
 
     model = PatchTSTQuantile(args, quantiles=QUANTILES).float().to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"PatchTSTQuantile total params: {total_params:,}")
+    print(f"PatchTSTQuantile trainable params: {trainable_params:,}")
 
     if args.is_training:
         model = train_quantile_model(model, args, device)

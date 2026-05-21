@@ -459,7 +459,7 @@ def main():
     args.freq = "t"
     args.embed = "timeF"
     args.seq_len = 672
-    args.label_len = 48
+    args.label_len = 0
     args.pred_len = 96
     args.enc_in = 1
     args.c_out = 1
@@ -493,6 +493,10 @@ def main():
         args.is_training = 0
 
     model = DLinearQuantile(args, quantiles=QUANTILES).float().to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"DLinearQuantile total params: {total_params:,}")
+    print(f"DLinearQuantile trainable params: {trainable_params:,}")
 
     if args.is_training:
         model = train_quantile_model(model, args, device)

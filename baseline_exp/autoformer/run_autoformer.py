@@ -479,7 +479,7 @@ def main():
     args.enc_in = 1
     args.dec_in = 1
     args.c_out = 1
-    args.d_model = 256
+    args.d_model = 512
     args.n_heads = 4
     args.e_layers = 2
     args.d_layers = 1
@@ -512,6 +512,10 @@ def main():
         args.is_training = 0
 
     model = AutoformerQuantile(args, quantiles=QUANTILES).float().to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"AutoformerQuantile total params: {total_params:,}")
+    print(f"AutoformerQuantile trainable params: {trainable_params:,}")
 
     if args.is_training:
         model = train_quantile_model(model, args, device)
