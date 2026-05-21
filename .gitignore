@@ -10,3 +10,11 @@ artifacts/
 *.pt
 *.pth
 *.npz
+*.npy
+*.csv
+*.log
+*.json
+*.zip
+*.tar.gz
+*.png
+*.jpg
