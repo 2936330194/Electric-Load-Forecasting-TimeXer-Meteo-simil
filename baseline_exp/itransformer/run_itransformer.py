@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(project_root)
 
-from models.Autoformer import Model as Autoformer
+from models.iTransformer import Model as iTransformer
 from data_provider.data_factory import data_provider
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric, cal_eval, append_probabilistic_eval
@@ -44,14 +44,13 @@ class QuantileLoss(nn.Module):
         )
         return losses.mean()
 
-class AutoformerQuantile(nn.Module):
+class ITransformerQuantile(nn.Module):
     def __init__(self, configs, quantiles=None):
-        super(AutoformerQuantile, self).__init__()
+        super(ITransformerQuantile, self).__init__()
         self.quantiles = quantiles if quantiles is not None else QUANTILES
         self.n_quantiles = len(self.quantiles)
-        self.pred_len = configs.pred_len
-        self.autoformer = Autoformer(configs)
-        self.quantile_head = nn.Linear(configs.c_out, self.n_quantiles)
+        self.itransformer = iTransformer(configs)
+        self.quantile_head = nn.Linear(1, self.n_quantiles)
         with torch.no_grad():
             self.quantile_head.weight.fill_(1.0)
             self.quantile_head.bias.copy_(
@@ -59,7 +58,8 @@ class AutoformerQuantile(nn.Module):
             )
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        point_pred = self.autoformer(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
+        point_pred = self.itransformer(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
+        point_pred = point_pred[:, -self.itransformer.pred_len:, :]
         quantile_pred = self.quantile_head(point_pred)
         return quantile_pred
 
@@ -105,7 +105,7 @@ def train_quantile_model(model, args, device):
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
 
     print(f"\n{'='*60}")
-    print(f"开始训练 Autoformer-Quantile 模型")
+    print(f"开始训练 iTransformer-Quantile 模型")
     print(f"分位数: {QUANTILES}")
     print(f"{'='*60}")
 
@@ -305,9 +305,9 @@ def plot_pred_vs_true(results_dir, use_inverse=False):
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.5)
     if np.isfinite(mape_val):
-        plt.title(f"Autoformer Quantile Prediction - MAPE: {100*mape_val:.2f}%")
+        plt.title(f"iTransformer Quantile Prediction - MAPE: {100*mape_val:.2f}%")
     else:
-        plt.title("Autoformer Quantile Prediction - MAPE: NaN")
+        plt.title("iTransformer Quantile Prediction - MAPE: NaN")
     plt.xlabel("Time Step")
     plt.ylabel("Load (MW)")
     plt.tight_layout()
@@ -364,28 +364,13 @@ def predict_future_load_from_csv(model, args, device, results_dir, future_path, 
 
     enc_window = history_values[-args.seq_len:].copy()
 
-    from utils.timefeatures import time_features as calc_time_features
-
-    enc_dates = pd.to_datetime(history_df["date"].values[-args.seq_len:])
-    enc_stamp = calc_time_features(enc_dates, freq=args.freq)
-    enc_stamp = enc_stamp.transpose(1, 0)
-
-    label_dates = pd.to_datetime(history_df["date"].values[-args.label_len:])
-    pred_dates = pd.to_datetime(future_df["date"].values[:args.pred_len])
-    dec_dates = np.concatenate([label_dates.values, pred_dates.values])
-    dec_stamp = calc_time_features(pd.DatetimeIndex(dec_dates), freq=args.freq)
-    dec_stamp = dec_stamp.transpose(1, 0)
-
     model.eval()
     with torch.no_grad():
         batch_x = torch.as_tensor(enc_window, dtype=torch.float32, device=device).unsqueeze(0)
-        x_mark = torch.as_tensor(enc_stamp, dtype=torch.float32, device=device).unsqueeze(0)
-
-        label_input = batch_x[:, -args.label_len:, :]
-        dec_zeros = torch.zeros((1, args.pred_len, batch_x.shape[-1]), dtype=torch.float32, device=device)
-        dec_inp = torch.cat([label_input, dec_zeros], dim=1)
-
-        y_mark = torch.as_tensor(dec_stamp, dtype=torch.float32, device=device).unsqueeze(0)
+        x_mark = torch.zeros((1, args.seq_len, 1), dtype=torch.float32, device=device)
+        dec_len = args.label_len + args.pred_len
+        dec_inp = torch.zeros((1, dec_len, batch_x.shape[-1]), dtype=torch.float32, device=device)
+        y_mark = torch.zeros((1, dec_len, 1), dtype=torch.float32, device=device)
 
         outputs = model(batch_x, x_mark, dec_inp, y_mark)
 
@@ -434,7 +419,7 @@ def predict_future_load_from_csv(model, args, device, results_dir, future_path, 
     plt.plot(range(n_history), history_tail, label="Historical Load", color="blue", alpha=0.8)
     plt.plot(
         future_x, preds_p50,
-        label="Autoformer P50 Prediction",
+        label="iTransformer P50 Prediction",
         color="orange", linewidth=2, marker="o", markersize=2,
     )
     plt.fill_between(
@@ -445,7 +430,7 @@ def predict_future_load_from_csv(model, args, device, results_dir, future_path, 
     plt.axvline(x=n_history - 0.5, color="gray", linestyle="--", alpha=0.6, label="Prediction Start")
     plt.legend(loc="upper left")
     plt.grid(True, linestyle="--", alpha=0.5)
-    plt.title(f"Autoformer Future {predict_steps}-Step Load Prediction (Quantile)")
+    plt.title(f"iTransformer Future {predict_steps}-Step Load Prediction (Quantile)")
     plt.xlabel("Time Step (15min)")
     plt.ylabel("Load (MW)")
     plt.tight_layout()
@@ -454,7 +439,7 @@ def predict_future_load_from_csv(model, args, device, results_dir, future_path, 
     plt.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Autoformer Baseline")
+    parser = argparse.ArgumentParser(description="iTransformer Baseline")
     parser.add_argument("--is_training", type=int, default=1, help="status")
     parser.add_argument("--train_epochs", type=int, default=50, help="train epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
@@ -467,7 +452,7 @@ def main():
     # Fixed project settings
     args.task_name = "long_term_forecast"
     args.model_id = "HunanLoad_2024_672_96"
-    args.model = "Autoformer"
+    args.model = "iTransformer"
     args.data = "custom"
     args.root_path = os.path.join(project_root, "data")
     args.data_path = "湖南省电力负荷2024.csv"
@@ -476,20 +461,20 @@ def main():
     args.freq = "t"
     args.embed = "timeF"
     args.seq_len = 672
-    args.label_len = 48
+    args.label_len = 0
     args.pred_len = 96
     args.enc_in = 1
-    args.dec_in = 1
     args.c_out = 1
     args.d_model = 512
     args.n_heads = 4
-    args.e_layers = 2
-    args.d_layers = 1
+    args.e_layers = 3
     args.d_ff = 2048
     args.factor = 3
     args.dropout = 0.1
     args.activation = "gelu"
-    args.moving_avg = 97
+    args.use_future_covariates = False
+    args.future_cov_dim = 0
+    args.future_cov_dropout = 0.1
     args.num_workers = 0
     args.checkpoints = os.path.dirname(__file__)
     args.loss = "Quantile"
@@ -513,11 +498,11 @@ def main():
         print("Checkpoint found. Skipping training phase.")
         args.is_training = 0
 
-    model = AutoformerQuantile(args, quantiles=QUANTILES).float().to(device)
+    model = ITransformerQuantile(args, quantiles=QUANTILES).float().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"AutoformerQuantile total params: {total_params:,}")
-    print(f"AutoformerQuantile trainable params: {trainable_params:,}")
+    print(f"iTransformerQuantile total params: {total_params:,}")
+    print(f"iTransformerQuantile trainable params: {trainable_params:,}")
 
     if args.is_training:
         model = train_quantile_model(model, args, device)
@@ -561,7 +546,7 @@ def main():
 
     # Save metrics JSON
     metrics = {
-        "model": "Autoformer",
+        "model": "iTransformer",
         "mae": float(mae),
         "mse": float(mse),
         "rmse": float(rmse),
@@ -578,7 +563,7 @@ def main():
         "shape": list(preds_inv.shape)
     }
 
-    metrics_path = os.path.join(args.checkpoints, "autoformer_metrics.json")
+    metrics_path = os.path.join(args.checkpoints, "itransformer_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved metrics to {metrics_path}")

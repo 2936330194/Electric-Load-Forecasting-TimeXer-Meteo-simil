@@ -1,4 +1,4 @@
-﻿"""
+"""
 test4_conv_similar.py - Optuna超参数优化 + 外生气象变量 + TimeXer 基础预测 + 相似日先验修正门控系统
 
 此版本引入了两阶段微调（Two-stage Fine-tuning）策略：
@@ -33,7 +33,7 @@ from torch import optim
 from models.TimeXer import Model as TimeXer
 import test4_base as base
 from utils.forecast_visualization import plot_pred_vs_true, predict_future_load_from_csv
-from utils.metrics import cal_eval, metric
+from utils.metrics import cal_eval, metric, append_probabilistic_eval
 from utils.quantile import QuantileLoss
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.weather_e2e import FullMapWeatherConvExtractor, WeatherGridStore, weather_data_provider
@@ -1293,7 +1293,9 @@ def test_quantile_model(model, args, device, weather_store: WeatherGridStore) ->
 
     origin_pred = preds_inv if test_data.scale else preds_p50
     origin_true = trues_inv if test_data.scale else trues
+    origin_quantiles = quantile_inv if test_data.scale else quantile_preds_all
     origin_eval_df = cal_eval(origin_true, origin_pred)
+    origin_eval_df = append_probabilistic_eval(origin_eval_df, origin_true, origin_quantiles, args.quantiles)
     print("[origin Eval] metrics:")
     print(origin_eval_df)
 

@@ -18,7 +18,7 @@ sys.path.append(project_root)
 from models.PatchTST import Model as PatchTST
 from data_provider.data_factory import data_provider
 from utils.tools import EarlyStopping, adjust_learning_rate
-from utils.metrics import metric, cal_eval
+from utils.metrics import metric, cal_eval, append_probabilistic_eval
 
 QUANTILES = [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
 N_QUANTILES = len(QUANTILES)
@@ -246,11 +246,13 @@ def test_quantile_model(model, args, device):
         preds_inv = preds_p50
         trues_inv = trues
 
+    origin_quantiles = quantile_inv if 'quantile_inv' in locals() else quantile_preds_all
     origin_eval_df = cal_eval(trues_inv, preds_inv)
+    origin_eval_df = append_probabilistic_eval(origin_eval_df, trues_inv, origin_quantiles, QUANTILES)
     print("[origin Eval] metrics:")
     print(origin_eval_df)
 
-    return folder_path, preds_inv, trues_inv
+    return folder_path, preds_inv, trues_inv, origin_eval_df
 
 def plot_pred_vs_true(results_dir, use_inverse=False):
     if use_inverse:
@@ -513,7 +515,7 @@ def main():
         else:
             raise FileNotFoundError(f"Model checkpoint not found at {best_weight_path}")
 
-    results_dir, preds_inv, trues_inv = test_quantile_model(model, args, device)
+    results_dir, preds_inv, trues_inv, origin_eval_df = test_quantile_model(model, args, device)
     plot_pred_vs_true(results_dir, use_inverse=args.inverse_eval)
     
     future_csv_path = os.path.join(args.root_path, "湖南省电力负荷2024_future.csv")
@@ -557,6 +559,9 @@ def main():
         "rmse_1d": rmse_1d,
         "mape_1d": mape_1d,
         "r2_1d": r2_1d,
+        "mean_pinball": float(origin_eval_df.loc["Eval", "Mean Pinball"]),
+        "picp_p10_p90": float(origin_eval_df.loc["Eval", "PICP (P10-P90)"]),
+        "pinaw_p10_p90": float(origin_eval_df.loc["Eval", "PINAW (P10-P90)"]),
         "shape": list(preds_inv.shape)
     }
 

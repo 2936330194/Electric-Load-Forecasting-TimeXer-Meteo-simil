@@ -37,7 +37,7 @@ from utils.forecast_visualization import (
 )
 from utils.quantile import QuantileLoss as SharedQuantileLoss
 from utils.tools import EarlyStopping, adjust_learning_rate
-from utils.metrics import metric, cal_eval
+from utils.metrics import metric, cal_eval, append_probabilistic_eval
 from utils.timefeatures import time_features
 
 CHECKPOINTS_DIR = "./checkpoints_test1/"
@@ -555,7 +555,9 @@ def test_quantile_model(model, args, device):
 
     origin_pred = preds_inv if test_data.scale else preds_p50
     origin_true = trues_inv if test_data.scale else trues
+    origin_quantiles = quantile_inv if test_data.scale else quantile_preds_all
     origin_eval_df = cal_eval(origin_true, origin_pred)
+    origin_eval_df = append_probabilistic_eval(origin_eval_df, origin_true, origin_quantiles, QUANTILES)
     print("[origin Eval] metrics:")
     print(origin_eval_df)
 

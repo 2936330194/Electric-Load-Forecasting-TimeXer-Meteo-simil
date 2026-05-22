@@ -23,7 +23,7 @@ np.random.seed(fix_seed)
 from data_provider.data_factory import data_provider
 from utils.forecast_visualization import plot_pred_vs_true
 from utils.tools import EarlyStopping, adjust_learning_rate
-from utils.metrics import metric, cal_eval
+from utils.metrics import metric, cal_eval, append_probabilistic_eval
 from utils.quantile import QuantileLoss
 
 QUANTILES = [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
@@ -220,7 +220,9 @@ def main():
         preds_inv = preds_p50
         trues_inv = trues
 
+    origin_quantiles = quantile_inv if 'quantile_inv' in locals() else quantile_preds_all
     origin_eval_df = cal_eval(trues_inv, preds_inv)
+    origin_eval_df = append_probabilistic_eval(origin_eval_df, trues_inv, origin_quantiles, QUANTILES)
     print("[origin Eval] metrics:")
     print(origin_eval_df)
 
