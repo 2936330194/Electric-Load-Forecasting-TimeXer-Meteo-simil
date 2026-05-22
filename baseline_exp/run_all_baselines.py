@@ -58,14 +58,6 @@ def main():
     else:
         print("PatchTST metrics file found, skipping execution.")
 
-    # Run DLinear
-    dlinear_metrics_path = os.path.join(base_dir, "dlinear", "dlinear_metrics.json")
-    if not os.path.exists(dlinear_metrics_path):
-        dlinear_script = os.path.join(base_dir, "dlinear", "run_dlinear.py")
-        run_script(dlinear_script, project_root)
-    else:
-        print("DLinear metrics file found, skipping execution.")
-    
     # Run TimeXer (Pure)
     timexer_metrics_path = os.path.join(base_dir, "timexer", "timexer_metrics.json")
     if not os.path.exists(timexer_metrics_path):
@@ -75,13 +67,12 @@ def main():
         print("TimeXer metrics file found, skipping execution.")
     
     # Read and aggregate metrics
-    models = ["ARIMA", "LSTM", "Autoformer", "PatchTST", "DLinear", "TimeXer"]
+    models = ["ARIMA", "LSTM", "Autoformer", "PatchTST", "TimeXer"]
     metrics_files = [
         os.path.join(base_dir, "arima", "arima_metrics.json"),
         os.path.join(base_dir, "lstm", "lstm_metrics.json"),
         os.path.join(base_dir, "autoformer", "autoformer_metrics.json"),
         os.path.join(base_dir, "patchtst", "patchtst_metrics.json"),
-        os.path.join(base_dir, "dlinear", "dlinear_metrics.json"),
         os.path.join(base_dir, "timexer", "timexer_metrics.json")
     ]
     
