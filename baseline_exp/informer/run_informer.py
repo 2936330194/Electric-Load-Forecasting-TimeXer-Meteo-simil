@@ -9,7 +9,7 @@ import os
 import sys
 import time
 import json
-import matplotlib.pyplot as plt
+
 
 # Set project root path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -63,14 +63,6 @@ class InformerQuantile(nn.Module):
         quantile_pred = self.quantile_head(point_pred)
         return quantile_pred
 
-def restore_sliding_window_2d(data_2d: np.ndarray) -> np.ndarray:
-    if len(data_2d) == 0:
-        return np.array([])
-    restored = list(data_2d[0, :])
-    for i in range(1, len(data_2d)):
-        restored.append(data_2d[i, -1])
-    return np.asarray(restored)
-
 def restore_sliding_window_3d(data_3d: np.ndarray) -> np.ndarray:
     if len(data_3d) == 0:
         return np.array([])
@@ -78,19 +70,6 @@ def restore_sliding_window_3d(data_3d: np.ndarray) -> np.ndarray:
     for i in range(1, len(data_3d)):
         restored.append(data_3d[i, -1, :])
     return np.asarray(restored)
-
-def _load_ordered_dataframe(csv_path: str, target: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    if "date" not in df.columns:
-        raise ValueError(f"缺少 date 列: {csv_path}")
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    if target not in df.columns and "Target" in df.columns:
-        df = df.rename(columns={"Target": target})
-    if target not in df.columns:
-        raise ValueError(f"缺少目标列 {target}: {csv_path}")
-    other_cols = [c for c in df.columns if c not in ("date", target)]
-    return df[["date"] + other_cols + [target]]
 
 def train_quantile_model(model, args, device):
     train_data, train_loader = data_provider(args, 'train')
@@ -253,193 +232,6 @@ def test_quantile_model(model, args, device):
     print(origin_eval_df)
 
     return folder_path, preds_inv, trues_inv, origin_eval_df
-
-def plot_pred_vs_true(results_dir, use_inverse=False):
-    if use_inverse:
-        pred_path = os.path.join(results_dir, "pred_inv.npy")
-        true_path = os.path.join(results_dir, "true_inv.npy")
-        quantile_path = os.path.join(results_dir, "quantile_preds_inv.npy")
-    else:
-        pred_path = os.path.join(results_dir, "pred.npy")
-        true_path = os.path.join(results_dir, "true.npy")
-        quantile_path = os.path.join(results_dir, "quantile_preds.npy")
-
-    if not os.path.exists(pred_path) or not os.path.exists(true_path):
-        print("Prediction files not found, skip plotting.")
-        return
-
-    preds = np.load(pred_path)
-    trues = np.load(true_path)
-
-    has_quantiles = os.path.exists(quantile_path)
-    if has_quantiles:
-        quantile_preds = np.load(quantile_path)
-
-    pred_series = restore_sliding_window_3d(preds).squeeze()
-    true_series = restore_sliding_window_3d(trues).squeeze()
-
-    if has_quantiles:
-        q_p10_raw = quantile_preds[:, :, P10_IDX:P10_IDX+1]
-        q_p90_raw = quantile_preds[:, :, P90_IDX:P90_IDX+1]
-        p10_series = restore_sliding_window_3d(q_p10_raw).squeeze()
-        p90_series = restore_sliding_window_3d(q_p90_raw).squeeze()
-
-    eval_df = cal_eval(true_series, pred_series)
-    print("[Plot Eval] metrics:")
-    print(eval_df)
-
-    mape_val = eval_df.iloc[0]["MAPE"]
-
-    plt.figure(figsize=(15, 5), facecolor="white")
-    plt.plot(true_series, label="GroundTruth", alpha=0.8, color="tab:blue")
-    plt.plot(pred_series, label="Prediction (P50)", alpha=0.7, color="tab:orange")
-
-    if has_quantiles:
-        x_range = range(len(p10_series))
-        plt.fill_between(
-            x_range, p10_series, p90_series,
-            alpha=0.2, color="tab:orange",
-            label="P10-P90 Confidence Interval"
-        )
-
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.5)
-    if np.isfinite(mape_val):
-        plt.title(f"Informer Quantile Prediction - MAPE: {100*mape_val:.2f}%")
-    else:
-        plt.title("Informer Quantile Prediction - MAPE: NaN")
-    plt.xlabel("Time Step")
-    plt.ylabel("Load (MW)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "pred_vs_true.png"), dpi=600, bbox_inches="tight")
-    plt.close()
-
-def predict_future_load_from_csv(model, args, device, results_dir, future_path, steps=96, use_inverse=True):
-    print("\n" + "=" * 60)
-    print(f"Future Forecast: from {future_path}")
-    print("=" * 60)
-
-    abs_future_path = os.path.abspath(future_path)
-    if not os.path.exists(abs_future_path):
-        print(f"Future file not found, skip: {abs_future_path}")
-        return
-
-    history_path = os.path.join(args.root_path, args.data_path)
-    if not os.path.exists(history_path):
-        print(f"History file not found, skip: {history_path}")
-        return
-
-    try:
-        history_df = _load_ordered_dataframe(history_path, args.target)
-    except Exception as e:
-        print(f"Load history data failed: {e}")
-        return
-
-    future_df = pd.read_csv(abs_future_path)
-    if "date" not in future_df.columns:
-        print(f"Future file missing date column: {abs_future_path}")
-        return
-    future_df["date"] = pd.to_datetime(future_df["date"])
-    future_df = future_df.sort_values("date").reset_index(drop=True)
-
-    if len(history_df) < args.seq_len:
-        print(f"History length ({len(history_df)}) < seq_len ({args.seq_len}), skip.")
-        return
-
-    predict_steps = min(int(steps), len(future_df), args.pred_len)
-    if predict_steps <= 0 or predict_steps < args.pred_len:
-        print(f"Future rows ({predict_steps}) < pred_len ({args.pred_len}), skip.")
-        return
-
-    train_data, _ = data_provider(args, 'train')
-    scaler = getattr(train_data, "scaler", None)
-    has_scaler = scaler is not None and hasattr(scaler, "mean_")
-
-    feature_cols = [args.target]
-    target_idx = 0
-    history_values = history_df[feature_cols].values.astype(np.float32)
-
-    if has_scaler:
-        history_values = scaler.transform(history_values)
-
-    enc_window = history_values[-args.seq_len:].copy()
-
-    model.eval()
-    with torch.no_grad():
-        batch_x = torch.as_tensor(enc_window, dtype=torch.float32, device=device).unsqueeze(0)
-        time_feature_dim = 5 if args.embed == "timeF" and args.freq == "t" else 1
-        x_mark = torch.zeros((1, args.seq_len, time_feature_dim), dtype=torch.float32, device=device)
-        label_input = batch_x[:, -args.label_len:, :] if args.label_len > 0 else batch_x[:, :0, :]
-        dec_zeros = torch.zeros((1, args.pred_len, batch_x.shape[-1]), dtype=torch.float32, device=device)
-        dec_inp = torch.cat([label_input, dec_zeros], dim=1)
-        dec_len = dec_inp.shape[1]
-        y_mark = torch.zeros((1, dec_len, time_feature_dim), dtype=torch.float32, device=device)
-
-        outputs = model(batch_x, x_mark, dec_inp, y_mark)
-
-        quantile_scaled = outputs[0, :args.pred_len, :].detach().cpu().numpy()
-        p50_scaled = quantile_scaled[:, P50_IDX]
-        p10_scaled = quantile_scaled[:, P10_IDX]
-        p90_scaled = quantile_scaled[:, P90_IDX]
-
-    if has_scaler and use_inverse:
-        def inv(arr):
-            return arr * scaler.scale_[target_idx] + scaler.mean_[target_idx]
-        preds_p50 = inv(p50_scaled)
-        preds_p10 = inv(p10_scaled)
-        preds_p90 = inv(p90_scaled)
-        history_target = history_df[args.target].values
-    else:
-        preds_p50 = p50_scaled
-        preds_p10 = p10_scaled
-        preds_p90 = p90_scaled
-        history_target = history_values[:, target_idx]
-
-    future_dates = future_df["date"].iloc[:args.pred_len].reset_index(drop=True)
-    preds_p50 = preds_p50[:len(future_dates)]
-    preds_p10 = preds_p10[:len(future_dates)]
-    preds_p90 = preds_p90[:len(future_dates)]
-    predict_steps = len(preds_p50)
-
-    os.makedirs(results_dir, exist_ok=True)
-    out_csv = os.path.join(results_dir, "future_load_prediction.csv")
-    pd.DataFrame({
-        "date": future_dates,
-        f"{args.target}_pred_P10": preds_p10,
-        f"{args.target}_pred_P50": preds_p50,
-        f"{args.target}_pred_P90": preds_p90,
-    }).to_csv(out_csv, index=False, encoding="utf-8-sig")
-
-    print(f"\nFuture {predict_steps}-step {args.target} predictions:")
-    for i in range(predict_steps):
-        print(f"  {future_dates.iloc[i]}: {preds_p10[i]:.4f} {preds_p50[i]:.4f} {preds_p90[i]:.4f}")
-
-    n_history = min(672, len(history_target))
-    history_tail = history_target[-n_history:]
-    future_x = range(n_history, n_history + predict_steps)
-
-    plt.figure(figsize=(15, 6), facecolor="white")
-    plt.plot(range(n_history), history_tail, label="Historical Load", color="blue", alpha=0.8)
-    plt.plot(
-        future_x, preds_p50,
-        label="Informer P50 Prediction",
-        color="orange", linewidth=2, marker="o", markersize=2,
-    )
-    plt.fill_between(
-        future_x, preds_p10, preds_p90,
-        alpha=0.25, color="orange",
-        label="P10-P90 Confidence Interval"
-    )
-    plt.axvline(x=n_history - 0.5, color="gray", linestyle="--", alpha=0.6, label="Prediction Start")
-    plt.legend(loc="upper left")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.title(f"Informer Future {predict_steps}-Step Load Prediction (Quantile)")
-    plt.xlabel("Time Step (15min)")
-    plt.ylabel("Load (MW)")
-    plt.tight_layout()
-    out_fig = os.path.join(results_dir, "future_load_prediction.png")
-    plt.savefig(out_fig, dpi=600, bbox_inches="tight")
-    plt.close()
 
 def main():
     parser = argparse.ArgumentParser(description="Informer Baseline")
