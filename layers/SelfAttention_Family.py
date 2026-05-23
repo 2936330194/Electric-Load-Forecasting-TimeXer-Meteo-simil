@@ -54,8 +54,9 @@ SelfAttention_Family.py - 自注意力机制模块
 
 import torch               # PyTorch 深度学习框架
 import torch.nn as nn      # 神经网络模块
+import numpy as np
 from math import sqrt      # 平方根函数，用于缩放因子计算
-from utils.masking import TriangularCausalMask  # 三角因果掩码
+from utils.masking import TriangularCausalMask, ProbMask
 
 
 class FullAttention(nn.Module):
@@ -160,6 +161,97 @@ class FullAttention(nn.Module):
         return V.contiguous(), None
 
 
+
+class ProbAttention(nn.Module):
+    """ProbSparse attention used by Informer."""
+
+    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
+        super(ProbAttention, self).__init__()
+        self.factor = factor
+        self.scale = scale
+        self.mask_flag = mask_flag
+        self.output_attention = output_attention
+        self.dropout = nn.Dropout(attention_dropout)
+
+    def _prob_QK(self, Q, K, sample_k, n_top):
+        B, H, L_K, E = K.shape
+        _, _, L_Q, _ = Q.shape
+
+        K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E)
+        index_sample = torch.randint(L_K, (L_Q, sample_k), device=K.device)
+        K_sample = K_expand[:, :, torch.arange(L_Q, device=K.device).unsqueeze(1), index_sample, :]
+        Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2)
+
+        M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K)
+        M_top = M.topk(n_top, sorted=False)[1]
+
+        Q_reduce = Q[
+            torch.arange(B, device=Q.device)[:, None, None],
+            torch.arange(H, device=Q.device)[None, :, None],
+            M_top,
+            :,
+        ]
+        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1))
+        return Q_K, M_top
+
+    def _get_initial_context(self, V, L_Q):
+        B, H, L_V, D = V.shape
+        if not self.mask_flag:
+            V_sum = V.mean(dim=-2)
+            context = V_sum.unsqueeze(-2).expand(B, H, L_Q, V_sum.shape[-1]).clone()
+        else:
+            assert L_Q == L_V
+            context = V.cumsum(dim=-2)
+        return context
+
+    def _update_context(self, context_in, V, scores, index, L_Q, attn_mask):
+        B, H, L_V, D = V.shape
+
+        if self.mask_flag:
+            attn_mask = ProbMask(B, H, L_Q, index, scores, device=V.device)
+            scores.masked_fill_(attn_mask.mask, -np.inf)
+
+        attn = torch.softmax(scores, dim=-1)
+        context_in[
+            torch.arange(B, device=V.device)[:, None, None],
+            torch.arange(H, device=V.device)[None, :, None],
+            index,
+            :,
+        ] = torch.matmul(attn, V).type_as(context_in)
+
+        if self.output_attention:
+            attns = (torch.ones([B, H, L_V, L_V], device=attn.device) / L_V).type_as(attn)
+            attns[
+                torch.arange(B, device=V.device)[:, None, None],
+                torch.arange(H, device=V.device)[None, :, None],
+                index,
+                :,
+            ] = attn
+            return context_in, attns
+        return context_in, None
+
+    def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        B, L_Q, H, D = queries.shape
+        _, L_K, _, _ = keys.shape
+
+        queries = queries.transpose(2, 1)
+        keys = keys.transpose(2, 1)
+        values = values.transpose(2, 1)
+
+        U_part = self.factor * np.ceil(np.log(L_K)).astype("int").item()
+        u = self.factor * np.ceil(np.log(L_Q)).astype("int").item()
+        U_part = U_part if U_part < L_K else L_K
+        u = u if u < L_Q else L_Q
+
+        scores_top, index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u)
+
+        scale = self.scale or 1.0 / sqrt(D)
+        if scale is not None:
+            scores_top = scores_top * scale
+
+        context = self._get_initial_context(values, L_Q)
+        context, attn = self._update_context(context, values, scores_top, index, L_Q, attn_mask)
+        return context.contiguous(), attn
 class AttentionLayer(nn.Module):
     """
     多头注意力层

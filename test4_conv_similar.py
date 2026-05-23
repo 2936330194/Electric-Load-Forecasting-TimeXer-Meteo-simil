@@ -49,11 +49,12 @@ SIMILAR_DAY_TOP_K = 3
 USE_SIMILAR_DAY_PRIOR = True
 
 # 针对先验纠偏门控 (Dynamic Prior-Correction Gating) 的隐藏层尺寸参数。
-SIMILAR_DAY_GATE_HIDDEN_DIM = 64
+# Optuna 邻域搜索显示较大门控容量更适合当前相似日先验纠偏任务。
+SIMILAR_DAY_GATE_HIDDEN_DIM = 96
 
 # 网络初始化时给先验纠偏比例的权重锚点。
-# 0.1 表示初始时仅采纳 10% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，随后网络再通过反向传播自动调节先验的介入比例。
-SIMILAR_DAY_GATE_INIT_BETA = 0.10
+# 0.12 表示初始时仅采纳约 12% 的相似日纠偏，让 TimeXer 先以主体预测稳定起步，随后网络再通过反向传播自动调节先验的介入比例。
+SIMILAR_DAY_GATE_INIT_BETA = 0.12
 
 
 # ================= 从基础实验模块导入常用工具函数 =================
@@ -79,16 +80,16 @@ OPTUNA_BEST_WEIGHT_FILE = "best_model_fullmap.pth"
 OPTUNA_BEST_TRIAL_FILE = "best_trial_result_fullmap.json"
 
 # ================= 第一阶段微调超参数（冻结骨干，仅训练门控 + 分位数头）=================
-STAGE1_EPOCHS = 15           # 第一阶段最大训练轮数
-STAGE1_PATIENCE = 4          # 第一阶段的早停耐心值（连续4轮验证集无改善即停止）
-STAGE1_GATE_LR = 7e-4        # 第一阶段中相似日门控网络的学习率（稍低，减少门控震荡）
-STAGE1_HEAD_LR = 1e-4        # 第一阶段中分位数预测头的学习率（更保守地校准预测头）
+STAGE1_EPOCHS = 13           # 第一阶段最大训练轮数
+STAGE1_PATIENCE = 3          # 第一阶段的早停耐心值（连续3轮验证集无改善即停止）
+STAGE1_GATE_LR = 8e-4        # 第一阶段中相似日门控网络的学习率（贴近 Optuna 优区间，使用圆整值）
+STAGE1_HEAD_LR = 2e-4        # 第一阶段中分位数预测头的学习率（提高头部校准速度，使用圆整值）
 
 # ================= 第二阶段微调超参数（解冻全部参数，低学习率联合精调）=================
-STAGE2_EPOCHS = 20           # 第二阶段最大训练轮数
-STAGE2_PATIENCE = 6          # 第二阶段的早停耐心值（略宽松，允许更充分的联合收敛）
-STAGE2_BACKBONE_LR = 1e-5    # 第二阶段中骨干网络（CNN + TimeXer）的基础学习率（更低，降低破坏预训练特征的风险）
-STAGE2_GATE_LR_SCALE = 10.0  # 第二阶段中门控/预测头的学习率倍率（保持门控/预测头约 1e-4 的有效学习率）
+STAGE2_EPOCHS = 26           # 第二阶段最大训练轮数（允许更充分收敛，但仍不直接复刻单个 trial）
+STAGE2_PATIENCE = 7          # 第二阶段的早停耐心值（允许更充分的联合收敛）
+STAGE2_BACKBONE_LR = 7e-6    # 第二阶段中骨干网络（CNN + TimeXer）的基础学习率（降低破坏预训练特征的风险）
+STAGE2_GATE_LR_SCALE = 8.0   # 第二阶段中门控/预测头的学习率倍率（门控/预测头有效学习率约 5.6e-5）
 STAGE2_USE_COSINE_LR = True  # 第二阶段是否启用余弦退火学习率调度（平滑衰减，避免末期震荡）
 
 # ================= Optuna 超参数键名映射表 =================

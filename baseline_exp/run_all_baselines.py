@@ -66,6 +66,14 @@ def main():
     else:
         print("iTransformer metrics file found, skipping execution.")
 
+    # Run Informer
+    informer_metrics_path = os.path.join(base_dir, "informer", "informer_metrics.json")
+    if not os.path.exists(informer_metrics_path):
+        informer_script = os.path.join(base_dir, "informer", "run_informer.py")
+        run_script(informer_script, project_root)
+    else:
+        print("Informer metrics file found, skipping execution.")
+
     # Run TimeXer (Pure)
     timexer_metrics_path = os.path.join(base_dir, "timexer", "timexer_metrics.json")
     if not os.path.exists(timexer_metrics_path):
@@ -75,13 +83,14 @@ def main():
         print("TimeXer metrics file found, skipping execution.")
     
     # Read and aggregate metrics
-    models = ["ARIMA", "LSTM", "Autoformer", "PatchTST", "iTransformer", "TimeXer"]
+    models = ["ARIMA", "LSTM", "Autoformer", "PatchTST", "iTransformer", "Informer", "TimeXer"]
     metrics_files = [
         os.path.join(base_dir, "arima", "arima_metrics.json"),
         os.path.join(base_dir, "lstm", "lstm_metrics.json"),
         os.path.join(base_dir, "autoformer", "autoformer_metrics.json"),
         os.path.join(base_dir, "patchtst", "patchtst_metrics.json"),
         os.path.join(base_dir, "itransformer", "itransformer_metrics.json"),
+        os.path.join(base_dir, "informer", "informer_metrics.json"),
         os.path.join(base_dir, "timexer", "timexer_metrics.json")
     ]
     
