@@ -520,14 +520,6 @@ def main():
             raise FileNotFoundError(f"Model checkpoint not found at {best_weight_path}")
 
     results_dir, preds_inv, trues_inv, origin_eval_df = test_quantile_model(model, args, device)
-    plot_pred_vs_true(results_dir, use_inverse=args.inverse_eval)
-    
-    future_csv_path = os.path.join(args.root_path, "湖南省电力负荷2024_future.csv")
-    predict_future_load_from_csv(
-        model=model, args=args, device=device,
-        results_dir=results_dir, future_path=future_csv_path,
-        steps=args.pred_len, use_inverse=args.inverse_eval,
-    )
 
     # Standard metrics
     mae, mse, rmse, mape, mspe = metric(preds_inv, trues_inv)

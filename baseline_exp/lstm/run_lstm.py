@@ -1,10 +1,9 @@
 import os
 import sys
-import json
 import time
+import json
 import random
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 from torch import optim
@@ -21,7 +20,6 @@ np.random.seed(fix_seed)
 
 # Import project components
 from data_provider.data_factory import data_provider
-from utils.forecast_visualization import plot_pred_vs_true
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric, cal_eval, append_probabilistic_eval
 from utils.quantile import QuantileLoss
@@ -225,78 +223,6 @@ def main():
     origin_eval_df = append_probabilistic_eval(origin_eval_df, trues_inv, origin_quantiles, QUANTILES)
     print("[origin Eval] metrics:")
     print(origin_eval_df)
-
-    plot_pred_vs_true(
-        args.checkpoints,
-        use_inverse=args.inverse_eval,
-        quantiles=QUANTILES,
-        title_prefix="LSTM Quantile Prediction",
-    )
-        
-    # Standard 2D window-average metrics
-    mae, mse, rmse, mape, mspe = metric(preds_inv, trues_inv)
-    target_mean = np.mean(trues_inv)
-    ss_tot = np.sum((trues_inv - target_mean) ** 2)
-    ss_res = np.sum((trues_inv - preds_inv) ** 2)
-    r2 = 1 - ss_res / ss_tot
-    
-    # 1D contiguous timeline metrics
-    def restore_sliding_window_3d(data_3d):
-        if len(data_3d) == 0: return np.array([])
-        restored = list(data_3d[0, :, :])
-        for i in range(1, len(data_3d)):
-            restored.append(data_3d[i, -1, :])
-        return np.asarray(restored)
-
-    pred_1d = restore_sliding_window_3d(preds_inv).squeeze()
-    true_1d = restore_sliding_window_3d(trues_inv).squeeze()
-
-    mae_1d = float(np.mean(np.abs(pred_1d - true_1d)))
-    mse_1d = float(np.mean((pred_1d - true_1d) ** 2))
-    rmse_1d = float(np.sqrt(mse_1d))
-    mape_1d = float(np.mean(np.abs((pred_1d - true_1d) / np.maximum(true_1d, 1e-5))))
-    
-    target_mean_1d = np.mean(true_1d)
-    ss_tot_1d = np.sum((true_1d - target_mean_1d) ** 2)
-    ss_res_1d = np.sum((true_1d - pred_1d) ** 2)
-    r2_1d = float(1 - ss_res_1d / ss_tot_1d)
-    
-    # Generate future forecasting predictions
-    print("\nGenerating future forecast predictions...")
-    future_csv_path = os.path.join(args.root_path, "湖南省电力负荷2024_future.csv")
-    if os.path.exists(future_csv_path):
-        future_df = pd.read_csv(future_csv_path)
-        future_df["date"] = pd.to_datetime(future_df["date"])
-        
-        # Load historical load tail to build input window
-        history_csv_path = os.path.join(args.root_path, args.data_path)
-        history_df = pd.read_csv(history_csv_path)
-        hist_load = history_df[args.target].iloc[-args.seq_len:].values.reshape(-1, 1)
-        
-        # Standardize using training scaler
-        scaled_hist_load = train_data.scaler.transform(hist_load)
-        
-        # Make future prediction
-        batch_x = torch.as_tensor(scaled_hist_load, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            outputs = model(batch_x)  # [1, pred_len, n_quantiles]
-            quantile_scaled = outputs[0].cpu().numpy()  # [pred_len, n_quantiles]
-            
-        # Inverse transform each quantile
-        future_quantile_phys = np.zeros_like(quantile_scaled)
-        for qi in range(N_QUANTILES):
-            q_col = quantile_scaled[:, qi:qi+1]
-            future_quantile_phys[:, qi] = train_data.scaler.inverse_transform(q_col).flatten()
-        
-        # Save to CSV with all quantiles
-        output_df = pd.DataFrame({"date": future_df["date"].iloc[:args.pred_len]})
-        for qi, q in enumerate(QUANTILES):
-            col_name = f"load_pred_P{int(q*100)}"
-            output_df[col_name] = future_quantile_phys[:, qi]
-        
-        output_csv_path = os.path.join(args.checkpoints, "future_load_prediction.csv")
-        output_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
-        print(f"Saved future predictions to {output_csv_path}")
 
 if __name__ == "__main__":
     main()

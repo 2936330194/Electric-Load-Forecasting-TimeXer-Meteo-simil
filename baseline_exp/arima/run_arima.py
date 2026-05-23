@@ -11,7 +11,6 @@ from statsmodels.tsa.arima.model import ARIMA
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(project_root)
 
-from utils.forecast_visualization import plot_pred_vs_true
 from utils.metrics import cal_eval
 
 def main():
@@ -107,53 +106,6 @@ def main():
     origin_eval_df = cal_eval(trues_inv, preds_inv)
     print("[origin Eval] metrics:")
     print(origin_eval_df)
-
-    plot_pred_vs_true(
-        results_dir,
-        use_inverse=True,
-        title_prefix="ARIMA Prediction",
-    )
-    
-    # 1D contiguous timeline metrics
-    def restore_sliding_window_2d(data_2d):
-        if len(data_2d) == 0: return np.array([])
-        restored = list(data_2d[0, :])
-        for i in range(1, len(data_2d)):
-            restored.append(data_2d[i, -1])
-        return np.asarray(restored)
-
-    pred_1d = restore_sliding_window_2d(preds_inv)
-    true_1d = restore_sliding_window_2d(trues_inv)
-
-    mae_1d = float(np.mean(np.abs(pred_1d - true_1d)))
-    mse_1d = float(np.mean((pred_1d - true_1d) ** 2))
-    rmse_1d = float(np.sqrt(mse_1d))
-    mape_1d = float(np.mean(np.abs((pred_1d - true_1d) / np.maximum(true_1d, 1e-5))))
-    
-    target_mean_1d = np.mean(true_1d)
-    ss_tot_1d = np.sum((true_1d - target_mean_1d) ** 2)
-    ss_res_1d = np.sum((true_1d - pred_1d) ** 2)
-    r2_1d = float(1 - ss_res_1d / ss_tot_1d)
-    
-    # Generate future forecasting predictions
-    print("\nGenerating future forecast predictions...")
-    future_csv_path = os.path.join(data_dir, "湖南省电力负荷2024_future.csv")
-    if os.path.exists(future_csv_path):
-        future_df = pd.read_csv(future_csv_path)
-        future_df["date"] = pd.to_datetime(future_df["date"])
-        
-        hist_load_tail = scaled_load[-seq_len:]
-        new_res = res.apply(hist_load_tail)
-        pred_scaled = new_res.forecast(steps=pred_len).reshape(-1, 1)
-        pred_phys = scaler.inverse_transform(pred_scaled).flatten()
-        
-        output_df = pd.DataFrame({
-            "date": future_df["date"].iloc[:pred_len],
-            "load_pred_P50": pred_phys
-        })
-        output_csv_path = os.path.join(os.path.dirname(__file__), "future_load_prediction.csv")
-        output_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
-        print(f"Saved future predictions to {output_csv_path}")
 
 if __name__ == "__main__":
     main()
