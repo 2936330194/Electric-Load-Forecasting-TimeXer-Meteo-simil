@@ -28,6 +28,11 @@ TARGET_DATES = pd.DatetimeIndex([pd.Timestamp("2024-11-24")])
 QUANTILES = [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
 Q10_INDEX = QUANTILES.index(0.1)
 Q90_INDEX = QUANTILES.index(0.9)
+CM_TO_INCH = 1.0 / 2.54
+FIG_WIDTH_CM = 14.0
+FIG_HEIGHT_CM = 12.0
+JOURNAL_LINE_WIDTH_PT = 0.5
+JOURNAL_FONT_SIZE_PT = 6.0
 
 FULL_DIR = ROOT / "results" / "sdv4_sl672_pl96_wd2_sdk3_ts1_bs64_exp000_e6704ca5"
 
@@ -38,9 +43,8 @@ MODEL_SPECS = OrderedDict(
             "ARIMA",
             {
                 "path": ROOT / "baseline_exp" / "arima" / "pred_inv.npy",
-                "color": "#D4A017",
-                "linestyle": "-",
-                "linewidth": 0.9,
+                "color": "#8C510A",
+                "linestyle": (0, (1.2, 1.0)),
             },
         ),
         (
@@ -49,8 +53,7 @@ MODEL_SPECS = OrderedDict(
                 "path": ROOT / "baseline_exp" / "lstm" / "pred_inv.npy",
                 "quantile_path": ROOT / "baseline_exp" / "lstm" / "quantile_preds_inv.npy",
                 "color": "#7209B7",
-                "linestyle": "-",
-                "linewidth": 0.9,
+                "linestyle": (0, (4.8, 1.2)),
             },
         ),
         (
@@ -59,8 +62,7 @@ MODEL_SPECS = OrderedDict(
                 "path": ROOT / "baseline_exp" / "informer" / "pred_inv.npy",
                 "quantile_path": ROOT / "baseline_exp" / "informer" / "quantile_preds_inv.npy",
                 "color": "#4B5563",
-                "linestyle": "-",
-                "linewidth": 0.9,
+                "linestyle": (0, (2.4, 1.2)),
             },
         ),
         (
@@ -68,9 +70,8 @@ MODEL_SPECS = OrderedDict(
             {
                 "path": ROOT / "baseline_exp" / "patchtst" / "pred_inv.npy",
                 "quantile_path": ROOT / "baseline_exp" / "patchtst" / "quantile_preds_inv.npy",
-                "color": "#E7298A",
-                "linestyle": "-",
-                "linewidth": 1.0,
+                "color": "#C51B7D",
+                "linestyle": (0, (5.0, 1.0, 1.0, 1.0)),
             },
         ),
         (
@@ -79,8 +80,7 @@ MODEL_SPECS = OrderedDict(
                 "path": ROOT / "baseline_exp" / "itransformer" / "pred_inv.npy",
                 "quantile_path": ROOT / "baseline_exp" / "itransformer" / "quantile_preds_inv.npy",
                 "color": "#009E73",
-                "linestyle": "-",
-                "linewidth": 1.0,
+                "linestyle": (0, (3.6, 1.0, 1.0, 1.0)),
             },
         ),
         (
@@ -95,8 +95,7 @@ MODEL_SPECS = OrderedDict(
                 / "test1_HunanLoad_2024_672_sl672_pl96_dm512_bs32_itr1_f59463f003"
                 / "quantile_preds_inv.npy",
                 "color": "#023E8A",
-                "linestyle": "--",
-                "linewidth": 0.9,
+                "linestyle": (0, (3.0, 1.0, 1.0, 1.0, 1.0, 1.0)),
             },
         ),
         (
@@ -110,9 +109,8 @@ MODEL_SPECS = OrderedDict(
                 / "results"
                 / "TimeXerE2E_sl672_pl96_wd3_wsl672_wh672_wk62x61_bs32_Exp_0_99626da6"
                 / "quantile_preds_inv.npy",
-                "color": "#4361EE",
-                "linestyle": "--",
-                "linewidth": 1.0,
+                "color": "#2166AC",
+                "linestyle": (0, (6.0, 1.2)),
             },
         ),
         (
@@ -124,9 +122,8 @@ MODEL_SPECS = OrderedDict(
                 / "results"
                 / "TimeXerE2E_sl672_pl96_wd2_wsl768_wh672_wk62x61_bs64_Optuna_trial032_0_437d0f80"
                 / "quantile_preds_inv.npy",
-                "color": "#F77F00",
-                "linestyle": "--",
-                "linewidth": 1.0,
+                "color": "#B35806",
+                "linestyle": (0, (2.0, 1.0, 5.0, 1.0)),
             },
         ),
         (
@@ -136,9 +133,8 @@ MODEL_SPECS = OrderedDict(
                 / "results"
                 / "test5_similar_only_similar_day_retriever_hunan_grid_2024_2025_filtered_15min_top3"
                 / "pred.npy",
-                "color": "#BC6C25",
-                "linestyle": "--",
-                "linewidth": 0.9,
+                "color": "#A6611A",
+                "linestyle": (0, (1.0, 1.2, 4.0, 1.2)),
             },
         ),
         (
@@ -148,26 +144,31 @@ MODEL_SPECS = OrderedDict(
                 "quantile_path": FULL_DIR / "quantile_preds_inv.npy",
                 "color": "#E63946",
                 "linestyle": "-",
-                "linewidth": 1.8,
             },
         ),
     ]
 )
 
 LEGEND_ORDER = [
-    "Ground Truth",
+    "实际值",
     "Informer",
     "SDR",
-    "Full (ours)",
+    "本文方法",
     "LSTM",
     "TimeXer*",
     "iTransformer",
     "ARIMA",
     "+MeteoConv",
     "PatchTST",
-    "P10-P90 CI",
+    "P10-P90预测区间",
     "+Optuna",
 ]
+
+DISPLAY_LABELS = {
+    "Ground Truth": "实际值",
+    "Full (ours)": "本文方法",
+    "P10-P90 CI": "P10-P90预测区间",
+}
 
 
 def load_point_prediction(path: Path) -> np.ndarray:
@@ -282,6 +283,10 @@ def print_metrics(
         print()
 
 
+def display_label(name: str) -> str:
+    return DISPLAY_LABELS.get(name, name)
+
+
 def configure_axes(ax: plt.Axes, ylabel: str) -> None:
     x_ticks = np.arange(0, PRED_LEN + 1, 12)
     x_tick_positions = np.minimum(x_ticks, PRED_LEN - 1)
@@ -290,25 +295,39 @@ def configure_axes(ax: plt.Axes, ylabel: str) -> None:
     ax.set_xlim(0, PRED_LEN - 1)
     ax.set_xticks(x_tick_positions)
     ax.set_xticklabels(x_tick_labels)
-    ax.set_xlabel("Time", fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=9)
-    ax.tick_params(axis="both", labelsize=8, length=3)
-    ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.45)
+    tick_labels = ax.get_xticklabels()
+    if tick_labels:
+        tick_labels[0].set_ha("left")
+        tick_labels[-1].set_ha("right")
+    ax.set_xlabel("时刻", fontsize=JOURNAL_FONT_SIZE_PT)
+    ax.set_ylabel(ylabel, fontsize=JOURNAL_FONT_SIZE_PT)
+    ax.tick_params(axis="both", labelsize=5.5, length=2.0, width=0.5, pad=1.5)
+    ax.grid(True, linestyle=":", linewidth=0.25, alpha=0.45)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.5)
 
 
 def build_legend_handles() -> list:
     handles = {
-        "Ground Truth": Line2D([0], [0], color="#000000", linestyle="-", linewidth=1.8, label="Ground Truth"),
-        "P10-P90 CI": Patch(facecolor="#E63946", alpha=0.15, edgecolor="none", label="P10-P90 CI"),
+        "实际值": Line2D(
+            [0],
+            [0],
+            color="#000000",
+            linestyle="-",
+            linewidth=JOURNAL_LINE_WIDTH_PT,
+            label="实际值",
+        ),
+        "P10-P90预测区间": Patch(facecolor="#E63946", alpha=0.13, edgecolor="none", label="P10-P90预测区间"),
     }
     for name, spec in MODEL_SPECS.items():
-        handles[name] = Line2D(
+        label = display_label(name)
+        handles[label] = Line2D(
             [0],
             [0],
             color=spec["color"],
             linestyle=spec["linestyle"],
-            linewidth=spec["linewidth"],
-            label=name,
+            linewidth=JOURNAL_LINE_WIDTH_PT,
+            label=label,
         )
     return [handles[name] for name in LEGEND_ORDER]
 
@@ -330,10 +349,20 @@ def plot_case_study(
     true: np.ndarray,
     quantile_predictions: dict[str, np.ndarray],
 ) -> list[Path]:
-    plt.rcParams["font.family"] = "Times New Roman"
+    plt.rcParams["font.family"] = ["SimSun", "Times New Roman"]
+    plt.rcParams["font.size"] = JOURNAL_FONT_SIZE_PT
     plt.rcParams["axes.unicode_minus"] = False
+    plt.rcParams["pdf.fonttype"] = 42
+    plt.rcParams["ps.fonttype"] = 42
+    plt.rcParams["svg.fonttype"] = "none"
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.2), dpi=600, sharex=False)
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(FIG_WIDTH_CM * CM_TO_INCH, FIG_HEIGHT_CM * CM_TO_INCH),
+        dpi=600,
+        sharex=True,
+    )
     x = np.arange(PRED_LEN)
 
     prediction_plot_order = [
@@ -351,7 +380,6 @@ def plot_case_study(
 
     day = TARGET_DATES[0]
     idx = window_indices[day]
-    label = f"Nov {day.day}"
 
     ax_pred = axes[0]
     ax_err = axes[1]
@@ -359,8 +387,16 @@ def plot_case_study(
     full_quantiles = quantile_predictions["Full (ours)"]
     q10 = full_quantiles[idx, :, Q10_INDEX]
     q90 = full_quantiles[idx, :, Q90_INDEX]
-    ax_pred.fill_between(x, q10, q90, color="#E63946", alpha=0.15, linewidth=0)
-    ax_pred.plot(x, true[idx], color="#000000", linestyle="-", linewidth=1.8, label="Ground Truth", zorder=4)
+    ax_pred.fill_between(x, q10, q90, color="#E63946", alpha=0.13, linewidth=0)
+    ax_pred.plot(
+        x,
+        true[idx],
+        color="#000000",
+        linestyle="-",
+        linewidth=JOURNAL_LINE_WIDTH_PT,
+        label="实际值",
+        zorder=4,
+    )
 
     for name in prediction_plot_order:
         spec = MODEL_SPECS[name]
@@ -369,8 +405,8 @@ def plot_case_study(
             predictions[name][idx],
             color=spec["color"],
             linestyle=spec["linestyle"],
-            linewidth=spec["linewidth"],
-            label=name,
+            linewidth=JOURNAL_LINE_WIDTH_PT,
+            label=display_label(name),
         )
 
     for name, spec in MODEL_SPECS.items():
@@ -379,46 +415,49 @@ def plot_case_study(
             np.abs(predictions[name][idx] - true[idx]),
             color=spec["color"],
             linestyle=spec["linestyle"],
-            linewidth=spec["linewidth"],
-            label=name,
+            linewidth=JOURNAL_LINE_WIDTH_PT,
+            label=display_label(name),
         )
 
-    for ax, ylabel in ((ax_pred, "Normalized Load"), (ax_err, "Absolute Error")):
+    for ax, ylabel in ((ax_pred, "归一化负荷"), (ax_err, "归一化绝对误差")):
         configure_axes(ax, ylabel)
         ax.text(
             0.015,
             0.93,
-            label,
+            f"2024年11月{day.day}日",
             transform=ax.transAxes,
             ha="left",
             va="top",
-            fontsize=10,
-            fontweight="bold",
+            fontsize=JOURNAL_FONT_SIZE_PT,
         )
+    ax_pred.tick_params(axis="x", labelbottom=True)
 
-    legend = ax_err.legend(
+    ax_pred.set_title("（a）负荷预测曲线", fontsize=JOURNAL_FONT_SIZE_PT, pad=2.0)
+    ax_err.set_title("（b）绝对误差曲线", fontsize=JOURNAL_FONT_SIZE_PT, pad=2.0)
+
+    legend = fig.legend(
         handles=build_legend_handles(),
-        loc="upper right",
-        bbox_to_anchor=(0.985, 0.985),
-        ncol=4,
-        fontsize=8.0,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=6,
+        fontsize=5.2,
         frameon=True,
         facecolor="white",
-        edgecolor="none",
-        framealpha=0.82,
-        handlelength=2.0,
-        columnspacing=0.75,
-        labelspacing=0.35,
-        borderpad=0.35,
+        edgecolor="#BDBDBD",
+        framealpha=1.0,
+        handlelength=1.8,
+        columnspacing=0.8,
+        labelspacing=0.25,
+        borderpad=0.25,
     )
     legend.set_zorder(10)
 
-    plt.tight_layout(rect=[0, 0, 1, 1])
+    fig.subplots_adjust(left=0.075, right=0.97, top=0.93, bottom=0.18, hspace=0.35)
     saved_paths = [
-        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.png", dpi=600, bbox_inches="tight"),
-        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.pdf", bbox_inches="tight"),
-        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.svg", bbox_inches="tight"),
-        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.eps", bbox_inches="tight"),
+        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.png", dpi=600),
+        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.pdf"),
+        save_figure(fig, ROOT / "case_study_cold_wave_nov2024.svg"),
+        # save_figure(fig, ROOT / "case_study_cold_wave_nov2024.eps"),
     ]
     plt.close(fig)
     return saved_paths
