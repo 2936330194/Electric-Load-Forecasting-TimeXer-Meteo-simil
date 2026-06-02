@@ -29,10 +29,12 @@ QUANTILES = [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
 Q10_INDEX = QUANTILES.index(0.1)
 Q90_INDEX = QUANTILES.index(0.9)
 CM_TO_INCH = 1.0 / 2.54
-FIG_WIDTH_CM = 14.0
-FIG_HEIGHT_CM = 12.0
+FIG_WIDTH_CM = 6.5
+FIG_HEIGHT_CM = 9.8
 JOURNAL_LINE_WIDTH_PT = 0.5
-JOURNAL_FONT_SIZE_PT = 6.0
+JOURNAL_FONT_SIZE_PT = 7.5
+TICK_FONT_SIZE_PT = 6.5
+LEGEND_FONT_SIZE_PT = 6.0
 
 FULL_DIR = ROOT / "results" / "sdv4_sl672_pl96_wd2_sdk3_ts1_bs64_exp000_e6704ca5"
 
@@ -151,23 +153,26 @@ MODEL_SPECS = OrderedDict(
 
 LEGEND_ORDER = [
     "实际值",
-    "Informer",
-    "SDR",
-    "本文方法",
-    "LSTM",
-    "TimeXer*",
-    "iTransformer",
     "ARIMA",
-    "+MeteoConv",
+    "LSTM",
+    "Informer",
     "PatchTST",
-    "P10-P90预测区间",
-    "+Optuna",
+    "iTransformer",
+    "SDR",
+    "TX-B",
+    "TX-BM",
+    "TX-BMO",
+    "本文方法",
+    "P10-P90区间",
 ]
 
 DISPLAY_LABELS = {
     "Ground Truth": "实际值",
+    "TimeXer*": "TX-B",
+    "+MeteoConv": "TX-BM",
+    "+Optuna": "TX-BMO",
     "Full (ours)": "本文方法",
-    "P10-P90 CI": "P10-P90预测区间",
+    "P10-P90 CI": "P10-P90区间",
 }
 
 
@@ -288,9 +293,9 @@ def display_label(name: str) -> str:
 
 
 def configure_axes(ax: plt.Axes, ylabel: str) -> None:
-    x_ticks = np.arange(0, PRED_LEN + 1, 12)
+    x_ticks = np.arange(0, PRED_LEN + 1, 24)
     x_tick_positions = np.minimum(x_ticks, PRED_LEN - 1)
-    x_tick_labels = [f"{hour:02d}:00" for hour in range(0, 25, 3)]
+    x_tick_labels = [str(hour) for hour in range(0, 25, 6)]
 
     ax.set_xlim(0, PRED_LEN - 1)
     ax.set_xticks(x_tick_positions)
@@ -299,9 +304,9 @@ def configure_axes(ax: plt.Axes, ylabel: str) -> None:
     if tick_labels:
         tick_labels[0].set_ha("left")
         tick_labels[-1].set_ha("right")
-    ax.set_xlabel("时刻", fontsize=JOURNAL_FONT_SIZE_PT)
+    ax.set_xlabel("时刻/h", fontsize=JOURNAL_FONT_SIZE_PT)
     ax.set_ylabel(ylabel, fontsize=JOURNAL_FONT_SIZE_PT)
-    ax.tick_params(axis="both", labelsize=5.5, length=2.0, width=0.5, pad=1.5)
+    ax.tick_params(axis="both", labelsize=TICK_FONT_SIZE_PT, length=2.0, width=0.5, pad=1.5)
     ax.grid(True, linestyle=":", linewidth=0.25, alpha=0.45)
     for spine in ax.spines.values():
         spine.set_linewidth(0.5)
@@ -317,7 +322,7 @@ def build_legend_handles() -> list:
             linewidth=JOURNAL_LINE_WIDTH_PT,
             label="实际值",
         ),
-        "P10-P90预测区间": Patch(facecolor="#E63946", alpha=0.13, edgecolor="none", label="P10-P90预测区间"),
+        "P10-P90区间": Patch(facecolor="#E63946", alpha=0.13, edgecolor="none", label="P10-P90区间"),
     }
     for name, spec in MODEL_SPECS.items():
         label = display_label(name)
@@ -366,16 +371,16 @@ def plot_case_study(
     x = np.arange(PRED_LEN)
 
     prediction_plot_order = [
-        "Full (ours)",
-        "iTransformer",
-        "PatchTST",
+        "ARIMA",
         "LSTM",
         "Informer",
-        "ARIMA",
-        "+Optuna",
-        "+MeteoConv",
-        "TimeXer*",
+        "PatchTST",
+        "iTransformer",
         "SDR",
+        "TimeXer*",
+        "+MeteoConv",
+        "+Optuna",
+        "Full (ours)",
     ]
 
     day = TARGET_DATES[0]
@@ -428,9 +433,10 @@ def plot_case_study(
             transform=ax.transAxes,
             ha="left",
             va="top",
-            fontsize=JOURNAL_FONT_SIZE_PT,
+            fontsize=TICK_FONT_SIZE_PT,
         )
     ax_pred.tick_params(axis="x", labelbottom=True)
+    ax_pred.set_xlabel("")
 
     ax_pred.set_title("（a）负荷预测曲线", fontsize=JOURNAL_FONT_SIZE_PT, pad=2.0)
     ax_err.set_title("（b）绝对误差曲线", fontsize=JOURNAL_FONT_SIZE_PT, pad=2.0)
@@ -438,21 +444,19 @@ def plot_case_study(
     legend = fig.legend(
         handles=build_legend_handles(),
         loc="lower center",
-        bbox_to_anchor=(0.5, 0.02),
-        ncol=6,
-        fontsize=5.2,
-        frameon=True,
+        bbox_to_anchor=(0.5, 0.018),
+        ncol=3,
+        fontsize=LEGEND_FONT_SIZE_PT,
+        frameon=False,
         facecolor="white",
-        edgecolor="#BDBDBD",
-        framealpha=1.0,
-        handlelength=1.8,
-        columnspacing=0.8,
-        labelspacing=0.25,
-        borderpad=0.25,
+        handlelength=1.35,
+        columnspacing=0.50,
+        labelspacing=0.20,
+        borderpad=0.0,
     )
     legend.set_zorder(10)
 
-    fig.subplots_adjust(left=0.075, right=0.97, top=0.93, bottom=0.18, hspace=0.35)
+    fig.subplots_adjust(left=0.17, right=0.97, top=0.94, bottom=0.25, hspace=0.35)
     saved_paths = [
         save_figure(fig, ROOT / "case_study_cold_wave_nov2024.png", dpi=600),
         save_figure(fig, ROOT / "case_study_cold_wave_nov2024.pdf"),
